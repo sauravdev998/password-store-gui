@@ -47,30 +47,42 @@ jobs:
       # GnuPG and put it first on PATH — also the configuration Windows users
       # actually have.
       #
-      # Installed from upstream rather than via Chocolatey: `choco install
-      # gnupg` reliably stalls at "Installing gnupg..." on the hosted Windows
-      # runners until the step times out. It is not specific to this package
-      # (gpg4win and openssl do the same), and the known workaround is to
-      # rewrite the machine PATH first, which is more fragile than a download.
+      # Unpacked rather than installed. Running the GnuPG installer on a hosted
+      # runner hangs the step until it times out, whether it is launched by
+      # `choco install gnupg` or directly with NSIS `/S` — nothing is printed
+      # and nothing exits. The installer is an NSIS archive, so 7-Zip (already
+      # on the image) can extract the tree without executing anything. GnuPG
+      # finds its own root relative to the running .exe, so an extracted
+      # bin/ + share/ works exactly like an installed one.
+      #
       # The checksum is the one published on gnupg.org/download/integrity_check.
       - name: Install a native GnuPG
         if: matrix.platform == 'windows-latest'
         shell: pwsh
+        timeout-minutes: 5
         run: |
-          $ProgressPreference = 'SilentlyContinue'
           $url = 'https://gnupg.org/ftp/gcrypt/binary/gnupg-w32-2.5.21_20260702.exe'
           $want = '6246c925a73167253444afc24a0deb83a3f43b7d636af84d6aaf48a98a62f024'
           $exe = Join-Path $env:RUNNER_TEMP 'gnupg-w32.exe'
 
-          Invoke-WebRequest -Uri $url -OutFile $exe
+          # curl.exe over Invoke-WebRequest: it is preinstalled, faster, and
+          # --max-time bounds a stalled transfer instead of hanging the step.
+          Write-Host "Downloading $url"
+          curl.exe -fsSL --retry 3 --max-time 180 -o $exe $url
+          if ($LASTEXITCODE -ne 0) { throw "download failed: curl exit $LASTEXITCODE" }
+
           $got = (Get-FileHash $exe -Algorithm SHA256).Hash
           if ($got -ne $want) { throw "gnupg installer checksum mismatch: $got" }
 
-          # NSIS: /S is silent, /D is the target directory and must come last
-          # and stay unquoted. A space-free path keeps gpg's own quoting simple.
-          Start-Process $exe -ArgumentList '/S', '/D=C:\gnupg' -Wait -NoNewWindow
+          Write-Host 'Extracting bin and share'
+          7z x $exe '-oC:\gnupg' 'bin\*' 'share\*' -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "extraction failed: 7z exit $LASTEXITCODE" }
+          if (-not (Test-Path 'C:\gnupg\bin\gpg.exe')) { throw 'no gpg.exe in the extracted tree' }
 
-          if (-not (Test-Path 'C:\gnupg\bin\gpg.exe')) { throw 'native gpg.exe not found after install' }
+          # Proves the extracted tree is usable, not merely present.
+          & 'C:\gnupg\bin\gpg.exe' --version
+          if ($LASTEXITCODE -ne 0) { throw "extracted gpg is not runnable: exit $LASTEXITCODE" }
+
           # GITHUB_PATH prepends, so this wins over Git for Windows' gpg.
           Add-Content -Path $env:GITHUB_PATH -Value 'C:\gnupg\bin' -Encoding utf8
 
