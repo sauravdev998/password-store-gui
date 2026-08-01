@@ -1,0 +1,44 @@
+[package]
+name = "password-store-gui"
+version = "0.1.0"
+description = "A cross-platform GUI client for the pass password manager"
+authors = ["Saurav Mohanta"]
+license = "GPL-3.0-or-later"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "password_store_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-log = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Secrets must not survive in freed memory or leak through a panic message.
+# See PLAN.md §4; these are enforced in CI via `cargo clippy -- -D warnings`.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

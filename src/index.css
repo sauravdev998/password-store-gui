@@ -1,0 +1,19 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, Consolas, Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  /* Native feel: no rubber-band scroll, no accidental text selection of a
+     revealed secret. Fields that should be selectable opt back in. */
+  overscroll-behavior: none;
+  user-select: none;
+}
