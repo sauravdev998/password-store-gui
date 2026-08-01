@@ -1,19 +1,216 @@
 @import 'tailwindcss';
 
-@theme {
+/*
+ * The visual system.
+ *
+ * One rule governs colour here: **amber means something is exposed right now.**
+ * A revealed value, a live one-time password, an armed clipboard, the action
+ * that decrypts an entry. Nothing else in the app is allowed to be warm, so a
+ * warm pixel anywhere on screen is always answerable with "what is showing?".
+ * Everything else — chrome, tree, labels, selection — is a cool graphite
+ * neutral that stays out of the way.
+ *
+ * Every foreground/background pair below was checked for WCAG contrast in both
+ * themes: body text >= 4.5:1, interactive borders and focus >= 3:1.
+ *
+ * `@theme inline` emits the utilities as `var(--c-*)` references rather than
+ * baked values, which is what lets the `prefers-color-scheme` block below
+ * re-point every token at once.
+ */
+
+@theme inline {
   --font-sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, Consolas, Menlo, monospace;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Surfaces, back to front. */
+  --color-canvas: var(--c-canvas);
+  --color-panel: var(--c-panel);
+  --color-raised: var(--c-raised);
+
+  /* Hairlines. `line` is decorative; `line-strong` carries control edges and
+     is held to the 3:1 non-text contrast threshold. */
+  --color-line: var(--c-line);
+  --color-line-strong: var(--c-line-strong);
+
+  /* Text, in descending emphasis. */
+  --color-ink: var(--c-ink);
+  --color-ink-muted: var(--c-ink-muted);
+  --color-ink-faint: var(--c-ink-faint);
+
+  /* Tree selection. Deliberately neutral: selecting an entry exposes nothing,
+     so it does not get to be warm. */
+  --color-sel: var(--c-sel);
+  --color-sel-ink: var(--c-sel-ink);
+
+  /* Exposure. `exposed` is the row wash and is deliberately near-invisible —
+     several values can be on screen at once, and at `accent-soft` strength the
+     pane turns into a warm block that signals nothing in particular. The dot,
+     the value's own colour, and the chips carry the meaning; this only groups
+     them. */
+  --color-exposed: var(--c-exposed);
+  --color-accent: var(--c-accent);
+  --color-accent-ink: var(--c-accent-ink);
+  --color-accent-soft: var(--c-accent-soft);
+  --color-accent-line: var(--c-accent-line);
+  --color-accent-on: var(--c-accent-on);
+
+  --color-danger-ink: var(--c-danger-ink);
+  --color-danger-soft: var(--c-danger-soft);
+  --color-danger-line: var(--c-danger-line);
+
+  --color-focus: var(--c-focus);
+
+  --radius-row: 0.375rem;
+  --radius-panel: 0.625rem;
+
+  --shadow-lift: 0 1px 2px var(--c-shadow-near), 0 10px 28px -14px var(--c-shadow-far);
 }
 
-html,
-body,
-#root {
-  height: 100%;
+:root {
+  /* Tells the webview to render native scrollbars, form controls and the
+     window background in the matching theme. */
+  color-scheme: light dark;
+
+  --c-canvas: oklch(0.981 0.003 250);
+  --c-panel: oklch(0.962 0.004 250);
+  --c-raised: oklch(1 0 0);
+  --c-line: oklch(0.905 0.006 255);
+  --c-line-strong: oklch(0.62 0.012 258);
+  --c-ink: oklch(0.255 0.012 260);
+  --c-ink-muted: oklch(0.505 0.012 260);
+  --c-ink-faint: oklch(0.635 0.01 260);
+  --c-sel: oklch(0.905 0.014 255);
+  --c-sel-ink: oklch(0.22 0.015 260);
+  --c-accent: oklch(0.62 0.135 62);
+  --c-accent-ink: oklch(0.5 0.125 55);
+  --c-accent-soft: oklch(0.955 0.035 78);
+  --c-exposed: oklch(0.975 0.018 78);
+  --c-accent-line: oklch(0.83 0.09 72);
+  --c-accent-on: oklch(0.2 0.045 55);
+  --c-danger-ink: oklch(0.47 0.17 27);
+  --c-danger-soft: oklch(0.965 0.016 25);
+  --c-danger-line: oklch(0.86 0.07 25);
+  --c-focus: oklch(0.5 0.08 255);
+  --c-shadow-near: oklch(0.2 0.02 260 / 0.06);
+  --c-shadow-far: oklch(0.2 0.02 260 / 0.22);
 }
 
-body {
-  /* Native feel: no rubber-band scroll, no accidental text selection of a
-     revealed secret. Fields that should be selectable opt back in. */
-  overscroll-behavior: none;
-  user-select: none;
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-canvas: oklch(0.205 0.008 258);
+    --c-panel: oklch(0.175 0.008 258);
+    --c-raised: oklch(0.245 0.009 258);
+    --c-line: oklch(0.3 0.01 258);
+    --c-line-strong: oklch(0.53 0.014 258);
+    --c-ink: oklch(0.945 0.004 258);
+    --c-ink-muted: oklch(0.705 0.01 258);
+    --c-ink-faint: oklch(0.565 0.01 258);
+    --c-sel: oklch(0.315 0.016 258);
+    --c-sel-ink: oklch(0.97 0.004 258);
+    --c-accent: oklch(0.76 0.135 70);
+    --c-accent-ink: oklch(0.8 0.12 72);
+    --c-accent-soft: oklch(0.29 0.045 65);
+    --c-exposed: oklch(0.235 0.022 65);
+    --c-accent-line: oklch(0.45 0.08 68);
+    --c-accent-on: oklch(0.2 0.03 60);
+    --c-danger-ink: oklch(0.72 0.15 27);
+    --c-danger-soft: oklch(0.27 0.055 25);
+    --c-danger-line: oklch(0.42 0.09 25);
+    --c-focus: oklch(0.78 0.07 255);
+    --c-shadow-near: oklch(0 0 0 / 0.3);
+    --c-shadow-far: oklch(0 0 0 / 0.55);
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    /* Native feel: no rubber-band scroll, no accidental text selection of a
+       revealed secret. Fields that should be selectable opt back in. */
+    overscroll-behavior: none;
+    user-select: none;
+    background-color: var(--c-canvas);
+    color: var(--c-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* One focus treatment for the whole app. A password manager is used mid-task
+     with the keyboard, so this is load-bearing, not decoration. */
+  :focus-visible {
+    outline: 2px solid var(--c-focus);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  /* Selection is only possible over a revealed value, which is exactly the
+     moment amber is for. */
+  ::selection {
+    background-color: var(--c-accent-soft);
+    color: var(--c-ink);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--c-line) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 11px;
+    height: 11px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--c-line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--c-ink-faint);
+    background-clip: content-box;
+  }
+}
+
+/*
+ * The one authored moment in the app: the wait while GnuPG works and the
+ * system decides whether to ask the user for anything. It breathes because
+ * something outside the window may be waiting on them — a pinentry dialog, a
+ * security key that wants a touch.
+ */
+@keyframes waiting {
+  0%,
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 0.55;
+    transform: translateY(-1px);
+  }
+}
+
+@utility animate-waiting {
+  animation: waiting 1.8s cubic-bezier(0.33, 1, 0.68, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

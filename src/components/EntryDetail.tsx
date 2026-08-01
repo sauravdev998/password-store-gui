@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNow } from '../hooks/useNow'
 import {
+  AlertIcon,
+  CheckIcon,
+  CopyIcon,
+  EyeIcon,
+  EyeOffIcon,
+  LockIcon,
+} from '../lib/icons'
+import {
   clearClipboard,
   copyField,
   copyNotes,
@@ -16,7 +24,7 @@ import {
 } from '../lib/commands'
 
 /**
- * One entry: its shape by default, its values only when asked for.
+ * One entry: its shape only once asked for, its values one at a time.
  *
  * The secret hygiene rule for this component (CLAUDE.md, Frontend): a revealed
  * value lives in `revealed` for as long as it is on screen and no longer. Two
@@ -29,12 +37,22 @@ import {
  * component at all. That is why every row has a Copy next to its Reveal, and
  * why copying an OTP works without ever showing one.
  *
+ * **Nothing decrypts on arrival.** `show_entry` returns shape rather than
+ * content, but it still has to run GnuPG to learn it — which can put a
+ * passphrase dialog on screen or set a security key blinking. Doing that
+ * because someone clicked a row would be the app spending the user's attention
+ * on a question they did not ask. So the pane arrives locked and the first
+ * decrypt is a deliberate act, unless the user has said otherwise.
+ *
  * Each reveal and each copy is its own decrypt in the core. Nothing is cached,
  * so there is no plaintext here between renders and none in the core between
  * commands.
  */
 type Props = {
   name: string
+  /** Skip the locked state: the user has said selecting is enough. */
+  autoOpen: boolean
+  onAutoOpenChange: (next: boolean) => void
 }
 
 /** Which value a revealed string belongs to. */
@@ -48,9 +66,12 @@ type Clipped = {
   slot: CopySlot
   label: string
   clearsAt: number
+  /** The full window, so the countdown can be drawn to scale. */
+  windowMs: number
 }
 
-export function EntryDetail({ name }: Props) {
+export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
+  const [opened, setOpened] = useState(autoOpen)
   const [metadata, setMetadata] = useState<EntryMetadata | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [revealed, setRevealed] = useState<Partial<Record<Slot, string>>>({})
@@ -58,9 +79,16 @@ export function EntryDetail({ name }: Props) {
 
   // Only ticks while there is a clipboard window to count down.
   const now = useNow(clipped ? 500 : null)
-  const pending = clipped && now < clipped.clearsAt ? clipped : null
+
+  // The window is over: drop it, which also stops the tick above. Without this
+  // the interval outlives what it was counting and runs for as long as the
+  // entry stays on screen.
+  useEffect(() => {
+    if (clipped && now >= clipped.clearsAt) setClipped(null)
+  }, [clipped, now])
 
   useEffect(() => {
+    if (!opened) return
     let cancelled = false
     setError(null)
     showEntry(name)
@@ -73,7 +101,7 @@ export function EntryDetail({ name }: Props) {
     return () => {
       cancelled = true
     }
-  }, [name])
+  }, [name, opened])
 
   async function reveal(slot: Slot, load: () => Promise<string>) {
     setError(null)
@@ -99,7 +127,8 @@ export function EntryDetail({ name }: Props) {
       const receipt = await run()
       // The receipt carries the window, never the value — there is nothing
       // here to hold onto but a deadline.
-      setClipped({ slot, label, clearsAt: Date.now() + receipt.clearsInSecs * 1000 })
+      const windowMs = receipt.clearsInSecs * 1000
+      setClipped({ slot, label, clearsAt: Date.now() + windowMs, windowMs })
     } catch (e: unknown) {
       setError(String(e))
     }
@@ -114,80 +143,204 @@ export function EntryDetail({ name }: Props) {
     }
   }
 
+  const loading = opened && !metadata && !error
+
   return (
-    <section className="flex h-full flex-col overflow-y-auto p-6">
-      <header className="mb-4">
-        <h2 className="font-mono text-lg font-semibold break-all">{name}</h2>
-      </header>
+    <section className="@container flex h-full flex-col">
+      <EntryHeading name={name} />
 
-      {error && (
-        <p className="mb-4 rounded border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-          {error}
-        </p>
-      )}
+      <div className="flex-1 overflow-y-auto px-6 pt-2 pb-6">
+        {error && (
+          <div
+            role="alert"
+            className="mb-5 flex items-start gap-2.5 rounded-panel border border-danger-line bg-danger-soft px-3.5 py-3 text-sm text-danger-ink"
+          >
+            <AlertIcon className="mt-px size-4 shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="leading-relaxed break-words">{error}</p>
+              <button
+                type="button"
+                className="mt-2 rounded-row border border-danger-line px-2 py-0.5 text-xs font-medium transition-colors hover:bg-danger-line/30"
+                onClick={() => {
+                  setError(null)
+                  setOpened(true)
+                  setMetadata(null)
+                }}
+              >
+                Try again
+              </button>
+            </div>
+          </div>
+        )}
 
-      {!metadata && !error && <p className="text-xs text-neutral-500">Decrypting…</p>}
-
-      {metadata && (
-        <dl className="space-y-1">
-          <SecretRow
-            label="Password"
-            value={revealed.password}
-            empty={!metadata.hasPassword}
-            copied={pending?.slot === 'password'}
-            onReveal={() => reveal('password', () => revealPassword(name))}
-            onHide={() => hide('password')}
-            onCopy={() => copy('password', 'Password', () => copyPassword(name))}
+        {!opened && !error && (
+          <LockedPanel
+            autoOpen={autoOpen}
+            onAutoOpenChange={onAutoOpenChange}
+            onUnlock={() => setOpened(true)}
           />
+        )}
 
-          {metadata.fields.map((key, index) => {
-            const slot: Slot = `field:${index}`
-            return (
-              // Keys may repeat, so the index is the field's identity — both
-              // for React and for the reveal and copy commands.
-              <SecretRow
-                key={slot}
-                label={key}
-                value={revealed[slot]}
-                copied={pending?.slot === slot}
-                onReveal={() => reveal(slot, () => revealField(name, index))}
-                onHide={() => hide(slot)}
-                onCopy={() => copy(slot, key, () => copyField(name, index))}
-              />
-            )
-          })}
+        {loading && <Decrypting />}
 
-          {metadata.hasNotes && (
+        {metadata && (
+          <dl>
             <SecretRow
-              label="Notes"
-              value={revealed.notes}
-              multiline
-              copied={pending?.slot === 'notes'}
-              onReveal={() => reveal('notes', () => revealNotes(name))}
-              onHide={() => hide('notes')}
-              onCopy={() => copy('notes', 'Notes', () => copyNotes(name))}
+              label="Password"
+              value={revealed.password}
+              empty={!metadata.hasPassword}
+              copied={clipped?.slot === 'password'}
+              onReveal={() => reveal('password', () => revealPassword(name))}
+              onHide={() => hide('password')}
+              onCopy={() => copy('password', 'Password', () => copyPassword(name))}
             />
-          )}
 
-          {metadata.hasOtp && (
-            <OtpRow
-              name={name}
-              copied={pending?.slot === 'otp'}
-              onError={setError}
-              onCopy={() => copy('otp', 'One-time password', () => copyOtp(name))}
-            />
-          )}
-        </dl>
-      )}
+            {metadata.fields.map((key, index) => {
+              const slot: Slot = `field:${index}`
+              return (
+                // Keys may repeat, so the index is the field's identity — both
+                // for React and for the reveal and copy commands.
+                <SecretRow
+                  key={slot}
+                  label={key}
+                  value={revealed[slot]}
+                  copied={clipped?.slot === slot}
+                  onReveal={() => reveal(slot, () => revealField(name, index))}
+                  onHide={() => hide(slot)}
+                  onCopy={() => copy(slot, key, () => copyField(name, index))}
+                />
+              )
+            })}
 
-      {pending && (
+            {metadata.hasNotes && (
+              <SecretRow
+                label="Notes"
+                value={revealed.notes}
+                multiline
+                copied={clipped?.slot === 'notes'}
+                onReveal={() => reveal('notes', () => revealNotes(name))}
+                onHide={() => hide('notes')}
+                onCopy={() => copy('notes', 'Notes', () => copyNotes(name))}
+              />
+            )}
+
+            {metadata.hasOtp && (
+              <OtpRow
+                name={name}
+                copied={clipped?.slot === 'otp'}
+                onError={setError}
+                onCopy={() => copy('otp', 'One-time password', () => copyOtp(name))}
+              />
+            )}
+          </dl>
+        )}
+      </div>
+
+      {clipped && (
         <ClipboardNotice
-          label={pending.label}
-          secondsLeft={Math.max(0, Math.ceil((pending.clearsAt - now) / 1000))}
+          label={clipped.label}
+          secondsLeft={Math.max(0, Math.ceil((clipped.clearsAt - now) / 1000))}
+          fraction={Math.max(0, Math.min(1, (clipped.clearsAt - now) / clipped.windowMs))}
           onClear={clearNow}
         />
       )}
     </section>
+  )
+}
+
+/**
+ * The entry's name, split at the separators.
+ *
+ * A store name like `Email/work/fastmail.com` is a path, and the leaf is what
+ * the user came for — so the folders recede and the last segment carries the
+ * weight. It also tells them where they are without a second breadcrumb.
+ */
+function EntryHeading({ name }: { name: string }) {
+  const segments = name.split('/')
+  const leaf = segments.pop() ?? name
+
+  return (
+    <header className="shrink-0 border-b border-line px-6 pt-5 pb-4">
+      {segments.length > 0 && (
+        <p className="mb-1 truncate font-mono text-xs text-ink-faint" title={name}>
+          {segments.join(' / ')}
+        </p>
+      )}
+      <h2 className="font-mono text-xl leading-tight font-semibold tracking-tight break-all">
+        {leaf}
+      </h2>
+    </header>
+  )
+}
+
+/**
+ * What the user sees before anything has been decrypted.
+ *
+ * It says plainly what the next click costs, because the cost is not obvious:
+ * the prompt that may appear belongs to the operating system, not to this
+ * window, and a security key that starts blinking has no explanation attached
+ * to it at all.
+ */
+function LockedPanel({
+  autoOpen,
+  onAutoOpenChange,
+  onUnlock,
+}: {
+  autoOpen: boolean
+  onAutoOpenChange: (next: boolean) => void
+  onUnlock: () => void
+}) {
+  return (
+    <div className="mx-auto mt-10 max-w-md text-center">
+      <LockIcon className="mx-auto size-9 text-ink-faint" />
+      <h3 className="mt-4 text-base font-semibold text-ink">This entry is locked</h3>
+      <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-ink-muted">
+        Opening it decrypts the file with GnuPG. Your system may ask for your passphrase, or your
+        security key may need a touch.
+      </p>
+
+      <div className="mt-6">
+        <button
+          type="button"
+          className="inline-flex items-center gap-2 rounded-row bg-accent px-4 py-2 text-sm font-semibold text-accent-on shadow-lift transition-[filter] duration-150 hover:brightness-105 active:brightness-95"
+          onClick={onUnlock}
+        >
+          <LockIcon className="size-4" open />
+          Unlock entry
+        </button>
+      </div>
+
+      {/* Its own line: turning the lock off for good is a different decision
+          from opening this one entry, and should not read as part of the
+          button. */}
+      <div className="mt-5">
+        <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-ink-muted select-none hover:text-ink">
+          <input
+            type="checkbox"
+            checked={autoOpen}
+            className="size-3.5 accent-[var(--c-accent)]"
+            onChange={(event) => {
+              onAutoOpenChange(event.target.checked)
+              if (event.target.checked) onUnlock()
+            }}
+          />
+          Open entries as soon as I select them
+        </label>
+      </div>
+    </div>
+  )
+}
+
+/** The wait. Named honestly, because the prompt may be outside this window. */
+function Decrypting() {
+  return (
+    <div className="mx-auto mt-10 max-w-md text-center">
+      <LockIcon className="animate-waiting mx-auto size-9 text-accent" open />
+      <p className="mt-4 text-sm font-medium text-ink">Decrypting…</p>
+      <p className="mx-auto mt-1 max-w-xs text-xs leading-relaxed text-ink-muted">
+        If your key needs a passphrase or a touch, look for a system prompt.
+      </p>
+    </div>
   )
 }
 
@@ -205,6 +358,16 @@ type SecretRowProps = {
   onCopy: () => void
 }
 
+/**
+ * One label/value pair.
+ *
+ * `dt` plus two `dd`s inside a `div`, which is the shape a definition list
+ * allows — the actions belong to the term as much as the value does, and a
+ * `div` full of buttons is not a legal child of a `dl`.
+ *
+ * The row goes warm when its value is on screen. That is the whole colour
+ * system in one place: amber is only ever "this is exposed right now".
+ */
 function SecretRow({
   label,
   value,
@@ -218,33 +381,69 @@ function SecretRow({
   const shown = value !== undefined
 
   return (
-    <div className="grid grid-cols-[10rem_1fr_auto] items-start gap-3 border-t border-neutral-200 py-2 dark:border-neutral-800">
-      <dt className="truncate pt-0.5 text-sm text-neutral-500" title={label}>
-        {label}
+    <div
+      className={`grid grid-cols-1 gap-x-4 gap-y-1.5 rounded-row border-t border-line px-3 py-3 transition-colors duration-150 first:border-t-0 @[34rem]:grid-cols-[minmax(6rem,11rem)_1fr_auto] @[34rem]:items-baseline ${
+        shown ? 'bg-exposed' : ''
+      }`}
+    >
+      <dt className="flex min-w-0 items-center gap-1.5 text-sm text-ink-muted">
+        {shown && (
+          <span
+            aria-hidden="true"
+            className="size-1.5 shrink-0 rounded-full bg-accent-ink"
+          />
+        )}
+        <span className="truncate" title={label}>
+          {label}
+        </span>
       </dt>
+
       <dd className="min-w-0 font-mono text-sm">
         {empty ? (
-          <span className="text-neutral-400 italic">empty</span>
+          <span className="text-ink-faint italic">empty</span>
         ) : shown ? (
           // `select-text` opts back in: the global rule turns selection off so
           // a stray drag cannot lift a secret out of the window.
-          <span className={`select-text break-all ${multiline ? 'whitespace-pre-wrap' : ''}`}>
+          <span
+            className={`select-text break-all text-accent-ink ${multiline ? 'whitespace-pre-wrap' : ''}`}
+          >
             {value}
           </span>
         ) : (
-          <span aria-label="hidden" className="text-neutral-400">
-            ••••••••••••
+          // A fixed run of dots. The count is constant on purpose: a mask that
+          // matched the value's length would leak it.
+          <span className="tracking-[0.15em] text-ink-faint">
+            <span className="sr-only">Hidden</span>
+            <span aria-hidden="true">••••••••••••</span>
           </span>
         )}
       </dd>
-      {!empty && (
-        <div className="flex gap-1">
-          {/* Copy before Reveal: copying never puts the value on screen or in
-              this component, so it is the safer of the two to reach for. */}
-          <RowButton onClick={onCopy}>{copied ? 'Copied' : 'Copy'}</RowButton>
-          <RowButton onClick={shown ? onHide : onReveal}>{shown ? 'Hide' : 'Reveal'}</RowButton>
-        </div>
-      )}
+
+      <dd className="flex gap-1.5 @[34rem]:justify-end">
+        {!empty && (
+          <>
+            {/* Copy before Reveal: copying never puts the value on screen or in
+                this component, so it is the safer of the two to reach for. */}
+            <RowButton
+              onClick={onCopy}
+              label={copied ? `${label} is on the clipboard` : `Copy ${label}`}
+              icon={copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+              warm={copied}
+            >
+              {copied ? 'Copied' : 'Copy'}
+            </RowButton>
+            <RowButton
+              onClick={shown ? onHide : onReveal}
+              label={shown ? `Hide ${label}` : `Reveal ${label}`}
+              icon={
+                shown ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />
+              }
+            >
+              {shown ? 'Hide' : 'Reveal'}
+            </RowButton>
+          </>
+        )}
+      </dd>
     </div>
   )
 }
@@ -268,7 +467,11 @@ type OtpRowProps = {
  * it straight on the clipboard, so the common case never renders a code at all.
  */
 function OtpRow({ name, copied, onError, onCopy }: OtpRowProps) {
-  const [code, setCode] = useState<{ digits: string; expiresAt: number } | null>(null)
+  const [code, setCode] = useState<{
+    digits: string
+    expiresAt: number
+    periodSecs: number
+  } | null>(null)
   // Guards the refresh below against firing again on every tick while the next
   // code is still in flight.
   const loading = useRef(false)
@@ -281,7 +484,11 @@ function OtpRow({ name, copied, onError, onCopy }: OtpRowProps) {
     loading.current = true
     try {
       const next = await otpCode(name)
-      setCode({ digits: next.code, expiresAt: Date.now() + next.validForSecs * 1000 })
+      setCode({
+        digits: next.code,
+        expiresAt: Date.now() + next.validForSecs * 1000,
+        periodSecs: next.periodSecs,
+      })
     } catch (e: unknown) {
       onError(String(e))
     } finally {
@@ -296,60 +503,164 @@ function OtpRow({ name, copied, onError, onCopy }: OtpRowProps) {
   }, [code, now, load])
 
   return (
-    <div className="grid grid-cols-[10rem_1fr_auto] items-start gap-3 border-t border-neutral-200 py-2 dark:border-neutral-800">
-      <dt className="truncate pt-0.5 text-sm text-neutral-500">One-time password</dt>
-      <dd className="flex min-w-0 items-center gap-2 font-mono text-sm">
+    <div
+      className={`grid grid-cols-1 gap-x-4 gap-y-1.5 rounded-row border-t border-line px-3 py-3 transition-colors duration-150 first:border-t-0 @[34rem]:grid-cols-[minmax(6rem,11rem)_1fr_auto] @[34rem]:items-baseline ${
+        code ? 'bg-exposed' : ''
+      }`}
+    >
+      <dt className="flex min-w-0 items-center gap-1.5 text-sm text-ink-muted">
+        {code && (
+          <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-accent-ink" />
+        )}
+        <span className="truncate">One-time password</span>
+      </dt>
+
+      <dd className="flex min-w-0 items-center gap-2.5 font-mono text-sm">
         {code ? (
           <>
-            <span className="select-text tracking-[0.2em]">{code.digits}</span>
-            <span
-              className="text-xs text-neutral-500 tabular-nums"
-              title="Seconds until this code expires"
-            >
-              {secondsLeft}s
+            <span className="select-text tracking-[0.2em] text-accent-ink tabular-nums">
+              {code.digits}
             </span>
+            <ExpiryDial secondsLeft={secondsLeft} periodSecs={code.periodSecs} />
           </>
         ) : (
-          <span aria-label="hidden" className="text-neutral-400">
-            ••••••
+          <span className="tracking-[0.15em] text-ink-faint">
+            <span className="sr-only">Hidden</span>
+            <span aria-hidden="true">••••••</span>
           </span>
         )}
       </dd>
-      <div className="flex gap-1">
-        <RowButton onClick={onCopy}>{copied ? 'Copied' : 'Copy'}</RowButton>
-        <RowButton onClick={code ? () => setCode(null) : () => void load()}>
-          {code ? 'Hide' : 'Show'}
+
+      <dd className="flex gap-1.5 @[34rem]:justify-end">
+        <RowButton
+          onClick={onCopy}
+          label={copied ? 'The one-time password is on the clipboard' : 'Copy one-time password'}
+          icon={copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+          warm={copied}
+        >
+          {copied ? 'Copied' : 'Copy'}
         </RowButton>
-      </div>
+        <RowButton
+          onClick={code ? () => setCode(null) : () => void load()}
+          label={code ? 'Hide one-time password' : 'Reveal one-time password'}
+          icon={code ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
+        >
+          {code ? 'Hide' : 'Reveal'}
+        </RowButton>
+      </dd>
     </div>
+  )
+}
+
+/**
+ * How much life the current code has left, drawn to scale.
+ *
+ * `periodSecs` comes back from the core for exactly this — the dial is the
+ * period, so a 30-second code and a 60-second one do not deplete at the same
+ * apparent rate. The seconds are written out beside it, because a shrinking arc
+ * answers "soon?" but not "how long?".
+ */
+function ExpiryDial({ secondsLeft, periodSecs }: { secondsLeft: number; periodSecs: number }) {
+  const radius = 6
+  const circumference = 2 * Math.PI * radius
+  const fraction = periodSecs > 0 ? Math.max(0, Math.min(1, secondsLeft / periodSecs)) : 0
+
+  return (
+    <span className="flex items-center gap-1.5 text-xs text-ink-muted">
+      <svg viewBox="0 0 16 16" className="size-3.5 shrink-0 -rotate-90" aria-hidden="true">
+        <circle cx="8" cy="8" r={radius} fill="none" stroke="currentColor" strokeWidth="2" opacity="0.25" />
+        <circle
+          cx="8"
+          cy="8"
+          r={radius}
+          fill="none"
+          stroke="var(--c-accent-ink)"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - fraction)}
+        />
+      </svg>
+      <span className="tabular-nums">
+        <span className="sr-only">Expires in </span>
+        {secondsLeft}s
+      </span>
+    </span>
   )
 }
 
 type ClipboardNoticeProps = {
   label: string
   secondsLeft: number
+  /** How much of the clip window is left, 1 → 0. */
+  fraction: number
   onClear: () => void
 }
 
-/** What is on the clipboard and how long the core will leave it there. */
-function ClipboardNotice({ label, secondsLeft, onClear }: ClipboardNoticeProps) {
+/**
+ * What is on the clipboard and how long the core will leave it there.
+ *
+ * Pinned below the scroll area rather than appended to it: a password sitting
+ * on the system clipboard is true of the whole machine, not of whatever part of
+ * the entry happens to be scrolled into view.
+ */
+function ClipboardNotice({ label, secondsLeft, fraction, onClear }: ClipboardNoticeProps) {
   return (
-    <p className="mt-4 flex items-center gap-3 rounded border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-600 dark:border-neutral-800 dark:bg-neutral-800/40 dark:text-neutral-400">
-      <span className="flex-1">
-        {label} copied — clipboard clears in <span className="tabular-nums">{secondsLeft}s</span>
-      </span>
-      <RowButton onClick={onClear}>Clear now</RowButton>
-    </p>
+    <div
+      role="status"
+      aria-live="polite"
+      className="shrink-0 border-t border-accent-line bg-accent-soft"
+    >
+      {/* The window, draining. It is the same number as the text, at a glance. */}
+      <div
+        aria-hidden="true"
+        className="h-0.5 origin-left bg-accent transition-transform duration-500 ease-linear"
+        style={{ transform: `scaleX(${fraction})` }}
+      />
+      <p className="flex items-center gap-3 px-6 py-3 text-xs text-accent-ink">
+        <span className="min-w-0 flex-1 leading-relaxed">
+          <span className="font-medium">{label}</span> copied — the clipboard clears in{' '}
+          <span className="tabular-nums">{secondsLeft}s</span>
+        </span>
+        <button
+          type="button"
+          className="shrink-0 rounded-row border border-accent-line px-2 py-1 font-medium transition-colors hover:bg-accent-line/40"
+          onClick={onClear}
+        >
+          Clear now
+        </button>
+      </p>
+    </div>
   )
 }
 
-function RowButton({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
+function RowButton({
+  onClick,
+  label,
+  icon,
+  warm,
+  children,
+}: {
+  onClick: () => void
+  /** The accessible name. "Copy" alone repeats on every row and names nothing. */
+  label: string
+  icon: React.ReactNode
+  warm?: boolean
+  children: React.ReactNode
+}) {
   return (
     <button
       type="button"
-      className="rounded border border-neutral-300 px-2 py-0.5 text-xs hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+      aria-label={label}
+      title={label}
+      className={`inline-flex items-center gap-1.5 rounded-row border px-2 py-1 text-xs font-medium transition-colors duration-100 ${
+        warm
+          ? 'border-accent-line bg-accent-soft text-accent-ink'
+          : 'border-line-strong/45 text-ink-muted hover:border-line-strong hover:bg-raised hover:text-ink'
+      }`}
       onClick={onClick}
     >
+      {icon}
       {children}
     </button>
   )

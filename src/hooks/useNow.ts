@@ -18,6 +18,12 @@ export function useNow(intervalMs: number | null): number {
 
   useEffect(() => {
     if (intervalMs === null) return
+    // Re-read on the way in. While the interval was off, `now` was frozen at
+    // whenever it last ran — so the first render after a countdown starts would
+    // otherwise subtract a stale clock from a fresh deadline and claim a
+    // 45-second clipboard window had 82 seconds left. Costs one render; buys a
+    // countdown that is right from its first frame.
+    setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), intervalMs)
     return () => window.clearInterval(timer)
   }, [intervalMs])

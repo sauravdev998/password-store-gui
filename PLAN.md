@@ -3,6 +3,11 @@
 > Working plan for Claude Code. This is a living document: update the **Status**
 > column as phases land, and record any deviation in **Architecture Decisions**.
 > Treat the **Security Invariants** section as hard constraints, not suggestions.
+>
+> `PRODUCT.md` is the companion document: it owns audience, positioning, and
+> product principles. This file owns scope, architecture, and phase status. Where
+> they overlap, `PRODUCT.md` says *who and why*, `PLAN.md` says *what and how* —
+> and a claim about what is built belongs here, not there.
 
 ---
 
@@ -17,11 +22,29 @@ careful GUI over that format: it must stay **byte-compatible** with the on-disk
 layout so a store edited by our app still works with the `pass` CLI, QtPass, the
 mobile apps, etc.
 
+### Who it's for (see `PRODUCT.md`)
+
+The primary user **chose `pass`'s format but does not use the CLI and is not
+going to**. They may not know what `gpg-agent`, a recipient, or a `.gpg-id` is;
+some arrive with **no store and no GPG key at all**. Existing CLI users are a
+real secondary audience — byte-compatibility is for them — but the interface is
+not designed around them. **Where the two conflict, the CLI-averse user wins.**
+
+This has teeth here, not just in `PRODUCT.md`: it is why failure messages must
+name the actual problem and the actual fix (§4.1), why the format's concepts
+have to surface in plain language rather than as `pass` jargon (§10.6), and why
+onboarding from nothing is a committed feature rather than a nicety (§7,
+Phase 7).
+
 ### Goals
 - Interoperate perfectly with existing `pass` stores and GPG setups.
 - Feel instant: fast tree browsing, fast decrypt, minimal memory footprint.
+  *Unmeasured* — this is engineering intent, not a benchmarked claim (§7,
+  "Not yet true").
 - Ship a single small binary per platform.
 - Never compromise on secret hygiene (see Security Invariants).
+- Take a user from **nothing — no key, no store — to a working store without a
+  terminal** (Phase 7, blocked on ADR-7).
 
 ### Non-goals (for v1)
 - Cloud sync beyond git.
@@ -263,6 +286,36 @@ is a bug even if the feature "works."
    the nearest `.gpg-id` (walking up the tree). On recipient change, re-encrypt
    the whole affected subtree, matching `pass init`.
 
+### 4.1 Product principles (from `PRODUCT.md`)
+
+These are **not** part of the eight — that list is deliberately fixed, and
+`CLAUDE.md` and `PRODUCT.md` both cite it by count. These bind design decisions
+rather than secret handling, and a violation is a defect in the same way.
+
+1. **A decrypt is expensive and always the user's choice.** Nothing decrypts
+   speculatively, on hover, on select, or on a timer. **A pinentry prompt or a
+   hardware-key tap the user did not ask for is a defect.** This is why the OTP
+   row stays hidden until asked for (Phase 2) and why nothing is cached between
+   commands (Phase 1). Smartcards are a *confirmed* operating condition, not a
+   later concern — see §10.8 for the one place this is currently in tension.
+2. **Hidden by default, revealed one field at a time.** A revealed value lives
+   on screen and nowhere else — not in a store, not in a URL, not across a
+   selection change. Implemented in Phase 1; overlaps Invariants 2 and 7.
+3. **The store is the user's, not ours.** Every write stays byte-compatible with
+   the CLI; nothing is added to the format for our convenience; **a name or file
+   we cannot handle is shown as unusable rather than silently hidden**
+   (`Tree::unsupported`, and `notes` retaining unparsed lines).
+4. **The user does not have to know `pass` to use it.** Where the format's
+   concepts must surface — recipients, sync state, missing keys — the interface
+   explains what is happening in plain language and says what to do about it.
+   How much vocabulary to expose, translate, or teach is open (§10.6).
+5. **Say what is true, especially about failure.** Missing `gpg`, an
+   unresolvable recipient, a diverged store: name the actual problem and the
+   actual fix. **Never a bare "operation failed"** — and never a message that
+   quotes a secret to be helpful (Invariant 5 governs the second half; this
+   principle governs the first). `verify_recipients` naming the id and the
+   `.gpg-id` that listed it (ADR-6) is the standard to match.
+
 ---
 
 ## 5. Repository layout
@@ -270,6 +323,7 @@ is a bug even if the feature "works."
 ```
 password-store-gui/
 ├── PLAN.md
+├── PRODUCT.md                # audience, positioning, product principles
 ├── CLAUDE.md                 # conventions + commands for the agent (see §9)
 ├── package.json              # pnpm workspace root
 ├── vite.config.ts
@@ -285,8 +339,10 @@ password-store-gui/
     └── src/
         ├── main.rs
         ├── lib.rs
-        ├── store/            # our types + Store trait; prs.rs holds the prs-lib impl
-        ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib's gnupg-bin backend
+        ├── store/            # our types + Store trait; name/gpg_id/tree/entry are
+        │                     #   ours outright (F-1, F-6); prs.rs holds the impl
+        ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib for *decrypt*,
+        │                     #   gnupg.rs spawns gpg for *encrypt* (ADR-6)
         ├── git.rs            # status, commit, pull, push, per-entry history
         ├── generate.rs       # password generation (CSPRNG, no modulo bias)
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
@@ -507,9 +563,52 @@ password-store-gui/
 
 ### Phase 6 — Optional / later — Status: ☐
 - `rpgp` pure-Rust backend for a fully bundled build.
-- Smartcard / YubiKey verification pass.
+- Smartcard / YubiKey **verification** pass. Note the *design* constraint is
+  already binding — §4.1 principle 1 exists because a hardware key is a
+  confirmed operating condition, not a hypothetical. What is deferred is
+  testing against real hardware, not designing for it.
 - Multi-`.gpg-id` subfolder UX; recipient management + subtree re-encrypt UI.
 - Import from other managers.
+
+### Phase 7 — Onboarding: nothing → working store — Status: ☐ (blocked on ADR-7)
+
+**Committed by `PRODUCT.md`, unscoped, and deliberately unsequenced.** Its
+number is not its priority: it serves the *primary* user (§1), so it plausibly
+outranks Phases 4–6. It is last in this list only because nothing about it is
+decided yet, and the numbering above is load-bearing in code comments and
+cross-references.
+
+- A user with **no GPG key and no store** reaches a working store without a
+  terminal: key generation, then the equivalent of `pass init`.
+- **The Invariant 3 constraint is the whole design problem.** This does not
+  conflict with "we never handle passphrases" *only so long as* key generation
+  is driven through `gpg` with the platform pinentry prompting for the new key's
+  passphrase — **never `--passphrase`, never `--pinentry-mode loopback`**, no
+  exceptions for "just onboarding". A pinentry appearing as a separate OS-level
+  window mid-wizard is expected behaviour, not a bug to design around.
+- Detecting and explaining a missing/broken `gpg` is part of this, and is the
+  sharpest test of §4.1 principle 5: "install Gpg4win" beats "gpg not found".
+- **Needs ADR-7 before any code.** Open questions at minimum: which `gpg`
+  invocations (`--full-generate-key` batch vs. `--quick-generate-key`), what we
+  do on a machine with an existing key we did not create, whether `pass init`
+  equivalence means writing `.gpg-id` ourselves (it does — `store/gpg_id.rs`
+  already owns that format) and whether onboarding may create a git repo.
+
+---
+
+### Not yet true (do not claim)
+
+`PRODUCT.md` lists these as absent; keeping them here stops a phase marker from
+being read as more than it is:
+
+- **No released build, no README, no screenshots, no project page, no logo.**
+  The bundled icons are Tauri's scaffold mark and `public/favicon.svg` is the
+  Vite default — placeholders, not identity.
+- **No benchmarks**, despite speed being the positioning (§1).
+- **No users, downloads, stars, or testimonials.**
+- **The GUI has never been click-tested against a real store.** Phases 1–3 are
+  verified at the command surface by `src-tauri/tests/`, not through the webview.
+  This is the single largest gap between "☑" and "works".
 
 ---
 
@@ -566,6 +665,28 @@ password-store-gui/
    set pulls in the `image` crate for clipboard images we never touch) plus
    `wayland-data-control`, so a native Wayland session does not have to go
    through XWayland.
+5. **Onboarding scope (ADR-7).** Committed by `PRODUCT.md`, unscoped, blocking
+   Phase 7. The hard edge is Invariant 3: pinentry-driven key generation only.
+   See Phase 7 for the open questions.
+6. **How much `pass` vocabulary to expose.** The domain words — *store*,
+   *entry*, *recipients*, `.gpg-id`, *pinentry*, *clip time* — are accurate and
+   are what every other client and all the documentation use, but the primary
+   user does not know them. Expose, translate, or teach? Currently unresolved
+   and answered ad hoc per screen, which is itself the problem. §4.1 principle 4
+   says plain language wins where the concept must surface; it does not say what
+   to *call* things. Resolve before the Phase 3 mutation UI hardens the wording.
+7. **Accessibility.** No product-specific standard has been committed
+   (`PRODUCT.md`). Sensible defaults apply; nothing is currently a stated
+   obligation. Worth deciding before Phase 5 rather than retrofitting.
+8. **Decrypt-on-select, versus §4.1 principle 1.** `src/lib/prefs.ts` ships a
+   `useAutoOpen` preference that decrypts on selection — **off by default**, in
+   `localStorage`, holding a boolean and never a secret. The principle as
+   written forbids decrypting "on select"; the preference's defence is that a
+   user who opted in *did* ask, once, instead of per click. That is a real
+   distinction for a cached-agent user and a bad one for a YubiKey user, whom
+   the default correctly protects. Decide whether the principle should read
+   "unrequested" rather than "on select", and note that `prefs.ts` is written to
+   move into Phase 5's settings plumbing when that lands.
 
 ---
 
@@ -578,10 +699,32 @@ password-store-gui/
 - `git2` links libgit2 vendored, so local git needs no system git; network SSH may
   still pull in libssh2 — see Open Decision 2.
 
+**A working `gpg` binary is a hard prerequisite on every platform** — Gpg4win on
+Windows, `pinentry-mac` on macOS, `pinentry-gtk`/`-qt` on Linux. Its absence is a
+first-class, explainable failure state (§4.1 principle 5), not a crash, and
+detecting it is part of Phase 7.
+
+### Identity & packaging metadata
+
+Fixed by `PRODUCT.md`; packaging (Phase 5) must not drift from it.
+
+| | |
+|---|---|
+| Name | **Password Store** |
+| Window title | `Password Store` |
+| Package | `password-store-gui` |
+| Bundle identifier | `dev.passwordstoregui.app` |
+| License | `GPL-3.0-or-later` (ADR-4 — a consequence of statically linking LGPL `prs-lib`) |
+
+No visual identity exists. The bundled icons and `public/favicon.svg` are
+scaffold defaults — **not a reference for anything**, and not to be extended
+into a design. No voice or tone has been established either.
+
 ---
 
 ## 12. References
 
+- `PRODUCT.md` — audience, positioning, product principles, evidence on hand
 - pass — https://www.passwordstore.org/ (format, env vars, extensions)
 - prs (reference impl, `prs-lib`, `prs-gtk3` example GUI) — https://sr.ht/~timvisee/prs/
 - QtPass (UX prior art) — https://qtpass.org/
