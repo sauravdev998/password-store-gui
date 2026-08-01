@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 pub mod crypto;
 pub mod error;
 pub mod secret;
@@ -22,7 +22,18 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::core_version])
+        // The store and the crypto backend are opened per command rather than
+        // here, so a missing store directory or a missing `gpg` is an error the
+        // window can show and the user can fix without relaunching.
+        .manage(commands::Core::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::core_version,
+            commands::list_tree,
+            commands::show_entry,
+            commands::reveal_password,
+            commands::reveal_field,
+            commands::reveal_notes,
+        ])
         .run(tauri::generate_context!())
         // Startup failure only; the message carries no store data.
         .expect("error while running tauri application");

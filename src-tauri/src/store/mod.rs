@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 pub use entry::{Entry, EntryMetadata, Field};
 pub use gpg_id::Recipients;
 pub use name::{EntryName, InvalidName};
+pub use prs::PrsStore;
 pub use tree::{Node, Tree};
 
 use crate::error::{Error, Result};

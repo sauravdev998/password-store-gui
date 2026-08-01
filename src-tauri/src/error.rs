@@ -35,6 +35,17 @@ pub enum Error {
     #[error("no entry named {name}")]
     EntryNotFound { name: EntryName },
 
+    /// A reveal named a field index the entry does not have.
+    ///
+    /// The index is the caller's own — the webview got it from
+    /// `EntryMetadata::fields` — so echoing it back tells it nothing it did not
+    /// already know, and nothing about the plaintext.
+    #[error("entry {name} has no field at index {index}")]
+    NoSuchField { name: EntryName, index: usize },
+
+    #[error("entry {name} has no notes")]
+    NoNotes { name: EntryName },
+
     #[error("no .gpg-id file found for {name}")]
     NoRecipients { name: EntryName },
 

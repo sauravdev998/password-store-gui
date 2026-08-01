@@ -256,7 +256,7 @@ password-store-gui/
 - ☑ Add `CLAUDE.md` with conventions from §9.
 - ☑ **ADR-4 resolved:** wrap `prs-lib` behind our own traits (see §3).
 
-### Phase 1 — Read-only core — Status: ◐
+### Phase 1 — Read-only core — Status: ☑
 - ☑ **Audit `prs-lib` against §4** (ADR-4) — done, findings in ADR-4a. Verdict:
   wrap. `store/` must own `.gpg-id` walk-up (F-1) and name validation (F-6).
 - ☑ `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate
@@ -288,9 +288,35 @@ password-store-gui/
   - *Deliberate Invariant 4 exception:* a field **key** is a plain `String`, not
     a `Secret` — the UI cannot offer a reveal without rendering the label. Keys
     only; a value never becomes a `String`.
-- Commands: `list_tree`, `show_entry` (returns metadata; password revealed only on demand).
-- Frontend: tree browser + entry detail with password **hidden by default** and a reveal toggle.
-- **Definition of done:** browse a real store and reveal a password; nothing written to disk; no plaintext in logs.
+- ☑ Commands (`commands.rs`): `list_tree`, `show_entry` (metadata only), and
+  `reveal_password` / `reveal_field` / `reveal_notes` — one value per call, and
+  `reveal()` is the single place a `Secret` becomes a `String`. The logic lives
+  on `Core` and the `#[tauri::command]` fns are one-liners over it, so the whole
+  surface is testable against a fake `Store` and a fake `Gpg`.
+  - *No `reveal_otp`:* the `otpauth://` URI embeds the shared seed. Phase 2
+    computes the code in the core and sends only the code.
+  - `Core` opens the store and the backend **per command** rather than at
+    startup: both fail for reasons the user can fix while the app runs (no store
+    directory, no `gpg` on `PATH`), and reopening makes the fix take effect on
+    the next click instead of the next launch. Cheap — a `canonicalize`, plus a
+    `gpg` probe that hits the `thread_local` context cache.
+  - Nothing decrypted is cached between commands, so a reveal is its own
+    decrypt. That is also why Invariant 7 has nothing to clear yet.
+- ☑ Frontend: `components/Tree.tsx` (recursive, expand/collapse, `unsupported`
+  surfaced in a disclosure) + `components/EntryDetail.tsx` (metadata on select;
+  every value **hidden by default** behind a per-row Reveal/Hide toggle). A
+  revealed value lives only in `EntryDetail`'s local state: hiding deletes the
+  slot, and `App` mounts the detail view with `key={name}` so switching entries
+  unmounts it rather than carrying a revealed value across.
+- ☑ **Definition of done** — covered by `tests/read_store.rs`, which drives the
+  real command surface against a real `gpg` and a temp store: browse the tree,
+  read metadata, reveal a password, a repeated-key field, and notes; assert the
+  serialized metadata contains no value; assert the store directory is
+  byte-identical before and after (Invariant 1) and that no file under it holds
+  the plaintext. The GPG fixture is shared with `tests/gpg_roundtrip.rs` in
+  `tests/common/`.
+  - *Unverified locally:* the GUI itself has not been click-tested against a
+    real store — the read path is covered at the core, not through the webview.
 
 ### Phase 2 — Clipboard & OTP — Status: ☐
 - `clipboard`: copy-in-core + auto-clear timer (Invariant 6).
@@ -358,7 +384,10 @@ password-store-gui/
 2. **Git network auth.** `git2` credential callbacks (SSH/HTTPS in-process) vs.
    shelling to the user's `git` for remote ops so their credential helpers just work.
    Leaning: shell to `git` for network ops, `git2` for local — simplest and most compatible.
-3. **Reveal policy.** Auto-hide on blur? Re-hide after N seconds? Per-field vs whole-entry reveal.
+3. **Reveal policy.** Partly settled by Phase 1: reveal is **per field**, and a
+   revealed value is dropped when the entry is deselected. Still open: auto-hide
+   on blur, and re-hide after N seconds — both belong with Invariant 7's
+   auto-lock in Phase 5, since neither exists in isolation.
 4. **Clipboard mechanism.** Core `arboard` (chosen, for the no-JS-plaintext property)
    vs Tauri clipboard plugin — keep `arboard` unless a platform quirk forces otherwise.
 
