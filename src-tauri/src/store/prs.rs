@@ -12,6 +12,7 @@
 //! - `store::can_decrypt` decrypts a real secret and inspects the plaintext as
 //!   a `&str` without zeroizing it (F-5). Never call it.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -96,6 +97,82 @@ impl Store for PrsStore {
 
     fn recipients(&self, name: &EntryName) -> Result<Recipients> {
         gpg_id::resolve(self.root(), name)
+    }
+
+    fn contains(&self, name: &EntryName) -> bool {
+        name.to_secret_path(self.root()).is_file()
+    }
+
+    fn remove(&self, name: &EntryName) -> Result<()> {
+        let path = self.secret_path(name)?;
+        fs::remove_file(&path).map_err(|err| Error::io(&path, err))?;
+        self.prune_empty_parents(name);
+        Ok(())
+    }
+
+    fn rename_file(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+        let source = self.secret_path(from)?;
+        let target = self.prepare_target(to)?;
+
+        // Not `fs::rename`: on Unix it would silently replace an existing
+        // target, and `prepare_target` refusing an occupied name is what makes
+        // "move onto an existing entry" an error the user sees rather than a
+        // password they lose.
+        fs::rename(&source, &target).map_err(|err| Error::io(&target, err))?;
+        self.prune_empty_parents(from);
+        Ok(())
+    }
+
+    fn copy_file(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+        let source = self.secret_path(from)?;
+        let target = self.prepare_target(to)?;
+        fs::copy(&source, &target).map_err(|err| Error::io(&target, err))?;
+        Ok(())
+    }
+}
+
+impl PrsStore {
+    /// Make `name`'s directory, having checked the name is free.
+    ///
+    /// The check and the create are here rather than at each call site so a
+    /// move and a copy cannot disagree about whether clobbering is allowed.
+    /// It is not atomic — nothing on a shared filesystem could be — but the
+    /// window is a directory creation wide, and the alternative is no check.
+    fn prepare_target(&self, name: &EntryName) -> Result<PathBuf> {
+        if self.contains(name) {
+            return Err(Error::EntryExists { name: name.clone() });
+        }
+        let path = name.to_secret_path(self.root());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| Error::io(parent, err))?;
+        }
+        Ok(path)
+    }
+
+    /// Remove directories an entry's departure left empty, up to the root.
+    ///
+    /// `pass` does the same: a folder in this store is only ever implied by the
+    /// entries under it, so one with nothing left in it would be a node the
+    /// tree shows and the user cannot remove.
+    ///
+    /// Failures are ignored on purpose. `remove_dir` refuses a non-empty
+    /// directory, which is the stopping condition rather than an error, and a
+    /// tidy-up that fails has not harmed the mutation that already succeeded.
+    fn prune_empty_parents(&self, name: &EntryName) {
+        let root = self.root();
+        let mut dir = name.to_path(root);
+
+        // Starts at the entry's own path, whose parent is the first candidate;
+        // stops before the root, which stays even when the store is empty.
+        while let Some(parent) = dir.parent() {
+            if parent == root || !parent.starts_with(root) {
+                return;
+            }
+            if fs::remove_dir(parent).is_err() {
+                return;
+            }
+            dir = parent.to_path_buf();
+        }
     }
 }
 

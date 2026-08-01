@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod crypto;
 pub mod error;
+pub mod generate;
 pub mod otp;
 pub mod secret;
 pub mod store;
@@ -41,6 +42,13 @@ pub fn run() {
             commands::copy_otp,
             commands::otp_code,
             commands::clear_clipboard,
+            commands::insert_entry,
+            commands::edit_entry,
+            commands::generate_entry,
+            commands::remove_entry,
+            commands::rename_entry,
+            commands::copy_entry,
+            commands::generate_defaults,
         ])
         .run(tauri::generate_context!())
         // Startup failure only; the message carries no store data.

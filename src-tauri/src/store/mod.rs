@@ -32,10 +32,17 @@ pub const STORE_DIR_ENV: &str = "PASSWORD_STORE_DIR";
 /// Store directory relative to the user's home, when the variable is unset.
 pub const DEFAULT_STORE_DIR: &str = ".password-store";
 
-/// A password store we can read.
+/// A password store we can read and write.
 ///
 /// Object-safe on purpose: the app holds a `dyn Store` so the backing
 /// implementation can be swapped without touching the command surface.
+///
+/// Note what is *not* here: nothing on this trait encrypts or decrypts. The
+/// file-level moves below are only correct when source and destination resolve
+/// to the same `.gpg-id`, and deciding that is `commands::Core`'s job — a move
+/// across a recipient boundary has to be a decrypt and a re-encrypt
+/// (Invariant 8), which is why these are named for the file operation they are
+/// rather than for the user-facing verb.
 pub trait Store: Send + Sync {
     /// Absolute, canonical store root.
     fn root(&self) -> &Path;
@@ -50,7 +57,26 @@ pub trait Store: Send + Sync {
     fn secret_path(&self, name: &EntryName) -> Result<PathBuf>;
 
     /// Recipients governing `name`, from the nearest `.gpg-id` (Invariant 8).
+    ///
+    /// Answerable for a name that does not exist yet, which is what lets a
+    /// write resolve its recipients before it creates anything.
     fn recipients(&self, name: &EntryName) -> Result<Recipients>;
+
+    /// Whether an entry by this name exists.
+    fn contains(&self, name: &EntryName) -> bool;
+
+    /// Delete the entry, and any directory the deletion leaves empty.
+    fn remove(&self, name: &EntryName) -> Result<()>;
+
+    /// Move the ciphertext as-is, without re-encrypting.
+    ///
+    /// Only valid when `from` and `to` share a `.gpg-id`; see the trait note.
+    fn rename_file(&self, from: &EntryName, to: &EntryName) -> Result<()>;
+
+    /// Copy the ciphertext as-is, without re-encrypting.
+    ///
+    /// Only valid when `from` and `to` share a `.gpg-id`; see the trait note.
+    fn copy_file(&self, from: &EntryName, to: &EntryName) -> Result<()>;
 }
 
 /// Where the store lives: `PASSWORD_STORE_DIR`, else `~/.password-store`.

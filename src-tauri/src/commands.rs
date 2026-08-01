@@ -26,6 +26,7 @@ use tauri::State;
 use crate::clipboard::Clipboard;
 use crate::crypto::{Gpg, PrsGpg};
 use crate::error::{Error, Result};
+use crate::generate;
 use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
 use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
@@ -168,6 +169,132 @@ impl Core {
         self.clipboard.clear()
     }
 
+    /// Create a new entry from the text the user typed.
+    ///
+    /// Refuses to overwrite: replacing an existing entry is [`Core::edit`], and
+    /// keeping them apart is what stops a mistyped name from silently
+    /// destroying a password.
+    pub fn insert(&self, name: &EntryName, body: &Secret) -> Result<()> {
+        let store = (self.store)()?;
+        if store.contains(name) {
+            return Err(Error::EntryExists { name: name.clone() });
+        }
+        self.write(&*store, name, body)
+    }
+
+    /// Replace an existing entry's contents.
+    pub fn edit(&self, name: &EntryName, body: &Secret) -> Result<()> {
+        let store = (self.store)()?;
+        if !store.contains(name) {
+            return Err(Error::EntryNotFound { name: name.clone() });
+        }
+        self.write(&*store, name, body)
+    }
+
+    /// Create an entry whose password is generated here.
+    ///
+    /// The password never leaves the core on this path: what comes back is the
+    /// same [`CopyReceipt`] a copy returns, so the common case — generate, then
+    /// paste it into the site that asked for it — happens without the value
+    /// being rendered anywhere. To see it, the user reveals it like any other.
+    /// The receipt is optional because the write is the primary effect and the
+    /// copy is not: on a machine with no display server the clipboard fails,
+    /// and reporting that as a failed *generate* would tell the user their
+    /// entry was not created when it was — leaving them to retry into an
+    /// `EntryExists`. So a clipboard that will not open yields `None`, and the
+    /// UI simply omits the "on the clipboard" notice.
+    pub fn generate(
+        &self,
+        name: &EntryName,
+        recipe: generate::Recipe,
+        body: Option<&Secret>,
+    ) -> Result<Option<CopyReceipt>> {
+        let store = (self.store)()?;
+        if store.contains(name) {
+            return Err(Error::EntryExists { name: name.clone() });
+        }
+
+        let password = generate::password(recipe)?;
+        let entry = match body {
+            // The generated password becomes the first line, and whatever the
+            // form collected follows it — the same layout the parser reads back.
+            Some(rest) => {
+                let mut joined = Vec::with_capacity(password.len() + rest.len() + 1);
+                joined.extend_from_slice(password.expose());
+                joined.push(b'\n');
+                joined.extend_from_slice(rest.expose());
+                Secret::new(joined)
+            }
+            None => Secret::from_slice(password.expose()),
+        };
+
+        self.write(&*store, name, &entry)?;
+        Ok(self.copy(&password).ok())
+    }
+
+    /// Delete an entry.
+    pub fn remove(&self, name: &EntryName) -> Result<()> {
+        (self.store)()?.remove(name)
+    }
+
+    /// Move an entry to a new name.
+    pub fn rename(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+        let store = (self.store)()?;
+        if self.same_recipients(&*store, from, to)? {
+            return store.rename_file(from, to);
+        }
+        // Across a recipient boundary the ciphertext cannot simply move: the
+        // destination's `.gpg-id` names a different audience (Invariant 8), so
+        // the entry is decrypted and encrypted again for it. The source is
+        // removed only once the new file exists.
+        self.reencrypt(&*store, from, to)?;
+        store.remove(from)
+    }
+
+    /// Copy an entry to a new name, leaving the original.
+    ///
+    /// Named apart from [`Core::copy`], which is the clipboard: on this surface
+    /// "copy" already means something, and the two must not read alike.
+    pub fn copy_entry(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+        let store = (self.store)()?;
+        if self.same_recipients(&*store, from, to)? {
+            return store.copy_file(from, to);
+        }
+        self.reencrypt(&*store, from, to)
+    }
+
+    /// Whether two names are governed by the same `.gpg-id` file.
+    ///
+    /// Compared by the file the walk-up landed on rather than by the ids it
+    /// holds: two `.gpg-id` files listing the same recipients today are still
+    /// two separate decisions, and a move between them should produce a file
+    /// encrypted under the destination's.
+    fn same_recipients(&self, store: &dyn Store, from: &EntryName, to: &EntryName) -> Result<bool> {
+        Ok(store.recipients(from)?.source == store.recipients(to)?.source)
+    }
+
+    /// Decrypt `from` and write it to `to` under `to`'s own recipients.
+    fn reencrypt(&self, store: &dyn Store, from: &EntryName, to: &EntryName) -> Result<()> {
+        if store.contains(to) {
+            return Err(Error::EntryExists { name: to.clone() });
+        }
+        let source = store.secret_path(from)?;
+        let plaintext = (self.gpg)()?.decrypt_file(&source)?;
+        self.write(store, to, &plaintext)
+    }
+
+    /// The single place a [`Secret`] is encrypted into the store.
+    ///
+    /// Recipients always come from the store's own walk-up for the name being
+    /// written, never from the name it came from — that is Invariant 8, and
+    /// routing every write through here is what makes it one rule rather than
+    /// six call sites that each have to remember it.
+    fn write(&self, store: &dyn Store, name: &EntryName, body: &Secret) -> Result<()> {
+        let recipients = store.recipients(name)?;
+        let path = name.to_secret_path(store.root());
+        (self.gpg)()?.encrypt_file(&path, &recipients, body)
+    }
+
     /// Decrypt `name` and parse it.
     ///
     /// The returned [`Entry`] holds the whole plaintext, so it is built to
@@ -299,6 +426,68 @@ pub fn clear_clipboard(core: State<'_, Core>) -> Result<()> {
     core.clear_clipboard()
 }
 
+// The mutation commands are the one direction in which plaintext travels *into*
+// the core, and that is not a hole in Invariant 2 — it is where a new secret
+// comes from. A password the user just typed exists in the webview because they
+// typed it; the invariant constrains what comes back out. Two consequences the
+// frontend owns: the form field holding it lives no longer than the form, and
+// the `String` serde builds on this side is not zeroized before it is dropped
+// (the same residual as ADR-4a F-4). Everything after [`body`] is a `Secret`.
+
+/// Wrap an inbound entry body, which is where core custody begins.
+fn body(text: String) -> Secret {
+    Secret::new(text.into_bytes())
+}
+
+/// Create an entry. Fails rather than overwriting an existing one.
+#[tauri::command]
+pub fn insert_entry(name: EntryName, content: String, core: State<'_, Core>) -> Result<()> {
+    core.insert(&name, &body(content))
+}
+
+/// Replace an existing entry's contents.
+#[tauri::command]
+pub fn edit_entry(name: EntryName, content: String, core: State<'_, Core>) -> Result<()> {
+    core.edit(&name, &body(content))
+}
+
+/// Create an entry with a generated password, and put that password on the
+/// clipboard without ever sending it to the webview.
+#[tauri::command]
+pub fn generate_entry(
+    name: EntryName,
+    recipe: generate::Recipe,
+    content: Option<String>,
+    core: State<'_, Core>,
+) -> Result<Option<CopyReceipt>> {
+    let rest = content.map(body);
+    core.generate(&name, recipe, rest.as_ref())
+}
+
+/// Delete an entry.
+#[tauri::command]
+pub fn remove_entry(name: EntryName, core: State<'_, Core>) -> Result<()> {
+    core.remove(&name)
+}
+
+/// Move an entry, re-encrypting if the destination has different recipients.
+#[tauri::command]
+pub fn rename_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<()> {
+    core.rename(&from, &to)
+}
+
+/// Copy an entry, re-encrypting if the destination has different recipients.
+#[tauri::command]
+pub fn copy_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<()> {
+    core.copy_entry(&from, &to)
+}
+
+/// The generation defaults, so the dialog opens on what `pass` would do.
+#[tauri::command]
+pub fn generate_defaults() -> generate::Recipe {
+    generate::Recipe::default()
+}
+
 #[cfg(test)]
 // Test code handles fixtures, never real secrets: the plaintexts below are
 // literals, not decrypted content.
@@ -358,18 +547,57 @@ mod tests {
             }
         }
 
+        /// Every entry is governed by the root `.gpg-id`, except one directory
+        /// that has its own — so a test can drive both sides of the "does this
+        /// move cross a recipient boundary" question.
         fn recipients(&self, name: &EntryName) -> Result<Recipients> {
-            let _ = name;
+            let (id, dir) = if name.as_str().starts_with(WALLED) {
+                (WALLED_RECIPIENT, self.root.join(WALLED))
+            } else {
+                (RECIPIENT, self.root.clone())
+            };
             Ok(Recipients {
-                ids: vec![RECIPIENT.to_owned()],
-                source: self.root.join(crate::store::gpg_id::GPG_ID_FILE),
+                ids: vec![id.to_owned()],
+                source: dir.join(crate::store::gpg_id::GPG_ID_FILE),
             })
+        }
+
+        fn contains(&self, name: &EntryName) -> bool {
+            self.names().contains(name)
+        }
+
+        fn remove(&self, name: &EntryName) -> Result<()> {
+            let path = self.secret_path(name)?;
+            lock(&self.gpg.plaintexts).remove(&path);
+            Ok(())
+        }
+
+        fn rename_file(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+            self.copy_file(from, to)?;
+            self.remove(from)
+        }
+
+        fn copy_file(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+            let source = self.secret_path(from)?;
+            if self.contains(to) {
+                return Err(Error::EntryExists { name: to.clone() });
+            }
+            let mut table = lock(&self.gpg.plaintexts);
+            let Some(text) = table.get(&source).cloned() else {
+                return Err(Error::EntryNotFound { name: from.clone() });
+            };
+            table.insert(to.to_secret_path(&self.root), text);
+            Ok(())
         }
     }
 
     /// The id [`FakeStore`] reports for every entry, so a test can tell what a
     /// write was encrypted to apart from what it contained.
     const RECIPIENT: &str = "fake-key";
+
+    /// A directory with its own `.gpg-id`, and the id it names.
+    const WALLED: &str = "Work/";
+    const WALLED_RECIPIENT: &str = "work-key";
 
     /// A backend that "decrypts" by looking the path up in a table, and
     /// "encrypts" by writing back into it.
@@ -736,6 +964,231 @@ mod tests {
 
         assert_eq!(json, r#"{"clearsInSecs":20}"#);
         assert!(!json.contains("correct horse"));
+    }
+
+    // --- mutations -------------------------------------------------------
+
+    /// What an entry now holds, for readable assertions.
+    fn stored(gpg: &FakeGpg, name: &str) -> Option<String> {
+        lock(&gpg.plaintexts)
+            .get(&name_of(name).to_secret_path(Path::new(ROOT)))
+            .cloned()
+    }
+
+    /// Who each write went to, in order.
+    fn writes(gpg: &FakeGpg) -> Vec<(String, Vec<String>)> {
+        lock(&gpg.written_to)
+            .iter()
+            .map(|(path, ids)| {
+                let name = EntryName::from_secret_path(Path::new(ROOT), path)
+                    .map(|n| n.as_str().to_owned())
+                    .unwrap_or_default();
+                (name, ids.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn insert_creates_an_entry_and_the_tree_shows_it() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let name = name_of("Email/gmail.com");
+
+        core.insert(&name, &Secret::from_slice(b"hunter2\nuser: alice"))
+            .unwrap();
+
+        assert_eq!(
+            stored(&gpg, "Email/gmail.com").as_deref(),
+            Some("hunter2\nuser: alice")
+        );
+        assert_eq!(
+            core.metadata(&name).unwrap().fields,
+            vec!["user".to_owned()]
+        );
+    }
+
+    /// A mistyped name must not silently destroy the password already there.
+    #[test]
+    fn insert_refuses_to_overwrite() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+
+        match core.insert(&name_of("wifi"), &Secret::from_slice(b"clobbered")) {
+            Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), "wifi"),
+            Err(other) => panic!("expected EntryExists, got {other:?}"),
+            Ok(()) => panic!("insert must not overwrite an existing entry"),
+        }
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("correct horse"));
+    }
+
+    #[test]
+    fn edit_replaces_the_whole_body_and_requires_the_entry_to_exist() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse\nuser: alice")]);
+
+        core.edit(&name_of("wifi"), &Secret::from_slice(b"new-password"))
+            .unwrap();
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("new-password"));
+
+        match core.edit(&name_of("absent"), &Secret::from_slice(b"x")) {
+            Err(Error::EntryNotFound { name }) => assert_eq!(name.as_str(), "absent"),
+            Err(other) => panic!("expected EntryNotFound, got {other:?}"),
+            Ok(()) => panic!("edit must not create an entry"),
+        }
+    }
+
+    /// Invariant 8: a write is encrypted to the recipients of the name being
+    /// written, resolved by the store's own walk-up.
+    #[test]
+    fn a_write_uses_the_recipients_of_its_own_directory() {
+        let (core, _, _, gpg) = core_with_parts(&[]);
+
+        core.insert(&name_of("loose"), &Secret::from_slice(b"a"))
+            .unwrap();
+        core.insert(&name_of("Work/intranet"), &Secret::from_slice(b"b"))
+            .unwrap();
+
+        assert_eq!(
+            writes(&gpg),
+            vec![
+                ("loose".to_owned(), vec![RECIPIENT.to_owned()]),
+                (
+                    "Work/intranet".to_owned(),
+                    vec![WALLED_RECIPIENT.to_owned()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_deletes_the_entry() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse"), ("keep", "x")]);
+
+        core.remove(&name_of("wifi")).unwrap();
+
+        assert_eq!(stored(&gpg, "wifi"), None);
+        assert_eq!(stored(&gpg, "keep").as_deref(), Some("x"));
+        assert!(matches!(
+            core.remove(&name_of("wifi")),
+            Err(Error::EntryNotFound { .. })
+        ));
+    }
+
+    /// Within one `.gpg-id` the ciphertext moves as it is: no decrypt, so no
+    /// pinentry for what the user experiences as a rename.
+    #[test]
+    fn rename_within_a_recipient_boundary_does_not_re_encrypt() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+
+        core.rename(&name_of("wifi"), &name_of("Home/wifi"))
+            .unwrap();
+
+        assert_eq!(stored(&gpg, "wifi"), None);
+        assert_eq!(stored(&gpg, "Home/wifi").as_deref(), Some("correct horse"));
+        assert!(
+            writes(&gpg).is_empty(),
+            "a move within one .gpg-id must not re-encrypt"
+        );
+    }
+
+    /// Across one it cannot: the destination names a different audience, so the
+    /// entry is decrypted and encrypted again for it (Invariant 8).
+    #[test]
+    fn rename_across_a_recipient_boundary_re_encrypts_to_the_destination() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+
+        core.rename(&name_of("wifi"), &name_of("Work/wifi"))
+            .unwrap();
+
+        assert_eq!(stored(&gpg, "wifi"), None);
+        assert_eq!(stored(&gpg, "Work/wifi").as_deref(), Some("correct horse"));
+        assert_eq!(
+            writes(&gpg),
+            vec![("Work/wifi".to_owned(), vec![WALLED_RECIPIENT.to_owned()])]
+        );
+    }
+
+    #[test]
+    fn copy_leaves_the_original_and_re_encrypts_across_a_boundary() {
+        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+
+        core.copy_entry(&name_of("wifi"), &name_of("Work/wifi"))
+            .unwrap();
+
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("correct horse"));
+        assert_eq!(stored(&gpg, "Work/wifi").as_deref(), Some("correct horse"));
+        assert_eq!(
+            writes(&gpg),
+            vec![("Work/wifi".to_owned(), vec![WALLED_RECIPIENT.to_owned()])]
+        );
+    }
+
+    /// Both directions of a move must refuse an occupied name, whether or not
+    /// they take the re-encrypting path.
+    #[test]
+    fn a_move_onto_an_existing_entry_is_refused() {
+        let (core, _, _, gpg) =
+            core_with_parts(&[("wifi", "keep me"), ("other", "b"), ("Work/taken", "c")]);
+
+        for (from, to) in [("wifi", "other"), ("wifi", "Work/taken")] {
+            match core.rename(&name_of(from), &name_of(to)) {
+                Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), to),
+                Err(other) => panic!("expected EntryExists, got {other:?}"),
+                Ok(()) => panic!("moving onto {to} must be refused"),
+            }
+        }
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("keep me"));
+        assert_eq!(stored(&gpg, "other").as_deref(), Some("b"));
+        assert_eq!(stored(&gpg, "Work/taken").as_deref(), Some("c"));
+    }
+
+    /// The generate path's whole point: the password is stored and copied
+    /// without ever being returned.
+    #[test]
+    fn generate_stores_a_password_and_copies_it_without_returning_it() {
+        let (core, clipboard, _, gpg) = core_with_parts(&[]);
+        let name = name_of("Email/new");
+
+        let receipt = core
+            .generate(
+                &name,
+                generate::Recipe {
+                    length: 20,
+                    symbols: false,
+                },
+                Some(&Secret::from_slice(b"user: alice")),
+            )
+            .unwrap();
+
+        // `Some` because the stub clipboard always opens; the `None` arm is the
+        // no-display-server case, where the entry is still created.
+        let receipt = receipt.unwrap();
+        assert_eq!(receipt.clears_in_secs, CLIP_TIME.as_secs());
+
+        let body = stored(&gpg, "Email/new").unwrap();
+        let (password, rest) = body.split_once('\n').unwrap();
+        assert_eq!(password.len(), 20);
+        assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(rest, "user: alice");
+
+        // What reached the clipboard is the password, and the receipt said
+        // nothing about it.
+        assert_eq!(clipboard.contents().as_deref(), Some(password));
+        assert!(!serde_json::to_string(&receipt).unwrap().contains(password));
+    }
+
+    #[test]
+    fn generate_refuses_to_overwrite_and_writes_nothing_when_it_does() {
+        let (core, clipboard, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+
+        match core.generate(&name_of("wifi"), generate::Recipe::default(), None) {
+            Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), "wifi"),
+            Err(other) => panic!("expected EntryExists, got {other:?}"),
+            Ok(_) => panic!("generate must not overwrite an existing entry"),
+        }
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("correct horse"));
+        assert_eq!(
+            clipboard.contents(),
+            None,
+            "a refused generate copies nothing"
+        );
     }
 
     /// Invariant 5 at the boundary: the string the webview receives for a

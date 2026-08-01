@@ -35,6 +35,11 @@ pub enum Error {
     #[error("no entry named {name}")]
     EntryNotFound { name: EntryName },
 
+    /// A write would have overwritten an entry the user did not name as the
+    /// target — an insert, a move, or a copy onto an occupied name.
+    #[error("an entry named {name} already exists")]
+    EntryExists { name: EntryName },
+
     /// A reveal named a field index the entry does not have.
     ///
     /// The index is the caller's own — the webview got it from
@@ -59,6 +64,17 @@ pub enum Error {
 
     #[error("the system clock is set before the Unix epoch")]
     SystemClock,
+
+    #[error("password length must be between {min} and {max}")]
+    BadLength { min: usize, max: usize },
+
+    /// The OS refused to provide randomness.
+    ///
+    /// Deliberately fatal to the generate path rather than a cue to fall back to
+    /// a seeded generator: a password from a predictable source is worse than no
+    /// password, and this is the one error here the user cannot act on.
+    #[error("the operating system provided no randomness")]
+    NoEntropy,
 
     #[error("no .gpg-id file found for {name}")]
     NoRecipients { name: EntryName },

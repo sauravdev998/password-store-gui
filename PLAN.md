@@ -288,6 +288,7 @@ password-store-gui/
         ├── store/            # our types + Store trait; prs.rs holds the prs-lib impl
         ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib's gnupg-bin backend
         ├── git.rs            # status, commit, pull, push, per-entry history
+        ├── generate.rs       # password generation (CSPRNG, no modulo bias)
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
         ├── secret.rs         # zeroizing secret newtypes
         ├── clipboard.rs      # copy + auto-clear
@@ -450,10 +451,48 @@ password-store-gui/
   `gpg`: it decrypts, it carries exactly the `.gpg-id`'s recipients and no
   others (F-9), an unresolvable recipient is refused by name before anything is
   written (F-8), and the store directory holds nothing but the ciphertext.
-- ☐ `insert`, `edit`, `generate`, `rm`, `mv`, `cp` — each re-encrypting to correct recipients.
-- Auto-commit to git after each mutation (conventional message like the CLI).
-- Frontend: add/edit forms, generate dialog (length + symbol options), delete/rename with confirm.
-- **Definition of done:** an entry created here is readable by the `pass` CLI.
+- ☑ `insert`, `edit`, `generate`, `rm`, `mv`, `cp` — each re-encrypting to the
+  recipients of the name being *written*, resolved by our own walk-up.
+  `Core::write` is the single site that does it, so Invariant 8 is one rule
+  rather than six call sites that each have to remember it.
+  - `insert` refuses to overwrite and `edit` refuses to create: keeping them
+    apart is what stops a mistyped name from destroying a password. Same for
+    `mv`/`cp` onto an occupied name.
+  - `mv`/`cp` move the ciphertext as-is **only when source and destination
+    resolve to the same `.gpg-id` file**, and decrypt/re-encrypt otherwise.
+    Compared by the file the walk-up landed on, not by the ids in it: two
+    `.gpg-id`s listing the same recipients today are still two decisions. The
+    common case — renaming within a folder — therefore costs no pinentry.
+  - `rm` prunes directories its entry emptied, as `pass` does; otherwise the
+    tree would show a folder the user has no way to remove.
+  - `generate` never returns the password. It writes the entry and puts the
+    value on the clipboard, so the usual flow — generate, paste into the site
+    asking for it — happens without it being rendered anywhere; to see it the
+    user reveals it like any other. The receipt is **optional**: a machine with
+    no display server fails the copy, and reporting that as a failed generate
+    would tell the user their entry was not created when it was.
+  - `generate.rs` mirrors `pass generate`, including
+    `PASSWORD_STORE_GENERATED_LENGTH`. Entropy comes from the OS via
+    `getrandom`, and characters are chosen by **rejection sampling**: `byte %
+    62` would favour the first 8 characters of the alphabet by 5/4. The
+    rejection rule is tested by feeding it every byte value rather than by
+    sampling — one pass over `0..=255` must yield each character exactly four
+    times, which is a proof instead of a probability that cannot fail
+    intermittently.
+  - Inbound plaintext is not a hole in Invariant 2: a password the user just
+    typed is *in* the webview because they typed it, and the invariant governs
+    what comes back out. `commands::body` is where core custody begins.
+- ☐ Auto-commit to git after each mutation (conventional message like the CLI).
+- ☐ Frontend: add/edit forms, generate dialog (length + symbol options), delete/rename with confirm.
+- ◐ **Definition of done:** an entry created here is readable by the `pass` CLI.
+  `tests/write_store.rs` drives the real command surface against a real `gpg`
+  and a temp store, then hands that store to the `pass` binary: insert, edit,
+  generate, copy, rename and remove all round-trip, and `pass show` prints back
+  exactly what we wrote. It also asserts no file under the store holds any
+  plaintext (Invariant 1) and that nothing but ciphertext and `.gpg-id` is left
+  behind. `pass` is skipped around where absent — it is a bash script and does
+  not exist on Windows, which is why ADR-2 reimplements the format — so on
+  Windows CI this degrades to our own round trip.
 
 ### Phase 4 — Git sync — Status: ☐
 - `git`: status, pull, push, per-entry history, basic conflict surfacing.
