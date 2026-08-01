@@ -66,6 +66,11 @@ cargo clippy --all-targets -- -D warnings
 
 ## Dependencies
 
+`prs-lib` provides the store, recipients, GPG backends, and git (ADR-4). It is
+**wrapped, not exposed**: its types live only in `store/prs.rs` and
+`crypto/prs.rs` behind our own traits, and must never appear in `commands.rs`,
+in a serialized payload, or in a public signature outside those modules.
+
 Never add a dependency that would move passphrase handling into our process
 without updating ADR-3 in `PLAN.md` first.
 

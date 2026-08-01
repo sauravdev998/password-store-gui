@@ -43,6 +43,7 @@ mobile apps, etc.
 
 ### Rust crates (initial)
 - `tauri` (2.x) + relevant plugins
+- `prs-lib` (GPL-3) — store, recipients, GPG backends, git; wrapped, never exposed (ADR-4)
 - `git2` — git operations
 - `arboard` — clipboard (used from the core, not JS)
 - `zeroize`, `secrecy` — wipe/guard plaintext
@@ -81,13 +82,21 @@ Record decisions here as they're made or changed.
   builds use `panic = "abort"` + `strip` — no unwinding through secret buffers,
   no symbol names in the shipped binary. Logging is registered only under
   `debug_assertions`, so release builds have no log sink to leak into.
-- **ADR-4 — Core-building approach: _CONFIRM BEFORE PHASE 1_.**
-  Default assumption in this plan: **build a thin native core ourselves**, using
-  [`prs-lib`](https://sr.ht/~timvisee/prs/) as the reference implementation to
-  crib from. **Alternative:** depend on `prs-lib` directly (it already does store
-  parsing, the same GPG backends, git, recipients, history). Wrapping `prs-lib`
-  collapses Phases 2–4 into "integrate the library" — choose it if speed matters
-  more than owning the core. **This choice gates Phase 1; see Open Decisions.**
+- **ADR-4 — RESOLVED: wrap [`prs-lib`](https://sr.ht/~timvisee/prs/) behind our
+  own traits.** `prs-lib` (0.5.7) already implements store parsing, `.gpg-id`
+  recipients, git, history, and exactly the backend set ADR-3 calls for
+  (`backend-gnupg-bin` default, `backend-gpgme`, `backend-rpgpie` behind
+  features). We depend on it, but define our own `Store`/`Gpg` traits and domain
+  types in `store/` and `crypto/`; `prs-lib` types live only in the impl modules
+  and never reach `commands.rs` or the frontend. That seam lets us replace any
+  piece whose behavior conflicts with §4 without touching the command surface.
+  **Consequences:**
+  - The app is **GPL-3.0-or-later** (`prs-lib` is GPL-3). Set in `Cargo.toml`.
+  - **Before we trust it**, audit `prs-lib`'s plaintext handling against §4:
+    does it ever write plaintext to disk, does it zeroize, does it use loopback
+    pinentry, can an error carry secret material? Record findings here. Wrap or
+    replace anything that fails.
+  - Phases 2–4 become integration work rather than reimplementation.
 
 ---
 
@@ -135,8 +144,8 @@ password-store-gui/
     └── src/
         ├── main.rs
         ├── lib.rs
-        ├── store/            # tree walk, entry model, .gpg-id resolution, parse
-        ├── crypto/           # Gpg trait + GnupgBin backend (+ future gpgme/rpgp)
+        ├── store/            # our types + Store trait; prs.rs holds the prs-lib impl
+        ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib's gnupg-bin backend
         ├── git.rs            # status, commit, pull, push, per-entry history
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
         ├── secret.rs         # zeroizing secret newtypes
@@ -163,18 +172,21 @@ password-store-gui/
 
 > Update **Status**: ☐ todo · ◐ in progress · ☑ done
 
-### Phase 0 — Scaffold & decision — Status: ◐
+### Phase 0 — Scaffold & decision — Status: ☑
 - ☑ Init Tauri 2 app with React + TS + Tailwind + Vite via pnpm.
 - ☑ Window renders on Linux (verified); `core_version` round-trips over IPC under
   a strict CSP. macOS/Windows unverified locally — CI is the check.
 - ☑ CI workflow (`.github/workflows/ci.yml`): fmt + clippy `-D warnings` + test +
   bundle on Linux/macOS/Windows. Written but not yet run — no remote configured.
 - ☑ Add `CLAUDE.md` with conventions from §9.
-- ☐ **Resolve ADR-4** (own core vs wrap `prs-lib`) before starting Phase 1.
+- ☑ **ADR-4 resolved:** wrap `prs-lib` behind our own traits (see §3).
 
 ### Phase 1 — Read-only core — Status: ☐
-- `store`: locate store, walk tree, resolve `.gpg-id`.
-- `crypto`: `Gpg` trait + `GnupgBin` impl (spawn `gpg --batch`, stdin→stdout, no disk).
+- **Audit `prs-lib` against §4 first** (ADR-4) — the result may change what we wrap.
+- `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate store,
+  walk tree, resolve `.gpg-id`.
+- `crypto`: our `Gpg` trait; `prs-lib`'s `backend-gnupg-bin` behind it (spawns
+  `gpg`, stdin→stdout, no disk). No `prs-lib` type crosses out of these modules.
 - Parse decrypted plaintext into the Entry model.
 - Commands: `list_tree`, `show_entry` (returns metadata; password revealed only on demand).
 - Frontend: tree browser + entry detail with password **hidden by default** and a reveal toggle.
@@ -241,8 +253,8 @@ password-store-gui/
 
 ## 10. Open decisions (resolve as you go)
 
-1. **ADR-4 — own core vs wrap `prs-lib`.** Gates Phase 1. *Recommended default:
-   own thin core using `prs-lib` as reference; switch to wrapping it if velocity matters most.*
+1. ~~**ADR-4 — own core vs wrap `prs-lib`.**~~ Resolved: wrap it behind our own
+   traits. See §3 ADR-4 for the consequences, including the required §4 audit.
 2. **Git network auth.** `git2` credential callbacks (SSH/HTTPS in-process) vs.
    shelling to the user's `git` for remote ops so their credential helpers just work.
    Leaning: shell to `git` for network ops, `git2` for local — simplest and most compatible.
