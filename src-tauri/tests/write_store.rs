@@ -21,14 +21,68 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use password_store_gui_lib::clipboard::{Backend, Clipboard, Scheduler};
 use password_store_gui_lib::commands::Core;
-use password_store_gui_lib::error::Error;
+use password_store_gui_lib::error::{Error, Result};
 use password_store_gui_lib::generate::Recipe;
+use password_store_gui_lib::secret::Secret;
 use password_store_gui_lib::store::EntryName;
 
 fn name(s: &str) -> EntryName {
     EntryName::new(s).unwrap()
+}
+
+/// A clipboard that lives in this process and nowhere else.
+///
+/// The point is what it is *not*. `Core::generate` copies, and `Core::new`
+/// wires up the real system clipboard — so going through that here would
+/// overwrite whatever the developer running `cargo test` had copied. Worse,
+/// on Wayland and X11 the clipboard is served by the process that set it, so
+/// the value would vanish with the test process and leave them with an empty
+/// clipboard rather than a wrong one. CI cannot catch this: with no display
+/// server the copy fails and the test passes anyway.
+#[derive(Clone, Default)]
+struct TestClipboard(Arc<Mutex<Option<String>>>);
+
+impl TestClipboard {
+    fn contents(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Backend for TestClipboard {
+    fn set_text(&mut self, text: &str) -> Result<()> {
+        *self.0.lock().unwrap() = Some(text.to_owned());
+        Ok(())
+    }
+
+    fn text(&mut self) -> Result<Option<Secret>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|text| Secret::from_slice(text.as_bytes())))
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+/// A scheduler whose timers never fire.
+///
+/// The clip window is not what this test is about, and `clipboard.rs` already
+/// pins the auto-clear rule deterministically against its own stubs. Here it
+/// only matters that nothing outlives the test.
+struct NeverFires;
+
+impl Scheduler for NeverFires {
+    fn schedule(&self, _delay: Duration, _task: Box<dyn FnOnce() + Send + 'static>) {}
 }
 
 /// Read an entry back through `pass show`, or `None` if `pass` is not installed.
@@ -68,7 +122,13 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
     // special-cased one.
     std::env::set_var("PASSWORD_STORE_DIR", store.path());
 
-    let core = Core::new();
+    // Never `Core::new()` here: see [`TestClipboard`].
+    let clipboard = TestClipboard::default();
+    let core = Core::with_clipboard(Clipboard::new(
+        Box::new(clipboard.clone()),
+        Box::new(NeverFires),
+        Duration::from_secs(45),
+    ));
 
     // --- insert ---------------------------------------------------------
     let gmail = name("Email/gmail.com");
@@ -98,17 +158,29 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
     // The generated password is never returned, so what it *is* can only be
     // learned by reading the entry back — which is the property under test.
     let wifi = name("wifi");
-    core.generate(
-        &wifi,
-        Recipe {
-            length: 24,
-            symbols: false,
-        },
-        None,
-    )
-    .unwrap();
+    let receipt = core
+        .generate(
+            &wifi,
+            Recipe {
+                length: 24,
+                symbols: false,
+            },
+            None,
+        )
+        .unwrap();
     let generated = core.reveal_password(&wifi).unwrap();
     assert_eq!(generated.len(), 24);
+
+    // The password reached the clipboard from inside the core, and the receipt
+    // said only when it would be wiped (Invariant 2).
+    assert_eq!(clipboard.contents().as_deref(), Some(generated.as_str()));
+    // `Some` because `TestClipboard` always opens; the `None` arm is the
+    // no-display-server case, where the entry is still created.
+    let receipt = receipt.unwrap();
+    assert_eq!(receipt.clears_in_secs, 45);
+    assert!(!serde_json::to_string(&receipt)
+        .unwrap()
+        .contains(&generated));
     if let Some(shown) = pass_show(store.path(), "wifi") {
         assert_eq!(shown.trim_end_matches('\n'), generated);
     }

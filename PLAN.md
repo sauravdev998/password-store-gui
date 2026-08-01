@@ -523,6 +523,14 @@ password-store-gui/
   real `pass` binary (guard with a CI check where `pass` is available).
 - **Security checks:** assert no plaintext in serialized command outputs except the
   explicit reveal path; assert clipboard clears after timeout; grep logs for secrets in tests.
+- **No test may touch the real clipboard.** It is shared state belonging to the
+  user's desktop session, not to the process, and on Wayland and X11 the value
+  is *served by the process that set it* — so a test that copies through
+  `Core::new` does not merely overwrite what the developer had, it leaves them
+  with an empty clipboard when the test process exits. CI cannot catch this:
+  with no display server the copy fails and the test passes anyway. Build a
+  `Core` with `Core::with_clipboard` and an in-process `Backend` instead; the
+  `Backend`/`Scheduler` traits are public for exactly this.
 - **Frontend:** light component tests for tree/detail; no secret ever stored in frontend state longer than a render.
 
 ---

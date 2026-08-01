@@ -61,10 +61,24 @@ impl Core {
     /// The real store — `PASSWORD_STORE_DIR`, else `~/.password-store` — read
     /// through the user's `gpg`, copying to the system clipboard.
     pub fn new() -> Self {
+        Self::with_clipboard(Clipboard::system())
+    }
+
+    /// The real store and backend, with a clipboard of the caller's choosing.
+    ///
+    /// Exists for the integration tests, and the reason is not tidiness. A
+    /// clipboard is shared mutable state belonging to the user's desktop
+    /// session, not to the process: a test that copied through
+    /// [`Core::new`] would overwrite whatever the developer had on it — and
+    /// since a Wayland or X11 clipboard is served by the process that set it,
+    /// would take the value away entirely when the test process exited. CI
+    /// cannot catch that, because CI has no display server for the copy to
+    /// succeed on. So the seam is here rather than left to be remembered.
+    pub fn with_clipboard(clipboard: Clipboard) -> Self {
         Self::from_parts(
             Box::new(|| Ok(Box::new(PrsStore::open_default()?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
-            Clipboard::system(),
+            clipboard,
         )
     }
 
