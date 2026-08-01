@@ -5,12 +5,17 @@
 //! contents and never anything derived from them. Keep it that way: a new
 //! variant that interpolates a decrypted buffer is a security bug, not a
 //! formatting choice.
+//!
+//! The single exception is [`Error::GpgUnavailable`], which carries a message
+//! from the crypto backend. It is safe because of when it is raised, not
+//! because the backend is trusted — see the variant's own note.
 
 use std::io;
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::secret::NotUtf8;
 use crate::store::{EntryName, InvalidName};
 
 /// Crate result type.
@@ -35,6 +40,26 @@ pub enum Error {
 
     #[error("the .gpg-id file at {path} lists no recipients")]
     EmptyRecipients { path: PathBuf },
+
+    /// No usable `gpg` binary.
+    ///
+    /// `reason` comes from the backend, which is safe only because this is
+    /// raised while *building* a crypto context — before any ciphertext has
+    /// been read, so there is no plaintext in the process to capture. See the
+    /// note on `crypto::prs::describe`; do not reuse the pattern elsewhere.
+    #[error("no usable GnuPG installation: {reason}")]
+    GpgUnavailable { reason: String },
+
+    /// Decryption failed.
+    ///
+    /// Carries the ciphertext's path and nothing else — deliberately not the
+    /// backend's error, since this is the one path where plaintext exists in
+    /// the process (Invariant 5).
+    #[error("failed to decrypt {path}")]
+    Decrypt { path: PathBuf },
+
+    #[error(transparent)]
+    NotUtf8(#[from] NotUtf8),
 
     #[error("failed to read {path}")]
     Io {

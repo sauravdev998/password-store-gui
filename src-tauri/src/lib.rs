@@ -1,5 +1,7 @@
 mod commands;
+pub mod crypto;
 pub mod error;
+pub mod secret;
 pub mod store;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

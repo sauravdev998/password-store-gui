@@ -265,8 +265,18 @@ password-store-gui/
   (F-1). `EntryName` is the validation choke point for F-6 and constructs
   `prs_lib::Store` field-wise to bypass `shellexpand`. Names we reject surface
   as `Tree::unsupported` rather than disappearing from the tree.
-- `crypto`: our `Gpg` trait; `prs-lib`'s `backend-gnupg-bin` behind it (spawns
+- ☑ `crypto`: our `Gpg` trait; `prs-lib`'s `backend-gnupg-bin` behind it (spawns
   `gpg`, stdin→stdout, no disk). No `prs-lib` type crosses out of these modules.
+  `crypto/prs.rs` builds `crypto::Config` itself so `gpg_tty` (F-2) and
+  `verbose` (F-3) are `false` at a site we own and test. `secret.rs` holds
+  `Secret`, which implements no `Debug` — so no struct containing one can
+  derive it either, making Invariant 4 a compile error rather than a review
+  note. `tests/gpg_roundtrip.rs` does the §8 round trip against a real `gpg`
+  in an ephemeral `GNUPGHOME`.
+  - *Note:* `prs_lib::crypto::Context` is a `Box<dyn IsContext>` with no `Send`
+    bound, so it cannot live in Tauri's shared state and `unsafe_code` is
+    forbidden. It is cached in a `thread_local!` instead — it holds no secret,
+    only the `gpg` path and the two flags above.
 - Parse decrypted plaintext into the Entry model.
 - Commands: `list_tree`, `show_entry` (returns metadata; password revealed only on demand).
 - Frontend: tree browser + entry detail with password **hidden by default** and a reveal toggle.
