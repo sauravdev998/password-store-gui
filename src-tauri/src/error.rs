@@ -46,6 +46,20 @@ pub enum Error {
     #[error("entry {name} has no notes")]
     NoNotes { name: EntryName },
 
+    #[error("entry {name} has no one-time-password source")]
+    NoOtp { name: EntryName },
+
+    /// The entry's `otpauth://` URI could not be read as a TOTP source.
+    ///
+    /// Carries nothing on purpose. `totp_rs::TotpUrlError` quotes the URI it
+    /// rejected in several of its variants, and that URI contains the shared
+    /// seed — so the parse error is dropped rather than wrapped.
+    #[error("the entry's otpauth:// URI is not a usable TOTP source")]
+    InvalidOtpUri,
+
+    #[error("the system clock is set before the Unix epoch")]
+    SystemClock,
+
     #[error("no .gpg-id file found for {name}")]
     NoRecipients { name: EntryName },
 
@@ -68,6 +82,22 @@ pub enum Error {
     /// the process (Invariant 5).
     #[error("failed to decrypt {path}")]
     Decrypt { path: PathBuf },
+
+    /// Clipboard failures, with none of the platform's own error text.
+    ///
+    /// `arboard`'s messages are not known to quote clipboard *contents*, but
+    /// the clipboard is the one subsystem whose whole job at this point is
+    /// holding a password — so these are secret-free by construction rather
+    /// than by audit, and the timer thread that fires most of them has no
+    /// caller to report to anyway.
+    #[error("no usable clipboard on this system")]
+    ClipboardUnavailable,
+
+    #[error("could not write to the clipboard")]
+    ClipboardWrite,
+
+    #[error("could not read the clipboard")]
+    ClipboardRead,
 
     #[error(transparent)]
     NotUtf8(#[from] NotUtf8),

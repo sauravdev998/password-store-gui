@@ -1,6 +1,8 @@
+pub mod clipboard;
 pub mod commands;
 pub mod crypto;
 pub mod error;
+pub mod otp;
 pub mod secret;
 pub mod store;
 
