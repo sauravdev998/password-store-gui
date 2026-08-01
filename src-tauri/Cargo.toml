@@ -38,6 +38,10 @@ tempfile = "3"
 # OS entropy for `generate`, taken directly rather than through a seeded
 # generator. Already in the tree transitively, so it costs no build time.
 getrandom = "0.3"
+# `std::fs::canonicalize` returns a `\\?\` verbatim path on Windows, which we
+# then hand to `gpg` as an argument. See `store::prs::PrsStore::open`. No
+# dependencies of its own, and a plain re-export of `std` off Windows.
+dunce = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
