@@ -46,15 +46,33 @@ jobs:
       # is treated as relative and joined onto gpg's cwd. Install a native
       # GnuPG and put it first on PATH — also the configuration Windows users
       # actually have.
+      #
+      # Installed from upstream rather than via Chocolatey: `choco install
+      # gnupg` reliably stalls at "Installing gnupg..." on the hosted Windows
+      # runners until the step times out. It is not specific to this package
+      # (gpg4win and openssl do the same), and the known workaround is to
+      # rewrite the machine PATH first, which is more fragile than a download.
+      # The checksum is the one published on gnupg.org/download/integrity_check.
       - name: Install a native GnuPG
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          choco install gnupg --no-progress -y
-          $gpg = Get-ChildItem 'C:\Program Files (x86)\GnuPG', 'C:\Program Files\GnuPG' `
-            -Filter gpg.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $gpg) { throw 'native gpg.exe not found after install' }
-          $gpg.Directory.FullName | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://gnupg.org/ftp/gcrypt/binary/gnupg-w32-2.5.21_20260702.exe'
+          $want = '6246c925a73167253444afc24a0deb83a3f43b7d636af84d6aaf48a98a62f024'
+          $exe = Join-Path $env:RUNNER_TEMP 'gnupg-w32.exe'
+
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          $got = (Get-FileHash $exe -Algorithm SHA256).Hash
+          if ($got -ne $want) { throw "gnupg installer checksum mismatch: $got" }
+
+          # NSIS: /S is silent, /D is the target directory and must come last
+          # and stay unquoted. A space-free path keeps gpg's own quoting simple.
+          Start-Process $exe -ArgumentList '/S', '/D=C:\gnupg' -Wait -NoNewWindow
+
+          if (-not (Test-Path 'C:\gnupg\bin\gpg.exe')) { throw 'native gpg.exe not found after install' }
+          # GITHUB_PATH prepends, so this wins over Git for Windows' gpg.
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\gnupg\bin' -Encoding utf8
 
       - uses: dtolnay/rust-toolchain@stable
         with:
