@@ -29,11 +29,18 @@ impl PrsStore {
     /// The path is canonicalized here, which is also what makes
     /// `strip_prefix` in [`EntryName::from_secret_path`] reliable: every path
     /// the walker yields is then a literal descendant of this root.
+    ///
+    /// Canonicalized through `dunce` rather than [`Path::canonicalize`]: on
+    /// Windows the latter returns an extended-length `\\?\C:\...` path, and
+    /// every entry path is derived from this root and handed to `gpg` on a
+    /// command line. `gpg` does not accept that form — it fails to open the
+    /// file, reporting a mangled name — so the root must stay an ordinary
+    /// path. `dunce` strips the prefix only when the result still names the
+    /// same file, and is `std`'s own function everywhere but Windows.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let canonical = root
-            .canonicalize()
-            .map_err(|_| Error::StoreNotFound { path: root.into() })?;
+        let canonical =
+            dunce::canonicalize(root).map_err(|_| Error::StoreNotFound { path: root.into() })?;
 
         if !canonical.is_dir() {
             return Err(Error::StoreNotFound { path: canonical });
@@ -293,7 +300,28 @@ mod tests {
         fs::write(root.join("a.gpg"), b"x").unwrap();
 
         let opened = PrsStore::open(&root).unwrap();
-        assert_eq!(opened.root(), root.canonicalize().unwrap());
+        assert_eq!(opened.root(), dunce::canonicalize(&root).unwrap());
         assert_eq!(entry_names(&opened.tree().unwrap()), vec!["a"]);
+    }
+
+    /// Entry paths are built from the root and passed to `gpg` as command-line
+    /// arguments, and `gpg` cannot open an extended-length `\\?\C:\...` path —
+    /// which is exactly what `Path::canonicalize` hands back on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_root_is_not_an_extended_length_path() {
+        use std::path::{Component, Prefix};
+
+        let store = fixture(&["Email/gmail.com.gpg"]);
+        let opened = PrsStore::open(store.path()).unwrap();
+
+        let prefix = match opened.root().components().next() {
+            Some(Component::Prefix(prefix)) => prefix.kind(),
+            other => panic!("a Windows root must start with a prefix, got {other:?}"),
+        };
+        assert!(
+            matches!(prefix, Prefix::Disk(_)),
+            "the root must be an ordinary drive path, got {prefix:?}"
+        );
     }
 }
