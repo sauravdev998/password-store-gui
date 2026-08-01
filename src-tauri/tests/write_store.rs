@@ -181,8 +181,8 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
     assert_eq!(clipboard.contents().as_deref(), Some(generated.as_str()));
     // `Some` because `TestClipboard` always opens; the `None` arm is the
     // no-display-server case, where the entry is still created.
-    let receipt = receipt.unwrap();
-    assert_eq!(receipt.clears_in_secs, 45);
+    let clip = receipt.clipboard.unwrap();
+    assert_eq!(clip.clears_in_secs, 45);
     assert!(!serde_json::to_string(&receipt)
         .unwrap()
         .contains(&generated));
@@ -233,7 +233,7 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
     match core.insert(&gmail, &secret("clobbered")) {
         Err(Error::EntryExists { .. }) => {}
         Err(other) => panic!("expected EntryExists, got {other}"),
-        Ok(()) => panic!("insert must not overwrite"),
+        Ok(_) => panic!("insert must not overwrite"),
     }
     assert_eq!(core.reveal_password(&gmail).unwrap(), "new-password");
 }

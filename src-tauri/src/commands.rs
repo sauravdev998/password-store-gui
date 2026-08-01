@@ -20,7 +20,7 @@
 //! it can be tested against a fake store and a fake backend without standing up
 //! a Tauri app.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tauri::State;
@@ -29,6 +29,7 @@ use crate::clipboard::Clipboard;
 use crate::crypto::{Gpg, PrsGpg};
 use crate::error::{Error, Result};
 use crate::generate;
+use crate::git::{Change, GitRepo, Vcs};
 use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
 use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
@@ -53,11 +54,19 @@ use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
 pub struct Core {
     store: StoreFactory,
     gpg: GpgFactory,
+    git: VcsFactory,
     clipboard: Clipboard,
 }
 
 type StoreFactory = Box<dyn Fn() -> Result<Box<dyn Store>> + Send + Sync>;
 type GpgFactory = Box<dyn Fn() -> Result<Box<dyn Gpg>> + Send + Sync>;
+
+/// Opens the store's repository, if it has one.
+///
+/// `Option` rather than `Result` because a store with no git repository is the
+/// ordinary case, not a failure — `pass git init` is optional and most stores
+/// never run it.
+type VcsFactory = Box<dyn Fn(&Path) -> Option<Box<dyn Vcs>> + Send + Sync>;
 
 impl Core {
     /// The real store — `PASSWORD_STORE_DIR`, else `~/.password-store` — read
@@ -80,6 +89,7 @@ impl Core {
         Self::from_parts(
             Box::new(|| Ok(Box::new(PrsStore::open_default()?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            Box::new(real_git),
             clipboard,
         )
     }
@@ -99,15 +109,23 @@ impl Core {
         Self::from_parts(
             Box::new(move || Ok(Box::new(PrsStore::open(&root)?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            Box::new(real_git),
             clipboard,
         )
     }
 
-    /// Seam for the tests below: any [`Store`], any [`Gpg`], any clipboard.
-    fn from_parts(store: StoreFactory, gpg: GpgFactory, clipboard: Clipboard) -> Self {
+    /// Seam for the tests below: any [`Store`], any [`Gpg`], any history, any
+    /// clipboard.
+    fn from_parts(
+        store: StoreFactory,
+        gpg: GpgFactory,
+        git: VcsFactory,
+        clipboard: Clipboard,
+    ) -> Self {
         Self {
             store,
             gpg,
+            git,
             clipboard,
         }
     }
@@ -151,6 +169,26 @@ impl Core {
             .notes()
             .ok_or_else(|| Error::NoNotes { name: name.clone() })?;
         reveal(notes)
+    }
+
+    /// The entry's plaintext, whole and unparsed — what the edit form loads.
+    ///
+    /// The one command that returns more than a single value, and the only path
+    /// by which an `otpauth://` URI can reach the webview. Both are deliberate.
+    /// Invariant 2 permits what the user explicitly reveals, and editing an
+    /// entry *is* asking for its whole text: `pass edit` opens the decrypted
+    /// file in `$EDITOR`, and there is no smaller request that can be served —
+    /// [`Core::edit`] replaces the entire body, so writing one requires having
+    /// read one. Splitting it into per-field edits would mean holding the
+    /// unedited remainder decrypted between commands, which is the cache Phase 1
+    /// deliberately does not have.
+    ///
+    /// It is not the OTP row's reveal and must not be used as one: that row
+    /// exists so the *code* can be had without the seed. This is reached only
+    /// by opening an editor on the entry, and the form that receives it drops it
+    /// when it closes.
+    pub fn reveal_entry(&self, name: &EntryName) -> Result<String> {
+        reveal(&self.plaintext(name)?)
     }
 
     /// Copy the password to the clipboard.
@@ -209,21 +247,23 @@ impl Core {
     /// Refuses to overwrite: replacing an existing entry is [`Core::edit`], and
     /// keeping them apart is what stops a mistyped name from silently
     /// destroying a password.
-    pub fn insert(&self, name: &EntryName, body: &Secret) -> Result<()> {
+    pub fn insert(&self, name: &EntryName, body: &Secret) -> Result<WriteReceipt> {
         let store = (self.store)()?;
         if store.contains(name) {
             return Err(Error::EntryExists { name: name.clone() });
         }
-        self.write(&*store, name, body)
+        self.write(&*store, name, body)?;
+        Ok(self.record(&*store, Change::Insert(name)))
     }
 
     /// Replace an existing entry's contents.
-    pub fn edit(&self, name: &EntryName, body: &Secret) -> Result<()> {
+    pub fn edit(&self, name: &EntryName, body: &Secret) -> Result<WriteReceipt> {
         let store = (self.store)()?;
         if !store.contains(name) {
             return Err(Error::EntryNotFound { name: name.clone() });
         }
-        self.write(&*store, name, body)
+        self.write(&*store, name, body)?;
+        Ok(self.record(&*store, Change::Edit(name)))
     }
 
     /// Create an entry whose password is generated here.
@@ -243,7 +283,7 @@ impl Core {
         name: &EntryName,
         recipe: generate::Recipe,
         body: Option<&Secret>,
-    ) -> Result<Option<CopyReceipt>> {
+    ) -> Result<WriteReceipt> {
         let store = (self.store)()?;
         if store.contains(name) {
             return Err(Error::EntryExists { name: name.clone() });
@@ -264,38 +304,67 @@ impl Core {
         };
 
         self.write(&*store, name, &entry)?;
-        Ok(self.copy(&password).ok())
+        let mut receipt = self.record(&*store, Change::Generate(name));
+        receipt.clipboard = self.copy(&password).ok();
+        Ok(receipt)
     }
 
     /// Delete an entry.
-    pub fn remove(&self, name: &EntryName) -> Result<()> {
-        (self.store)()?.remove(name)
+    pub fn remove(&self, name: &EntryName) -> Result<WriteReceipt> {
+        let store = (self.store)()?;
+        store.remove(name)?;
+        Ok(self.record(&*store, Change::Remove(name)))
     }
 
     /// Move an entry to a new name.
-    pub fn rename(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+    pub fn rename(&self, from: &EntryName, to: &EntryName) -> Result<WriteReceipt> {
         let store = (self.store)()?;
         if self.same_recipients(&*store, from, to)? {
-            return store.rename_file(from, to);
+            store.rename_file(from, to)?;
+        } else {
+            // Across a recipient boundary the ciphertext cannot simply move:
+            // the destination's `.gpg-id` names a different audience
+            // (Invariant 8), so the entry is decrypted and encrypted again for
+            // it. The source is removed only once the new file exists.
+            self.reencrypt(&*store, from, to)?;
+            store.remove(from)?;
         }
-        // Across a recipient boundary the ciphertext cannot simply move: the
-        // destination's `.gpg-id` names a different audience (Invariant 8), so
-        // the entry is decrypted and encrypted again for it. The source is
-        // removed only once the new file exists.
-        self.reencrypt(&*store, from, to)?;
-        store.remove(from)
+        Ok(self.record(&*store, Change::Rename { from, to }))
     }
 
     /// Copy an entry to a new name, leaving the original.
     ///
     /// Named apart from [`Core::copy`], which is the clipboard: on this surface
     /// "copy" already means something, and the two must not read alike.
-    pub fn copy_entry(&self, from: &EntryName, to: &EntryName) -> Result<()> {
+    pub fn copy_entry(&self, from: &EntryName, to: &EntryName) -> Result<WriteReceipt> {
         let store = (self.store)()?;
         if self.same_recipients(&*store, from, to)? {
-            return store.copy_file(from, to);
+            store.copy_file(from, to)?;
+        } else {
+            self.reencrypt(&*store, from, to)?;
         }
-        self.reencrypt(&*store, from, to)
+        Ok(self.record(&*store, Change::Copy { from, to }))
+    }
+
+    /// Record a completed mutation in the store's history.
+    ///
+    /// Infallible by design. Everything it could report has already happened on
+    /// disk, so a commit that does not go through is news about the *history*,
+    /// not about the entry — and returning `Err` here would tell the user their
+    /// password was not saved when it was. The outcome rides back in the
+    /// receipt and the interface says which of the two is true (§4.1
+    /// principle 5).
+    fn record(&self, store: &dyn Store, change: Change<'_>) -> WriteReceipt {
+        let commit = (self.git)(store.root()).map(|repo| {
+            match repo.commit(&change.message(), &change.paths()) {
+                Ok(()) => Commit::Committed,
+                Err(err) => Commit::Failed(err.to_string()),
+            }
+        });
+        WriteReceipt {
+            commit,
+            clipboard: None,
+        }
     }
 
     /// Whether two names are governed by the same `.gpg-id` file.
@@ -336,9 +405,13 @@ impl Core {
     /// serve one request and dropped with it — never stored, never returned
     /// past this module.
     fn entry(&self, name: &EntryName) -> Result<Entry> {
+        Entry::parse(self.plaintext(name)?)
+    }
+
+    /// Decrypt `name`, unparsed.
+    fn plaintext(&self, name: &EntryName) -> Result<Secret> {
         let path = (self.store)()?.secret_path(name)?;
-        let plaintext = (self.gpg)()?.decrypt_file(&path)?;
-        Entry::parse(plaintext)
+        (self.gpg)()?.decrypt_file(&path)
     }
 
     /// The single place a [`Secret`] reaches the clipboard.
@@ -363,6 +436,39 @@ impl Core {
 pub struct CopyReceipt {
     /// Seconds until the auto-clear fires, so the UI can count down with it.
     pub clears_in_secs: u64,
+}
+
+/// What a mutation tells the webview: what happened *around* the write.
+///
+/// Nothing about what was written, for the same reason [`CopyReceipt`] says
+/// nothing about what was copied. The write itself is reported by the command
+/// returning `Ok` at all — everything here is a side effect that can fail
+/// without the entry failing with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteReceipt {
+    /// What became of the store's history. `None` when the store is not a git
+    /// repository, which is the ordinary case rather than a problem.
+    pub commit: Option<Commit>,
+    /// Only `generate` fills this: the password it made went straight to the
+    /// clipboard, never through the webview.
+    pub clipboard: Option<CopyReceipt>,
+}
+
+/// Whether the change reached the store's git history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status", content = "reason")]
+pub enum Commit {
+    Committed,
+    /// The entry was written; the commit was not made. Carries a secret-free
+    /// explanation — see [`crate::error::Error::Git`] for why git's own
+    /// messages are safe to relay when the crypto layer's are not.
+    Failed(String),
+}
+
+/// The real repository, discovered from the store root.
+fn real_git(root: &Path) -> Option<Box<dyn Vcs>> {
+    GitRepo::discover(root).map(|repo| Box::new(repo) as Box<dyn Vcs>)
 }
 
 impl Default for Core {
@@ -421,6 +527,16 @@ pub fn reveal_notes(name: EntryName, core: State<'_, Core>) -> Result<String> {
     core.reveal_notes(&name)
 }
 
+/// Load an entry's whole plaintext into the edit form.
+///
+/// The one reveal that returns more than a single value; see
+/// [`Core::reveal_entry`] for why editing is the request that justifies it.
+/// Call it from opening an editor and from nowhere else.
+#[tauri::command]
+pub fn reveal_entry(name: EntryName, core: State<'_, Core>) -> Result<String> {
+    core.reveal_entry(&name)
+}
+
 // The OTP URI deliberately has no reveal command: it embeds the shared TOTP
 // seed, and what a user actually wants to see is the six-digit code. That is
 // what `otp_code` returns, computed in the core.
@@ -476,13 +592,17 @@ fn body(text: String) -> Secret {
 
 /// Create an entry. Fails rather than overwriting an existing one.
 #[tauri::command]
-pub fn insert_entry(name: EntryName, content: String, core: State<'_, Core>) -> Result<()> {
+pub fn insert_entry(
+    name: EntryName,
+    content: String,
+    core: State<'_, Core>,
+) -> Result<WriteReceipt> {
     core.insert(&name, &body(content))
 }
 
 /// Replace an existing entry's contents.
 #[tauri::command]
-pub fn edit_entry(name: EntryName, content: String, core: State<'_, Core>) -> Result<()> {
+pub fn edit_entry(name: EntryName, content: String, core: State<'_, Core>) -> Result<WriteReceipt> {
     core.edit(&name, &body(content))
 }
 
@@ -494,26 +614,26 @@ pub fn generate_entry(
     recipe: generate::Recipe,
     content: Option<String>,
     core: State<'_, Core>,
-) -> Result<Option<CopyReceipt>> {
+) -> Result<WriteReceipt> {
     let rest = content.map(body);
     core.generate(&name, recipe, rest.as_ref())
 }
 
 /// Delete an entry.
 #[tauri::command]
-pub fn remove_entry(name: EntryName, core: State<'_, Core>) -> Result<()> {
+pub fn remove_entry(name: EntryName, core: State<'_, Core>) -> Result<WriteReceipt> {
     core.remove(&name)
 }
 
 /// Move an entry, re-encrypting if the destination has different recipients.
 #[tauri::command]
-pub fn rename_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<()> {
+pub fn rename_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<WriteReceipt> {
     core.rename(&from, &to)
 }
 
 /// Copy an entry, re-encrypting if the destination has different recipients.
 #[tauri::command]
-pub fn copy_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<()> {
+pub fn copy_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Result<WriteReceipt> {
     core.copy_entry(&from, &to)
 }
 
@@ -703,20 +823,70 @@ mod tests {
     /// a receipt carrying it is evidence it came from the configured value.
     const CLIP_TIME: Duration = Duration::from_secs(20);
 
+    /// One recorded commit: the message, and the paths it was asked to stage.
+    type Recorded = (String, Vec<PathBuf>);
+
+    /// A history that records what it was asked to commit rather than writing
+    /// one, so a test can read the message and the paths without a repository.
+    #[derive(Clone, Default)]
+    struct FakeVcs {
+        commits: Arc<Mutex<Vec<Recorded>>>,
+        /// When set, every commit fails with it — the store *is* versioned but
+        /// git will not take the change.
+        refuses: Option<&'static str>,
+    }
+
+    impl Vcs for FakeVcs {
+        fn commit(&self, message: &str, paths: &[PathBuf]) -> Result<()> {
+            if let Some(reason) = self.refuses {
+                return Err(Error::Git {
+                    reason: reason.to_owned(),
+                });
+            }
+            lock(&self.commits).push((message.to_owned(), paths.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A core over in-memory fakes, with the handles a test needs to see what
+    /// reached the clipboard, what was encrypted, and what was committed.
+    struct Parts {
+        core: Core,
+        clipboard: StubBackend,
+        scheduler: StubScheduler,
+        gpg: FakeGpg,
+        git: FakeVcs,
+    }
+
     /// A core over the given `name -> plaintext` pairs, plus the handles a test
     /// needs to see what reached the clipboard and to fire its timer.
     fn core_with_clipboard(
         entries: &[(&'static str, &'static str)],
     ) -> (Core, StubBackend, StubScheduler) {
-        let (core, backend, scheduler, _) = core_with_parts(entries);
-        (core, backend, scheduler)
+        let parts = core_with_parts(entries);
+        (parts.core, parts.clipboard, parts.scheduler)
     }
 
-    /// As [`core_with_clipboard`], plus the backend handle a write test needs to
-    /// see what was encrypted and to whom.
-    fn core_with_parts(
-        entries: &[(&'static str, &'static str)],
-    ) -> (Core, StubBackend, StubScheduler, FakeGpg) {
+    /// As [`core_with_clipboard`], with every fake exposed.
+    fn core_with_parts(entries: &[(&'static str, &'static str)]) -> Parts {
+        core_with_git(entries, FakeVcs::default())
+    }
+
+    /// A core whose store is versioned by `git`.
+    fn core_with_git(entries: &[(&'static str, &'static str)], git: FakeVcs) -> Parts {
+        core_from(entries, {
+            let git = git.clone();
+            Box::new(move |_| Some(Box::new(git.clone())))
+        })
+        .with_git(git)
+    }
+
+    /// A core whose store is not a git repository at all — the ordinary case.
+    fn core_without_git(entries: &[(&'static str, &'static str)]) -> Parts {
+        core_from(entries, Box::new(|_| None))
+    }
+
+    fn core_from(entries: &[(&'static str, &'static str)], git: VcsFactory) -> Parts {
         let gpg = FakeGpg::with(entries, Path::new(ROOT));
         let backend = StubBackend::default();
         let scheduler = StubScheduler::default();
@@ -731,13 +901,27 @@ mod tests {
                 }))
             }),
             Box::new(move || Ok(Box::new(command_gpg.clone()))),
+            git,
             Clipboard::new(
                 Box::new(backend.clone()),
                 Box::new(scheduler.clone()),
                 CLIP_TIME,
             ),
         );
-        (core, backend, scheduler, gpg)
+        Parts {
+            core,
+            clipboard: backend,
+            scheduler,
+            gpg,
+            git: FakeVcs::default(),
+        }
+    }
+
+    impl Parts {
+        fn with_git(mut self, git: FakeVcs) -> Self {
+            self.git = git;
+            self
+        }
     }
 
     /// A core over the given `name -> plaintext` pairs.
@@ -786,6 +970,7 @@ mod tests {
                     reason: "listing must not decrypt".into(),
                 })
             }),
+            Box::new(|_| None),
             unused_clipboard(),
         );
 
@@ -872,6 +1057,17 @@ mod tests {
         assert_eq!(
             store().reveal_notes(&name_of("Email/gmail.com")).unwrap(),
             "remember the milk"
+        );
+    }
+
+    /// The edit form's load: everything, verbatim, including the `otpauth://`
+    /// line no other command will hand over. Editing is the request that earns
+    /// it — the body cannot be rewritten without having been read.
+    #[test]
+    fn reveal_entry_returns_the_whole_plaintext_unparsed() {
+        assert_eq!(
+            store().reveal_entry(&name_of("Email/gmail.com")).unwrap(),
+            GMAIL
         );
     }
 
@@ -1025,7 +1221,7 @@ mod tests {
 
     #[test]
     fn insert_creates_an_entry_and_the_tree_shows_it() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse")]);
         let name = name_of("Email/gmail.com");
 
         core.insert(&name, &Secret::from_slice(b"hunter2\nuser: alice"))
@@ -1044,19 +1240,19 @@ mod tests {
     /// A mistyped name must not silently destroy the password already there.
     #[test]
     fn insert_refuses_to_overwrite() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse")]);
 
         match core.insert(&name_of("wifi"), &Secret::from_slice(b"clobbered")) {
             Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), "wifi"),
             Err(other) => panic!("expected EntryExists, got {other:?}"),
-            Ok(()) => panic!("insert must not overwrite an existing entry"),
+            Ok(_) => panic!("insert must not overwrite an existing entry"),
         }
         assert_eq!(stored(&gpg, "wifi").as_deref(), Some("correct horse"));
     }
 
     #[test]
     fn edit_replaces_the_whole_body_and_requires_the_entry_to_exist() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse\nuser: alice")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse\nuser: alice")]);
 
         core.edit(&name_of("wifi"), &Secret::from_slice(b"new-password"))
             .unwrap();
@@ -1065,7 +1261,7 @@ mod tests {
         match core.edit(&name_of("absent"), &Secret::from_slice(b"x")) {
             Err(Error::EntryNotFound { name }) => assert_eq!(name.as_str(), "absent"),
             Err(other) => panic!("expected EntryNotFound, got {other:?}"),
-            Ok(()) => panic!("edit must not create an entry"),
+            Ok(_) => panic!("edit must not create an entry"),
         }
     }
 
@@ -1073,7 +1269,7 @@ mod tests {
     /// written, resolved by the store's own walk-up.
     #[test]
     fn a_write_uses_the_recipients_of_its_own_directory() {
-        let (core, _, _, gpg) = core_with_parts(&[]);
+        let Parts { core, gpg, .. } = core_with_parts(&[]);
 
         core.insert(&name_of("loose"), &Secret::from_slice(b"a"))
             .unwrap();
@@ -1094,7 +1290,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_the_entry() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse"), ("keep", "x")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse"), ("keep", "x")]);
 
         core.remove(&name_of("wifi")).unwrap();
 
@@ -1110,7 +1306,7 @@ mod tests {
     /// pinentry for what the user experiences as a rename.
     #[test]
     fn rename_within_a_recipient_boundary_does_not_re_encrypt() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse")]);
 
         core.rename(&name_of("wifi"), &name_of("Home/wifi"))
             .unwrap();
@@ -1127,7 +1323,7 @@ mod tests {
     /// entry is decrypted and encrypted again for it (Invariant 8).
     #[test]
     fn rename_across_a_recipient_boundary_re_encrypts_to_the_destination() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse")]);
 
         core.rename(&name_of("wifi"), &name_of("Work/wifi"))
             .unwrap();
@@ -1142,7 +1338,7 @@ mod tests {
 
     #[test]
     fn copy_leaves_the_original_and_re_encrypts_across_a_boundary() {
-        let (core, _, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts { core, gpg, .. } = core_with_parts(&[("wifi", "correct horse")]);
 
         core.copy_entry(&name_of("wifi"), &name_of("Work/wifi"))
             .unwrap();
@@ -1159,14 +1355,14 @@ mod tests {
     /// they take the re-encrypting path.
     #[test]
     fn a_move_onto_an_existing_entry_is_refused() {
-        let (core, _, _, gpg) =
+        let Parts { core, gpg, .. } =
             core_with_parts(&[("wifi", "keep me"), ("other", "b"), ("Work/taken", "c")]);
 
         for (from, to) in [("wifi", "other"), ("wifi", "Work/taken")] {
             match core.rename(&name_of(from), &name_of(to)) {
                 Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), to),
                 Err(other) => panic!("expected EntryExists, got {other:?}"),
-                Ok(()) => panic!("moving onto {to} must be refused"),
+                Ok(_) => panic!("moving onto {to} must be refused"),
             }
         }
         assert_eq!(stored(&gpg, "wifi").as_deref(), Some("keep me"));
@@ -1178,7 +1374,12 @@ mod tests {
     /// without ever being returned.
     #[test]
     fn generate_stores_a_password_and_copies_it_without_returning_it() {
-        let (core, clipboard, _, gpg) = core_with_parts(&[]);
+        let Parts {
+            core,
+            clipboard,
+            gpg,
+            ..
+        } = core_with_parts(&[]);
         let name = name_of("Email/new");
 
         let receipt = core
@@ -1194,8 +1395,8 @@ mod tests {
 
         // `Some` because the stub clipboard always opens; the `None` arm is the
         // no-display-server case, where the entry is still created.
-        let receipt = receipt.unwrap();
-        assert_eq!(receipt.clears_in_secs, CLIP_TIME.as_secs());
+        let clip = receipt.clipboard.unwrap();
+        assert_eq!(clip.clears_in_secs, CLIP_TIME.as_secs());
 
         let body = stored(&gpg, "Email/new").unwrap();
         let (password, rest) = body.split_once('\n').unwrap();
@@ -1211,7 +1412,12 @@ mod tests {
 
     #[test]
     fn generate_refuses_to_overwrite_and_writes_nothing_when_it_does() {
-        let (core, clipboard, _, gpg) = core_with_parts(&[("wifi", "correct horse")]);
+        let Parts {
+            core,
+            clipboard,
+            gpg,
+            ..
+        } = core_with_parts(&[("wifi", "correct horse")]);
 
         match core.generate(&name_of("wifi"), generate::Recipe::default(), None) {
             Err(Error::EntryExists { name }) => assert_eq!(name.as_str(), "wifi"),
@@ -1224,6 +1430,145 @@ mod tests {
             None,
             "a refused generate copies nothing"
         );
+    }
+
+    // --- history ---------------------------------------------------------
+
+    /// Every commit the fake history recorded: message, then the paths it was
+    /// asked to stage, with separators normalised so the assertions read the
+    /// same on every platform.
+    fn commits(git: &FakeVcs) -> Vec<(String, Vec<String>)> {
+        lock(&git.commits)
+            .iter()
+            .map(|(message, paths)| {
+                let paths = paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect();
+                (message.clone(), paths)
+            })
+            .collect()
+    }
+
+    /// A store that was never `pass git init`ed has no history to fail at, and
+    /// the receipt says so rather than implying something went wrong.
+    #[test]
+    fn a_store_without_git_records_nothing_and_reports_nothing() {
+        let Parts { core, .. } = core_without_git(&[]);
+
+        let receipt = core
+            .insert(&name_of("wifi"), &Secret::from_slice(b"correct horse"))
+            .unwrap();
+
+        assert_eq!(receipt.commit, None);
+        assert_eq!(
+            serde_json::to_string(&receipt).unwrap(),
+            r#"{"commit":null,"clipboard":null}"#
+        );
+    }
+
+    /// The messages are a compatibility surface: a store's history is shared
+    /// with the CLI, so `git log` must not betray which client wrote what.
+    #[test]
+    fn every_mutation_is_recorded_in_the_words_pass_uses() {
+        let git = FakeVcs::default();
+        let Parts { core, .. } = core_with_git(&[], git.clone());
+
+        core.insert(&name_of("wifi"), &Secret::from_slice(b"correct horse"))
+            .unwrap();
+        core.edit(&name_of("wifi"), &Secret::from_slice(b"new horse"))
+            .unwrap();
+        core.copy_entry(&name_of("wifi"), &name_of("spare"))
+            .unwrap();
+        core.rename(&name_of("spare"), &name_of("Home/spare"))
+            .unwrap();
+        core.remove(&name_of("Home/spare")).unwrap();
+
+        assert_eq!(
+            commits(&git),
+            vec![
+                (
+                    "Add given password for wifi to store.".to_owned(),
+                    vec!["wifi.gpg".to_owned()]
+                ),
+                (
+                    "Edit password for wifi using Password Store.".to_owned(),
+                    vec!["wifi.gpg".to_owned()]
+                ),
+                (
+                    "Copy wifi to spare.".to_owned(),
+                    vec!["spare.gpg".to_owned()]
+                ),
+                (
+                    "Rename spare to Home/spare.".to_owned(),
+                    vec!["spare.gpg".to_owned(), "Home/spare.gpg".to_owned()]
+                ),
+                (
+                    "Remove Home/spare from store.".to_owned(),
+                    vec!["Home/spare.gpg".to_owned()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_generated_entry_is_recorded_as_generated() {
+        let git = FakeVcs::default();
+        let Parts { core, .. } = core_with_git(&[], git.clone());
+
+        let receipt = core
+            .generate(&name_of("Email/new"), generate::Recipe::default(), None)
+            .unwrap();
+
+        assert_eq!(receipt.commit, Some(Commit::Committed));
+        assert_eq!(
+            commits(&git),
+            vec![(
+                "Add generated password for Email/new.".to_owned(),
+                vec!["Email/new.gpg".to_owned()]
+            )]
+        );
+    }
+
+    /// The whole reason the outcome rides in a receipt instead of an `Err`: the
+    /// entry *was* written. Failing the command would tell the user their
+    /// password was not saved and send them back to retry into an
+    /// `EntryExists`.
+    #[test]
+    fn a_refused_commit_does_not_fail_the_write() {
+        let git = FakeVcs {
+            refuses: Some("no signature"),
+            ..FakeVcs::default()
+        };
+        let Parts { core, gpg, .. } = core_with_git(&[], git);
+
+        let receipt = core
+            .insert(&name_of("wifi"), &Secret::from_slice(b"correct horse"))
+            .unwrap();
+
+        assert_eq!(stored(&gpg, "wifi").as_deref(), Some("correct horse"));
+        match receipt.commit {
+            Some(Commit::Failed(reason)) => assert!(reason.contains("no signature"), "{reason}"),
+            other => panic!("expected a failed commit, got {other:?}"),
+        }
+    }
+
+    /// A receipt describes what happened around the write, never what was
+    /// written — the same rule [`CopyReceipt`] follows.
+    #[test]
+    fn the_serialized_write_receipt_carries_no_value() {
+        let Parts { core, .. } = core_with_git(&[], FakeVcs::default());
+
+        let receipt = core
+            .insert(&name_of("wifi"), &Secret::from_slice(b"correct horse"))
+            .unwrap();
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            json,
+            r#"{"commit":{"status":"committed"},"clipboard":null}"#
+        );
+        assert!(!json.contains("correct horse"));
     }
 
     /// Invariant 5 at the boundary: the string the webview receives for a

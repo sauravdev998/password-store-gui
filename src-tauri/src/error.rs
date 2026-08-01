@@ -135,6 +135,24 @@ pub enum Error {
     #[error("could not read the clipboard")]
     ClipboardRead,
 
+    /// Git has no author, so it cannot write a commit.
+    ///
+    /// Separate from [`Error::Git`] because it is the ordinary first-run state
+    /// on a machine that has never used git, and because libgit2's own wording
+    /// for it does not say what to do (§4.1 principle 5).
+    #[error("git does not know who you are: set user.name and user.email in your git config")]
+    GitNoIdentity,
+
+    /// A git operation failed.
+    ///
+    /// Carries libgit2's own message, which is safe in a way the crypto
+    /// layer's errors are not: git only ever reads and writes what is on disk,
+    /// and what is on disk is ciphertext (Invariant 1). Nothing this error can
+    /// quote is plaintext, and by the time it is raised the write it describes
+    /// has already dropped its secret.
+    #[error("git could not record the change: {reason}")]
+    Git { reason: String },
+
     #[error(transparent)]
     NotUtf8(#[from] NotUtf8),
 

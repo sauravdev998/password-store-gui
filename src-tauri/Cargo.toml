@@ -35,6 +35,11 @@ totp-rs = { version = "5.7.2", default-features = false, features = ["otpauth", 
 # and `tempfile` makes a ciphertext write atomic.
 which = "8"
 tempfile = "3"
+# Local git only, which is why the network features are off: `default-features`
+# pulls in libssh2 and OpenSSL for fetch/push, and Open Decision 2 leans to
+# shelling out to the user's `git` for network operations so their credential
+# helpers keep working. Phase 4 revisits that; a commit needs none of it.
+git2 = { version = "0.21", default-features = false }
 # OS entropy for `generate`, taken directly rather than through a seeded
 # generator. Already in the tree transitively, so it costs no build time.
 getrandom = "0.3"

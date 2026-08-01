@@ -3,6 +3,7 @@ pub mod commands;
 pub mod crypto;
 pub mod error;
 pub mod generate;
+pub mod git;
 pub mod otp;
 pub mod secret;
 pub mod store;
@@ -36,6 +37,7 @@ pub fn run() {
             commands::reveal_password,
             commands::reveal_field,
             commands::reveal_notes,
+            commands::reveal_entry,
             commands::copy_password,
             commands::copy_field,
             commands::copy_notes,
