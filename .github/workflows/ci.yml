@@ -41,6 +41,21 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf libssl-dev
 
+      # The gpg.exe bundled with Git for Windows is an MSYS2 build: it reads
+      # GNUPGHOME as an MSYS path, so the native temp dir the test fixture sets
+      # is treated as relative and joined onto gpg's cwd. Install a native
+      # GnuPG and put it first on PATH — also the configuration Windows users
+      # actually have.
+      - name: Install a native GnuPG
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install gnupg --no-progress -y
+          $gpg = Get-ChildItem 'C:\Program Files (x86)\GnuPG', 'C:\Program Files\GnuPG' `
+            -Filter gpg.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $gpg) { throw 'native gpg.exe not found after install' }
+          $gpg.Directory.FullName | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
