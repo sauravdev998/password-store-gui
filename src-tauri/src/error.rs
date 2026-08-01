@@ -68,6 +68,16 @@ pub enum Error {
     #[error("password length must be between {min} and {max}")]
     BadLength { min: usize, max: usize },
 
+    /// A settings value measured in seconds was out of range.
+    ///
+    /// `setting` is a plain-language name for the thing, not the field or the
+    /// environment variable behind it (Open Decision 6): the user is told which
+    /// control they just moved too far, in the words the control uses. There is
+    /// no floor because zero is meaningful at both call sites — no clipboard
+    /// window, and no idle lock.
+    #[error("{setting} cannot be more than {max} seconds")]
+    BadDuration { setting: &'static str, max: u64 },
+
     /// The OS refused to provide randomness.
     ///
     /// Deliberately fatal to the generate path rather than a cue to fall back to

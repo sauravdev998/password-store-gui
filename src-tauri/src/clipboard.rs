@@ -82,10 +82,14 @@ pub struct Clipboard {
 }
 
 /// The half a scheduled clear needs to reach after its delay, hence the `Arc`.
+///
+/// Note what is *not* here: the clip window. It is a setting the user can
+/// change while the app runs (ADR-11), so it is passed to [`Clipboard::copy`]
+/// by a caller that has just read it rather than captured here at startup,
+/// where it would go stale the moment Settings was saved.
 struct Inner {
     state: Mutex<State>,
     scheduler: Box<dyn Scheduler>,
-    clip_time: Duration,
 }
 
 struct State {
@@ -104,20 +108,12 @@ struct State {
 }
 
 impl Clipboard {
-    /// The real clipboard, with the window from the environment.
+    /// The real clipboard.
     pub fn system() -> Self {
-        Self::new(
-            Box::new(SystemClipboard::new()),
-            Box::new(Threads),
-            clip_time_from_env(),
-        )
+        Self::new(Box::new(SystemClipboard::new()), Box::new(Threads))
     }
 
-    pub fn new(
-        backend: Box<dyn Backend>,
-        scheduler: Box<dyn Scheduler>,
-        clip_time: Duration,
-    ) -> Self {
+    pub fn new(backend: Box<dyn Backend>, scheduler: Box<dyn Scheduler>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
@@ -126,20 +122,15 @@ impl Clipboard {
                     outstanding: None,
                 }),
                 scheduler,
-                clip_time,
             }),
         }
     }
 
-    /// How long a copied value survives before the auto-clear.
-    pub fn clip_time(&self) -> Duration {
-        self.inner.clip_time
-    }
-
-    /// Put `secret` on the clipboard and schedule its removal.
+    /// Put `secret` on the clipboard and schedule its removal after
+    /// `clip_time`.
     ///
     /// Returns the window, so the caller can tell the user how long they have.
-    pub fn copy(&self, secret: &Secret) -> Result<Duration> {
+    pub fn copy(&self, secret: &Secret, clip_time: Duration) -> Result<Duration> {
         // A clipboard carries text; a non-UTF-8 secret has nothing to copy.
         let text = secret.expose_str()?;
 
@@ -154,25 +145,42 @@ impl Clipboard {
         };
 
         let inner = Arc::clone(&self.inner);
-        self.inner.scheduler.schedule(
-            self.inner.clip_time,
-            Box::new(move || inner.clear_if_ours(generation)),
-        );
+        self.inner
+            .scheduler
+            .schedule(clip_time, Box::new(move || inner.clear_if_ours(generation)));
 
-        Ok(self.inner.clip_time)
+        Ok(clip_time)
     }
 
     /// Clear the clipboard now, whatever it holds.
     ///
     /// Unconditional, unlike the timer: a user who asks for the clipboard to be
-    /// cleared means it even if they copied something else since, and Invariant
-    /// 7's auto-lock will want the same in Phase 5. Any outstanding timer is
-    /// cancelled by the generation bump.
+    /// cleared means it even if they copied something else since. Any
+    /// outstanding timer is cancelled by the generation bump.
     pub fn clear(&self) -> Result<()> {
         let mut state = self.inner.state();
         state.generation = state.generation.wrapping_add(1);
         state.outstanding = None;
         state.backend.clear()
+    }
+
+    /// Run the clip window's clear early, if it is still outstanding.
+    ///
+    /// This is [`Clipboard::clear`]'s careful sibling, and the difference is
+    /// the whole point: it wipes the clipboard **only if it still holds what we
+    /// put there**, exactly as the timer would have. That is what makes it safe
+    /// to call at moments the user did not ask for a clear — on the way out of
+    /// the app, which is the Phase 2 known limit this closes (Invariant 6's
+    /// timer thread dies with the process, so quitting inside the window used
+    /// to leave the password behind).
+    ///
+    /// Nothing happens when the window has already elapsed, or when the user
+    /// has copied something else since. Unconditionally clearing at those
+    /// moments would destroy clipboard contents that were never ours — which is
+    /// the failure Invariant 6 is worded to avoid.
+    pub fn clear_if_outstanding(&self) {
+        let generation = self.inner.state().generation;
+        self.inner.clear_if_ours(generation);
     }
 }
 
@@ -235,24 +243,24 @@ impl Fingerprint {
     }
 }
 
-/// The clip window: `PASSWORD_STORE_CLIP_TIME` seconds, else 45.
-pub fn clip_time_from_env() -> Duration {
+/// What `PASSWORD_STORE_CLIP_TIME` says, if it says anything usable.
+pub fn clip_time_from_env() -> Option<Duration> {
     parse_clip_time(std::env::var_os(CLIP_TIME_ENV))
 }
 
 /// The rule behind [`clip_time_from_env`], separated so it is testable without
 /// mutating process-global environment state.
 ///
-/// Anything unparseable falls back to the default instead of erroring: the
-/// alternative to a clip window is *no* clip window, and a typo in a shell
-/// profile must not be what turns the auto-clear off. A deliberate `0` is
+/// Anything unparseable yields `None` instead of erroring: the alternative to a
+/// clip window is *no* clip window, and a typo in a shell profile must not be
+/// what turns the auto-clear off. `None` falls through to the user's own
+/// setting and only then to [`DEFAULT_CLIP_TIME`] (ADR-11). A deliberate `0` is
 /// honoured — `pass` would `sleep 0` too — and clears at once.
-fn parse_clip_time(var: Option<OsString>) -> Duration {
+fn parse_clip_time(var: Option<OsString>) -> Option<Duration> {
     var.as_ref()
         .and_then(|value| value.to_str())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_CLIP_TIME)
 }
 
 /// A thread per outstanding copy: sleep, then run.
@@ -260,9 +268,9 @@ fn parse_clip_time(var: Option<OsString>) -> Duration {
 /// Simple on purpose — at most a handful are ever live, each sleeps and exits,
 /// and a superseded one costs a generation check.
 ///
-/// Known limit: the thread dies with the process, so quitting the app inside
-/// the clip window leaves the secret on the clipboard. Clearing on exit belongs
-/// with Invariant 7's auto-lock work in Phase 5.
+/// The thread dies with the process, which used to mean quitting inside the
+/// clip window left the secret on the clipboard. [`Clipboard::clear_if_outstanding`]
+/// closes that, called from the app's exit handler in `lib.rs`.
 pub struct Threads;
 
 impl Scheduler for Threads {
@@ -448,11 +456,7 @@ mod tests {
     fn clipboard() -> (Clipboard, StubBackend, StubScheduler) {
         let backend = StubBackend::default();
         let scheduler = StubScheduler::default();
-        let clipboard = Clipboard::new(
-            Box::new(backend.clone()),
-            Box::new(scheduler.clone()),
-            CLIP_TIME,
-        );
+        let clipboard = Clipboard::new(Box::new(backend.clone()), Box::new(scheduler.clone()));
         (clipboard, backend, scheduler)
     }
 
@@ -464,7 +468,7 @@ mod tests {
     fn copy_puts_the_value_on_the_clipboard_and_reports_the_window() {
         let (clipboard, backend, scheduler) = clipboard();
 
-        let window = clipboard.copy(&secret("hunter2")).unwrap();
+        let window = clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
 
         assert_eq!(window, CLIP_TIME);
         assert_eq!(backend.contents().as_deref(), Some("hunter2"));
@@ -475,7 +479,7 @@ mod tests {
     #[test]
     fn the_timer_clears_a_value_that_is_still_ours() {
         let (clipboard, backend, scheduler) = clipboard();
-        clipboard.copy(&secret("hunter2")).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
 
         scheduler.fire();
 
@@ -487,7 +491,7 @@ mod tests {
     #[test]
     fn the_timer_leaves_a_value_the_user_copied_afterwards() {
         let (clipboard, backend, scheduler) = clipboard();
-        clipboard.copy(&secret("hunter2")).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
 
         backend.overwrite("a shopping list");
         scheduler.fire();
@@ -501,7 +505,7 @@ mod tests {
     #[test]
     fn the_timer_leaves_a_clipboard_that_was_cleared_and_refilled() {
         let (clipboard, backend, scheduler) = clipboard();
-        clipboard.copy(&secret("hunter2")).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
 
         backend.overwrite("");
         scheduler.fire();
@@ -516,8 +520,8 @@ mod tests {
     fn re_copying_a_value_restarts_the_window_instead_of_inheriting_it() {
         let (clipboard, backend, scheduler) = clipboard();
 
-        clipboard.copy(&secret("hunter2")).unwrap();
-        clipboard.copy(&secret("hunter2")).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
         assert_eq!(scheduler.pending(), 2);
 
         scheduler.fire_oldest();
@@ -529,6 +533,60 @@ mod tests {
 
         scheduler.fire_oldest();
         assert_eq!(backend.contents(), None, "the second copy's own timer runs");
+    }
+
+    /// The Phase 2 known limit, closed: quitting inside the clip window used to
+    /// leave the password on the clipboard, because the timer thread dies with
+    /// the process.
+    #[test]
+    fn an_early_clear_wipes_a_password_still_inside_its_window() {
+        let (clipboard, backend, _scheduler) = clipboard();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
+
+        clipboard.clear_if_outstanding();
+
+        assert_eq!(backend.contents(), None);
+    }
+
+    /// And the reason it is not just [`Clipboard::clear`]: on the way out of the
+    /// app nobody asked for anything to be cleared, so a value that was never
+    /// ours must survive.
+    #[test]
+    fn an_early_clear_leaves_a_value_the_user_copied_afterwards() {
+        let (clipboard, backend, _scheduler) = clipboard();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
+        backend.overwrite("a shopping list");
+
+        clipboard.clear_if_outstanding();
+
+        assert_eq!(backend.contents().as_deref(), Some("a shopping list"));
+    }
+
+    #[test]
+    fn an_early_clear_with_nothing_outstanding_does_nothing() {
+        let (clipboard, backend, _scheduler) = clipboard();
+        backend.overwrite("something the user copied");
+
+        clipboard.clear_if_outstanding();
+
+        assert_eq!(
+            backend.contents().as_deref(),
+            Some("something the user copied")
+        );
+    }
+
+    /// Once the window has run its course the value is no longer ours to touch,
+    /// so a later exit must not reach back and clear whatever replaced it.
+    #[test]
+    fn an_early_clear_after_the_window_already_fired_does_nothing() {
+        let (clipboard, backend, scheduler) = clipboard();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
+        scheduler.fire();
+        backend.overwrite("copied later");
+
+        clipboard.clear_if_outstanding();
+
+        assert_eq!(backend.contents().as_deref(), Some("copied later"));
     }
 
     #[test]
@@ -544,7 +602,7 @@ mod tests {
     #[test]
     fn clear_cancels_an_outstanding_timer() {
         let (clipboard, backend, scheduler) = clipboard();
-        clipboard.copy(&secret("hunter2")).unwrap();
+        clipboard.copy(&secret("hunter2"), CLIP_TIME).unwrap();
 
         clipboard.clear().unwrap();
         backend.overwrite("copied after the clear");
@@ -573,10 +631,10 @@ mod tests {
         }
 
         let scheduler = StubScheduler::default();
-        let clipboard = Clipboard::new(Box::new(Broken), Box::new(scheduler.clone()), CLIP_TIME);
+        let clipboard = Clipboard::new(Box::new(Broken), Box::new(scheduler.clone()));
 
         assert!(matches!(
-            clipboard.copy(&secret("hunter2")),
+            clipboard.copy(&secret("hunter2"), CLIP_TIME),
             Err(Error::ClipboardWrite)
         ));
         assert_eq!(scheduler.pending(), 0);
@@ -587,7 +645,7 @@ mod tests {
         let (clipboard, backend, scheduler) = clipboard();
 
         assert!(matches!(
-            clipboard.copy(&Secret::from_slice(&[0xff, 0xfe])),
+            clipboard.copy(&Secret::from_slice(&[0xff, 0xfe]), CLIP_TIME),
             Err(Error::NotUtf8(_))
         ));
         assert_eq!(backend.contents(), None);
@@ -632,19 +690,19 @@ mod tests {
 
     #[test]
     fn the_clip_window_defaults_to_the_pass_default() {
-        assert_eq!(parse_clip_time(None), DEFAULT_CLIP_TIME);
-        assert_eq!(parse_clip_time(Some(OsString::new())), DEFAULT_CLIP_TIME);
+        assert_eq!(parse_clip_time(None), None);
+        assert_eq!(parse_clip_time(Some(OsString::new())), None);
     }
 
     #[test]
     fn the_clip_window_comes_from_the_environment_when_it_is_a_number() {
         assert_eq!(
             parse_clip_time(Some(OsString::from("10"))),
-            Duration::from_secs(10)
+            Some(Duration::from_secs(10))
         );
         assert_eq!(
             parse_clip_time(Some(OsString::from(" 90 "))),
-            Duration::from_secs(90)
+            Some(Duration::from_secs(90))
         );
     }
 
@@ -654,8 +712,8 @@ mod tests {
         for value in ["forever", "-1", "45s", "1.5"] {
             assert_eq!(
                 parse_clip_time(Some(OsString::from(value))),
-                DEFAULT_CLIP_TIME,
-                "{value:?} must fall back to the default"
+                None,
+                "{value:?} must fall through rather than decide"
             );
         }
     }

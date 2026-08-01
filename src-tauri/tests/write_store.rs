@@ -128,11 +128,7 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
     let clipboard = TestClipboard::default();
     let core = Core::with_store_root(
         store.path(),
-        Clipboard::new(
-            Box::new(clipboard.clone()),
-            Box::new(NeverFires),
-            Duration::from_secs(45),
-        ),
+        Clipboard::new(Box::new(clipboard.clone()), Box::new(NeverFires)),
     );
 
     // --- insert ---------------------------------------------------------

@@ -122,11 +122,7 @@ fn mutations_are_committed_to_the_stores_git_history() {
 
     let core = Core::with_store_root(
         store.path(),
-        Clipboard::new(
-            Box::new(TestClipboard::default()),
-            Box::new(NeverFires),
-            Duration::from_secs(45),
-        ),
+        Clipboard::new(Box::new(TestClipboard::default()), Box::new(NeverFires)),
     );
 
     // --- insert ---------------------------------------------------------

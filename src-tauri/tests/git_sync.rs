@@ -79,11 +79,7 @@ impl Scheduler for NeverFires {
 fn core_at(root: &Path) -> Core {
     Core::with_store_root(
         root,
-        Clipboard::new(
-            Box::new(TestClipboard::default()),
-            Box::new(NeverFires),
-            Duration::from_secs(45),
-        ),
+        Clipboard::new(Box::new(TestClipboard::default()), Box::new(NeverFires)),
     )
 }
 
