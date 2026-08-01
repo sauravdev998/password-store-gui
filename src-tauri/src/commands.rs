@@ -29,7 +29,7 @@ use crate::clipboard::Clipboard;
 use crate::crypto::{Gpg, PrsGpg};
 use crate::error::{Error, Result};
 use crate::generate;
-use crate::git::{Change, GitRepo, Vcs};
+use crate::git::{Change, GitRepo, Revision, SyncOutcome, SyncStatus, Vcs};
 use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
 use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
@@ -252,6 +252,88 @@ impl Core {
     pub fn has_history(&self) -> Result<bool> {
         let store = (self.store)()?;
         Ok((self.git)(store.root()).is_some())
+    }
+
+    /// Where the store stands relative to its remote, or `None` when it keeps
+    /// no history at all.
+    ///
+    /// Reads no entry and touches no network: it reports the distance to the
+    /// remote as of the last fetch, so the interface can draw an indicator on
+    /// arrival without that being an operation which can hang or prompt.
+    pub fn sync_status(&self) -> Result<Option<SyncStatus>> {
+        let store = (self.store)()?;
+        (self.git)(store.root())
+            .map(|repo| repo.status())
+            .transpose()
+    }
+
+    /// Fetch, merge, push — the one command that reaches the network.
+    ///
+    /// A store with no repository and a store whose branch tracks nothing give
+    /// the same answer, [`SyncOutcome::NoRemote`], because they are the same
+    /// answer: there is nothing to sync with. Neither is a failure.
+    pub fn sync(&self) -> Result<SyncOutcome> {
+        let store = (self.store)()?;
+        match (self.git)(store.root()) {
+            Some(repo) => repo.sync(),
+            None => Ok(SyncOutcome::NoRemote),
+        }
+    }
+
+    /// The commits that touched `name`, newest first.
+    ///
+    /// Nothing is decrypted, so opening a history costs no pinentry (§4.1
+    /// principle 1). It deliberately does not check that the entry currently
+    /// exists: a history is about a name, and the version worth recovering is
+    /// often the one from before a deletion. An unversioned store has an empty
+    /// history rather than an error, for the same reason [`Core::sync`] treats
+    /// one as having no remote.
+    pub fn history(&self, name: &EntryName) -> Result<Vec<Revision>> {
+        let store = (self.store)()?;
+        match (self.git)(store.root()) {
+            Some(repo) => repo.history(name),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// An entry's whole plaintext as it was at `revision` (ADR-10).
+    ///
+    /// The second command that returns a whole body, and it is the same
+    /// exception [`Core::reveal_entry`] is: there is no smaller request to
+    /// serve, because the shape of an old version is only knowable by
+    /// decrypting it and the reason to ask is to see what it said. Reached only
+    /// by choosing a specific commit from a list that itself decrypted nothing,
+    /// so the decrypt is as deliberate as opening the editor is.
+    pub fn reveal_revision(&self, name: &EntryName, revision: &str) -> Result<String> {
+        reveal(&self.revision(name, revision)?)
+    }
+
+    /// Copy the password a past version held, without showing it.
+    ///
+    /// The recovery path in its usual shape — "the new one does not work, give
+    /// me the old one" — served the way every other copy is: the value goes to
+    /// the clipboard from inside the core and never reaches the webview.
+    pub fn copy_revision_password(&self, name: &EntryName, revision: &str) -> Result<CopyReceipt> {
+        let entry = Entry::parse(self.revision(name, revision)?)?;
+        self.copy(entry.password())
+    }
+
+    /// Decrypt `name` as it was at `revision`.
+    ///
+    /// The ciphertext comes out of a git object rather than off disk, which is
+    /// why this goes through [`Gpg::decrypt`] instead of `decrypt_file`. The
+    /// backend's pathless failure is replaced here, where the entry is known.
+    fn revision(&self, name: &EntryName, revision: &str) -> Result<Secret> {
+        let store = (self.store)()?;
+        // No history means no version to ask for. The webview only offers this
+        // from a list the same repository produced, so reaching it is a
+        // malformed request rather than something a user can do.
+        let repo = (self.git)(store.root()).ok_or(Error::NoSuchRevision)?;
+        let ciphertext = repo.blob_at(name, revision)?;
+
+        (self.gpg)()?
+            .decrypt(&ciphertext)
+            .map_err(|_| Error::DecryptRevision { name: name.clone() })
     }
 
     /// Create a new entry from the text the user typed.
@@ -596,6 +678,44 @@ pub fn store_has_history(core: State<'_, Core>) -> Result<bool> {
     core.has_history()
 }
 
+/// Where the store stands relative to its remote. `null` when it keeps no
+/// history. Local only — no network, no decrypt.
+#[tauri::command]
+pub fn sync_status(core: State<'_, Core>) -> Result<Option<SyncStatus>> {
+    core.sync_status()
+}
+
+/// Fetch, merge and push. The only command in the app that reaches the network,
+/// and the only one that needs the user's `git` (ADR-9).
+#[tauri::command]
+pub fn sync_store(core: State<'_, Core>) -> Result<SyncOutcome> {
+    core.sync()
+}
+
+/// The commits that touched an entry, newest first. Decrypts nothing.
+#[tauri::command]
+pub fn entry_history(name: EntryName, core: State<'_, Core>) -> Result<Vec<Revision>> {
+    core.history(&name)
+}
+
+/// A past version of an entry, whole. The history counterpart to
+/// [`reveal_entry`], and the same deliberate exception — see ADR-10.
+#[tauri::command]
+pub fn reveal_revision(name: EntryName, revision: String, core: State<'_, Core>) -> Result<String> {
+    core.reveal_revision(&name, &revision)
+}
+
+/// Copy the password a past version held, without it passing through the
+/// webview.
+#[tauri::command]
+pub fn copy_revision_password(
+    name: EntryName,
+    revision: String,
+    core: State<'_, Core>,
+) -> Result<CopyReceipt> {
+    core.copy_revision_password(&name, &revision)
+}
+
 // The mutation commands are the one direction in which plaintext travels *into*
 // the core, and that is not a hole in Invariant 2 — it is where a new secret
 // comes from. A password the user just typed exists in the webview because they
@@ -808,6 +928,14 @@ mod tests {
     }
 
     impl Gpg for FakeGpg {
+        /// The identity, which is the honest fake: this backend's "ciphertext"
+        /// is the plaintext, so a blob handed straight to it comes back as
+        /// itself. That is what lets the history tests drive a real decrypt
+        /// path without a key.
+        fn decrypt(&self, ciphertext: &[u8]) -> Result<Secret> {
+            Ok(Secret::from_slice(ciphertext))
+        }
+
         fn decrypt_file(&self, path: &Path) -> Result<Secret> {
             match lock(&self.plaintexts).get(path) {
                 Some(text) => Ok(Secret::from_slice(text.as_bytes())),
@@ -853,6 +981,24 @@ mod tests {
         /// When set, every commit fails with it — the store *is* versioned but
         /// git will not take the change.
         refuses: Option<&'static str>,
+        /// Past versions: `(entry, revision id, the body that version held)`.
+        ///
+        /// The body is stored as-is because [`FakeGpg::decrypt`] is the
+        /// identity — so what `blob_at` hands back is what a reveal should
+        /// produce, which is the property these tests are checking.
+        past: Arc<Mutex<Vec<(String, String, String)>>>,
+        /// What `status` and `sync` report. Neither has anything to derive an
+        /// answer from without a repository, so a test states it.
+        status: Option<SyncStatus>,
+        outcome: Option<SyncOutcome>,
+    }
+
+    impl FakeVcs {
+        /// Record that `entry` held `body` at `revision`.
+        fn with_past(self, entry: &str, revision: &str, body: &str) -> Self {
+            lock(&self.past).push((entry.to_owned(), revision.to_owned(), body.to_owned()));
+            self
+        }
     }
 
     impl Vcs for FakeVcs {
@@ -864,6 +1010,40 @@ mod tests {
             }
             lock(&self.commits).push((message.to_owned(), paths.to_vec()));
             Ok(())
+        }
+
+        fn status(&self) -> Result<SyncStatus> {
+            Ok(self.status.clone().unwrap_or(SyncStatus {
+                branch: Some("main".to_owned()),
+                tracking: None,
+                uncommitted: 0,
+            }))
+        }
+
+        fn history(&self, name: &EntryName) -> Result<Vec<Revision>> {
+            Ok(lock(&self.past)
+                .iter()
+                .filter(|(entry, ..)| entry == name.as_str())
+                .map(|(_, id, _)| Revision {
+                    id: id.clone(),
+                    summary: format!("Edit password for {name} using Password Store."),
+                    author: "Test".to_owned(),
+                    committed_at: 0,
+                    change: crate::git::RevisionKind::Modified,
+                })
+                .collect())
+        }
+
+        fn blob_at(&self, name: &EntryName, revision: &str) -> Result<Vec<u8>> {
+            lock(&self.past)
+                .iter()
+                .find(|(entry, id, _)| entry == name.as_str() && id == revision)
+                .map(|(.., body)| body.as_bytes().to_vec())
+                .ok_or(Error::NoSuchRevision)
+        }
+
+        fn sync(&self) -> Result<SyncOutcome> {
+            Ok(self.outcome.clone().unwrap_or(SyncOutcome::NoRemote))
         }
     }
 
@@ -1597,6 +1777,171 @@ mod tests {
             r#"{"commit":{"status":"committed"},"clipboard":null}"#
         );
         assert!(!json.contains("correct horse"));
+    }
+
+    // --- sync and per-entry history --------------------------------------
+
+    /// A store with no repository has nothing to say about a remote, and the
+    /// interface needs to be able to tell that apart from "in step".
+    #[test]
+    fn sync_status_is_absent_for_a_store_with_no_history() {
+        assert_eq!(core_without_git(&[]).core.sync_status().unwrap(), None);
+    }
+
+    #[test]
+    fn sync_status_reports_the_distance_to_the_remote() {
+        let git = FakeVcs {
+            status: Some(SyncStatus {
+                branch: Some("main".to_owned()),
+                tracking: Some(crate::git::Tracking {
+                    upstream: "origin/main".to_owned(),
+                    ahead: 2,
+                    behind: 1,
+                }),
+                uncommitted: 0,
+            }),
+            ..FakeVcs::default()
+        };
+        let Parts { core, .. } = core_with_git(&[], git);
+
+        let status = core.sync_status().unwrap().unwrap();
+        let tracking = status.tracking.unwrap();
+
+        assert_eq!(tracking.upstream, "origin/main");
+        assert_eq!((tracking.ahead, tracking.behind), (2, 1));
+    }
+
+    /// A store that is not shared, and a store that is not versioned at all,
+    /// are the same answer: there is nothing to sync with, and neither is a
+    /// failure the user has to do something about.
+    #[test]
+    fn syncing_a_store_with_nothing_to_sync_with_is_not_a_failure() {
+        assert_eq!(
+            core_without_git(&[]).core.sync().unwrap(),
+            SyncOutcome::NoRemote
+        );
+        assert_eq!(
+            core_with_git(&[], FakeVcs::default()).core.sync().unwrap(),
+            SyncOutcome::NoRemote
+        );
+    }
+
+    /// The frontend's `SyncOutcome` type mirrors this shape by hand, so the
+    /// wire form is pinned rather than left to drift.
+    #[test]
+    fn the_serialized_sync_outcome_names_its_case() {
+        let synced = SyncOutcome::Synced {
+            pulled: 2,
+            pushed: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&synced).unwrap(),
+            r#"{"status":"synced","pulled":2,"pushed":1}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncOutcome::NoRemote).unwrap(),
+            r#"{"status":"noRemote"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncOutcome::Conflicted {
+                entries: vec!["Email/gmail.com".to_owned()],
+            })
+            .unwrap(),
+            r#"{"status":"conflicted","entries":["Email/gmail.com"]}"#
+        );
+    }
+
+    #[test]
+    fn an_unversioned_store_has_an_empty_history_rather_than_an_error() {
+        let Parts { core, .. } = core_without_git(&[("wifi", "correct horse")]);
+
+        assert!(core.history(&name_of("wifi")).unwrap().is_empty());
+    }
+
+    /// Listing a history decrypts nothing, which is what makes opening one free
+    /// of a pinentry the user did not ask for (§4.1 principle 1).
+    #[test]
+    fn listing_a_history_never_decrypts() {
+        let git = FakeVcs::default().with_past("wifi", "abc123", "old horse");
+        // A backend that fails if it is used at all, so a decrypt on this path
+        // would fail the test rather than pass unnoticed.
+        let core = Core::from_parts(
+            Box::new(|| {
+                Ok(Box::new(FakeStore {
+                    root: PathBuf::from(ROOT),
+                    gpg: FakeGpg::default(),
+                }))
+            }),
+            Box::new(|| {
+                Err(Error::GpgUnavailable {
+                    reason: "listing a history must not decrypt".into(),
+                })
+            }),
+            Box::new(move |_| Some(Box::new(git.clone()))),
+            unused_clipboard(),
+        );
+
+        let history = core.history(&name_of("wifi")).unwrap();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "abc123");
+    }
+
+    /// ADR-10: choosing a specific commit is the request that earns a whole
+    /// body, the same way choosing Edit is in ADR-8.
+    #[test]
+    fn reveal_revision_returns_the_body_that_version_held() {
+        let git = FakeVcs::default().with_past("wifi", "abc123", "old horse\nuser: alice");
+        let Parts { core, .. } = core_with_git(&[("wifi", "correct horse")], git);
+
+        assert_eq!(
+            core.reveal_revision(&name_of("wifi"), "abc123").unwrap(),
+            "old horse\nuser: alice"
+        );
+        // The current entry is untouched by having looked at an old one.
+        assert_eq!(
+            core.reveal_password(&name_of("wifi")).unwrap(),
+            "correct horse"
+        );
+    }
+
+    /// The recovery path in its usual shape, served like every other copy: the
+    /// old password reaches the clipboard without reaching the caller.
+    #[test]
+    fn copy_revision_password_copies_the_old_first_line_and_not_the_rest() {
+        let git = FakeVcs::default().with_past("wifi", "abc123", "old horse\nuser: alice");
+        let Parts {
+            core, clipboard, ..
+        } = core_with_git(&[("wifi", "correct horse")], git);
+
+        let receipt = core
+            .copy_revision_password(&name_of("wifi"), "abc123")
+            .unwrap();
+
+        assert_eq!(receipt.clears_in_secs, CLIP_TIME.as_secs());
+        assert_eq!(clipboard.contents().as_deref(), Some("old horse"));
+        assert!(!serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("old horse"));
+    }
+
+    /// The id arrives back over IPC, so it is checked rather than trusted —
+    /// and an unversioned store has no version to give at all.
+    #[test]
+    fn a_revision_the_history_does_not_have_is_refused() {
+        let git = FakeVcs::default().with_past("wifi", "abc123", "old horse");
+        let Parts { core, .. } = core_with_git(&[("wifi", "correct horse")], git);
+
+        assert!(matches!(
+            core.reveal_revision(&name_of("wifi"), "nope"),
+            Err(Error::NoSuchRevision)
+        ));
+        assert!(matches!(
+            core_without_git(&[("wifi", "correct horse")])
+                .core
+                .reveal_revision(&name_of("wifi"), "abc123"),
+            Err(Error::NoSuchRevision)
+        ));
     }
 
     /// Invariant 5 at the boundary: the string the webview receives for a

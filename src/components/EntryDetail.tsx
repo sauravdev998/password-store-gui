@@ -8,6 +8,7 @@ import {
   DuplicateIcon,
   EyeIcon,
   EyeOffIcon,
+  HistoryIcon,
   LockIcon,
   MoveIcon,
   PencilIcon,
@@ -64,6 +65,8 @@ type Props = {
   clipped: Clipped | null
   onCopied: (next: Clipped) => void
   onEdit: () => void
+  /** Absent when the store keeps no history, so there is nothing to show. */
+  onHistory?: () => void
   onRename: () => void
   onDuplicate: () => void
   onDelete: () => void
@@ -79,6 +82,7 @@ export function EntryDetail({
   clipped,
   onCopied,
   onEdit,
+  onHistory,
   onRename,
   onDuplicate,
   onDelete,
@@ -145,6 +149,7 @@ export function EntryDetail({
       <EntryHeading
         name={name}
         onEdit={onEdit}
+        onHistory={onHistory}
         onRename={onRename}
         onDuplicate={onDuplicate}
         onDelete={onDelete}
@@ -255,12 +260,14 @@ export function EntryDetail({
 function EntryHeading({
   name,
   onEdit,
+  onHistory,
   onRename,
   onDuplicate,
   onDelete,
 }: {
   name: string
   onEdit: () => void
+  onHistory?: () => void
   onRename: () => void
   onDuplicate: () => void
   onDelete: () => void
@@ -284,6 +291,16 @@ function EntryHeading({
 
         <div className="flex shrink-0 gap-1">
           <HeaderButton label="Edit entry" icon={<PencilIcon className="size-4" />} onClick={onEdit} />
+          {onHistory && (
+            // Beside the destructive actions on purpose: the history is what
+            // makes deleting recoverable, and this is where the user is
+            // standing when that matters.
+            <HeaderButton
+              label="Earlier versions of this entry"
+              icon={<HistoryIcon className="size-4" />}
+              onClick={onHistory}
+            />
+          )}
           <HeaderButton label="Rename entry" icon={<MoveIcon className="size-4" />} onClick={onRename} />
           <HeaderButton
             label="Duplicate entry"

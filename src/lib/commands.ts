@@ -89,6 +89,57 @@ export type WriteReceipt = {
   clipboard: CopyReceipt | null
 }
 
+/** A branch's relationship to the one it tracks, as of the last sync. */
+export type Tracking = {
+  /** The remote branch, as git names it: `origin/main`. */
+  upstream: string
+  /** Commits this store has that the remote does not. */
+  ahead: number
+  /** Commits the remote has that this store does not. */
+  behind: number
+}
+
+/**
+ * Where the store stands relative to its remote.
+ *
+ * Computed locally: it reports the distance as of the last sync and never goes
+ * and looks, so reading it cannot hang or ask for a credential.
+ */
+export type SyncStatus = {
+  /** `null` on a store with no commits yet, or a detached checkout. */
+  branch: string | null
+  /** `null` when the store is not shared with a remote at all. */
+  tracking: Tracking | null
+  /**
+   * Files under the store that its history does not have. Normally zero, since
+   * every change commits itself.
+   */
+  uncommitted: number
+}
+
+/** What a sync did. Mirrors `git::SyncOutcome`. */
+export type SyncOutcome =
+  | { status: 'noRemote' }
+  | { status: 'upToDate' }
+  | { status: 'synced'; pulled: number; pushed: number }
+  /** The same entries changed in both places. **Nothing on disk was changed.** */
+  | { status: 'conflicted'; entries: string[] }
+
+/** What a commit did to the entry it is being listed for. */
+export type RevisionKind = 'added' | 'modified' | 'removed'
+
+/** One past version of an entry. Carries no content — see {@link revealRevision}. */
+export type Revision = {
+  /** The commit id, which is how a version is asked for. */
+  id: string
+  /** The first line of the commit message. */
+  summary: string
+  author: string
+  /** Unix seconds. Formatting belongs here, where the locale is known. */
+  committedAt: number
+  change: RevisionKind
+}
+
 /** Liveness/version probe for the Rust core. */
 export function coreVersion(): Promise<string> {
   return invoke<string>('core_version')
@@ -169,6 +220,62 @@ export function clearClipboard(): Promise<void> {
  */
 export function storeHasHistory(): Promise<boolean> {
   return invoke<boolean>('store_has_history')
+}
+
+/**
+ * Where the store stands relative to its remote. `null` when it keeps no
+ * history at all.
+ *
+ * Safe to call on arrival and after any change: it reads only what is already
+ * on disk, so it never reaches the network, never prompts, and never decrypts.
+ */
+export function syncStatus(): Promise<SyncStatus | null> {
+  return invoke<SyncStatus | null>('sync_status')
+}
+
+/**
+ * Fetch, merge and push — the one call in the app that reaches the network.
+ *
+ * It needs the `git` command line tool, which nothing else here does: the store
+ * itself is read and written without it. A conflict is reported rather than
+ * left on disk, and in that case nothing was changed.
+ */
+export function syncStore(): Promise<SyncOutcome> {
+  return invoke<SyncOutcome>('sync_store')
+}
+
+/**
+ * The versions of an entry its history holds, newest first.
+ *
+ * Decrypts nothing, so opening a history costs no passphrase prompt and no
+ * security-key touch. Reading one of the versions does — see
+ * {@link revealRevision}.
+ */
+export function entryHistory(name: string): Promise<Revision[]> {
+  return invoke<Revision[]>('entry_history', { name })
+}
+
+/**
+ * A past version of an entry, whole.
+ *
+ * The history counterpart to {@link revealEntry}, and the same exception: there
+ * is no smaller request, since the point of asking is to see what the version
+ * said and its shape is only knowable by decrypting it. The obligation on this
+ * side is the same — the string belongs to the open view and goes when it
+ * closes.
+ */
+export function revealRevision(name: string, revision: string): Promise<string> {
+  return invoke<string>('reveal_revision', { name, revision })
+}
+
+/**
+ * Copy the password a past version held, without showing it.
+ *
+ * The recovery case in its usual shape, served like every other copy: the value
+ * goes to the clipboard from inside the core and never comes through here.
+ */
+export function copyRevisionPassword(name: string, revision: string): Promise<CopyReceipt> {
+  return invoke<CopyReceipt>('copy_revision_password', { name, revision })
 }
 
 /**

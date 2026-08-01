@@ -66,13 +66,25 @@ cargo clippy --all-targets -- -D warnings
 
 ## Dependencies
 
-`prs-lib` provides the store, recipients, GPG backends, and git (ADR-4). It is
-**wrapped, not exposed**: its types live only in `store/prs.rs` and
-`crypto/prs.rs` behind our own traits, and must never appear in `commands.rs`,
-in a serialized payload, or in a public signature outside those modules.
+`prs-lib` is **wrapped, not exposed** (ADR-4): its types live only in
+`store/prs.rs` and `crypto/prs.rs` behind our own traits, and must never appear
+in `commands.rs`, in a serialized payload, or in a public signature outside
+those modules.
 
-Never add a dependency that would move passphrase handling into our process
-without updating ADR-3 in `PLAN.md` first.
+What it actually backs is narrower than ADR-4 first assumed, and the seam is
+why that was cheap to change: **decryption and the store walk, and nothing
+else.** Encryption is our own `gpg` invocation in `crypto/gnupg.rs` (ADR-6),
+recipient walk-up and name validation are ours in `store/` (ADR-4a F-1, F-6),
+and git is `git2` plus the user's own binary (ADR-9) — `prs-lib`'s git is not
+used at all.
+
+Two dependency rules, both with an ADR behind them:
+
+- Never add a dependency that would move **passphrase** handling into our
+  process without updating ADR-3 first.
+- Never add one that would move **network credential** handling into it —
+  in-process SSH or HTTPS auth — without updating ADR-9. Same reasoning, same
+  answer: `git` and `gpg-agent` hold the user's credentials, and we do not.
 
 ## Commits
 

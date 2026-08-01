@@ -62,12 +62,14 @@ Phase 7).
 | Core | **Rust (stable)** | All sensitive logic lives here. |
 | Frontend | **React 19 + TypeScript + Tailwind (v4) + Vite**, pnpm | Familiar stack; UI only, holds no long-lived secrets. |
 | Crypto | **Shell out to the `gpg` binary** (default) | Uses the user's keyring, `gpg-agent`, pinentry, smartcards for free. |
-| Git | **`git2`** (vendored libgit2) | No system git needed for local ops. |
+| Git | **`git2`** (vendored libgit2) for local ops, the user's **`git`** spawned for the network | No system git needed to read or write a store; syncing needs it (ADR-9). |
 
 ### Rust crates (initial)
 - `tauri` (2.x) + relevant plugins
 - `prs-lib` (GPL-3) — store, recipients, GPG backends, git; wrapped, never exposed (ADR-4)
-- `git2` — git operations, `default-features = false` (local only; see Phase 3)
+- `git2` — local git operations, `default-features = false` — settled by ADR-9:
+  with the network half delegated to the `git` binary, libssh2 and OpenSSL are
+  never needed
 - `arboard` — clipboard (used from the core, not JS)
 - `zeroize`, `secrecy` — wipe/guard plaintext
 - `totp-rs` — TOTP from `otpauth://` URIs
@@ -293,6 +295,87 @@ Record decisions here as they're made or changed.
     does. The colour rule — warm means something is showing — holds here, at
     the largest scale it reaches anywhere in the app.
 
+- **ADR-9 — `git2` for what we do ourselves, the user's `git` for the network
+  (2026-08-02).** Resolves Open Decision 2 in the direction it leaned. Reading,
+  writing and the store's local history run on vendored libgit2 and need no
+  `git` installed; `fetch`, `merge` and `push` spawn the user's own binary.
+  `git.rs` becomes `git/`, with `git/remote.rs` holding everything that spawns.
+
+  **The argument is Invariant 3's, applied to a different credential.** An SSH
+  key passphrase, an HTTPS token, a 2FA prompt and a hardware key's touch are
+  the user's credentials, and the way not to mishandle them is not to handle
+  them. `git` already knows how — their credential helper, `ssh-agent`,
+  `~/.ssh/config`, the platform keychain — so spawning it means every one of
+  those keeps working without us implementing, prompting for, or storing any of
+  it. The alternative was `git2`'s credential callbacks, which would have meant
+  turning on the network features (vendored libssh2 + OpenSSL) *and* writing our
+  own passphrase prompt: a large build surface bought in exchange for the one
+  thing §4 is most careful about.
+
+  **Consequences:**
+  - `git2` keeps `default-features = false`, which was previously a Phase 3
+    expedient and is now the settled state.
+  - Syncing needs `git` on `PATH`; nothing else does. That is
+    `Error::GitBinaryMissing`, worded so it names which part is unavailable
+    rather than implying the store is broken (§4.1 principle 5). It joins
+    Gpg4win in §11 as a Windows prerequisite, but only for sharing a store.
+  - `GIT_TERMINAL_PROMPT=0` on every spawn. With no terminal, `git` would
+    otherwise block indefinitely asking for a username on an HTTPS remote with
+    no credential helper. `GIT_ASKPASS`/`SSH_ASKPASS` are deliberately left
+    alone — those are the graphical prompts this ADR exists to keep.
+  - **`git`'s output is relayed, after redaction.** Relaying is safe as far as
+    the store goes: Invariant 1 means everything git touches is ciphertext. The
+    redaction is about the *other* credential — a remote may be configured as
+    `https://user:token@host/repo`, and git quotes the URL back on failure, so
+    `remote::redact` strips userinfo that carries a password. A bare `user@host`
+    is left, since it is not a secret and removing it would make the one message
+    meant to help unreadable.
+  - *Not done:* there is no timeout on the spawn. A dead connection can leave a
+    sync spinning until the OS gives up. Recorded rather than fixed, like the
+    clipboard's quit-inside-the-window limit.
+
+- **ADR-10 — a conflicted merge is rolled back, and reading a past version is
+  ADR-8 again (2026-08-02).** Two decisions from Phase 4, both consequences of
+  the format rather than of the interface.
+
+  **The rollback.** `sync` fetches, merges, then pushes. It uses a real merge
+  rather than `--ff-only`, because a store keeps one file per entry and two
+  people changing two different entries merges cleanly — refusing that would
+  report the ordinary case as a conflict. But when the merge *does* conflict it
+  is aborted and the working tree restored, rather than left for the user to
+  resolve. **An unresolved merge writes conflict markers into the conflicting
+  files, and here every file is ciphertext**: the result decrypts nowhere — not
+  here, not in the `pass` CLI, not on a phone — and a user who chose `pass` and
+  does not use a terminal has no way back. So the store is returned to exactly
+  what it was, byte for byte, and the interface names the entries and says
+  plainly that nothing on this computer changed. This is a deliberate deviation
+  from `pass git pull`, which leaves whatever git leaves.
+
+  **Reading a past version** (`reveal_revision`) returns a whole decrypted body,
+  and is the second exception to §4.1 principle 2's "one field at a time" —
+  ADR-8's reasoning, unchanged: there is no smaller request to serve, because
+  the point of asking is to see what the version *said*, and its shape is only
+  knowable by decrypting it. It is reached only by choosing a specific commit
+  from a list that itself decrypted nothing, so the decrypt is as deliberate as
+  opening the editor. The same discipline applies: the dialog is mounted only
+  while open, at most one version is open at a time, and the shown body carries
+  the `bg-exposed` wash.
+
+  **Consequences:**
+  - `Gpg::decrypt(&[u8])` is added beside `decrypt_file`, because a version out
+    of a git object was never a file. `decrypt_file` is now that method plus the
+    read, which is what lets its error keep the path.
+  - `copy_revision_password` exists so the ordinary recovery — "the new one does
+    not work, give me the old one" — needs no reveal at all.
+  - The revwalk sorts `TIME | TOPOLOGICAL`. Time alone is not enough and the
+    case where it fails is not exotic: two commits made in the same second on
+    two sides of a merge sort arbitrarily, so a synced store could show the
+    commit that *created* an entry as newer than a change to it. Found by
+    `tests/git_sync.rs`, not by reading.
+  - `status` is local-only by design: it reports the distance to the remote as
+    of the last fetch. An indicator the window draws on arrival must not be an
+    operation that can hang, prompt, or fail on a train.
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -332,6 +415,11 @@ rather than secret handling, and a violation is a defect in the same way.
 2. **Hidden by default, revealed one field at a time.** A revealed value lives
    on screen and nowhere else — not in a store, not in a URL, not across a
    selection change. Implemented in Phase 1; overlaps Invariants 2 and 7.
+   **Two commands return a whole body instead of one field, and both are
+   recorded rather than left to be discovered:** the edit form (ADR-8) and
+   reading a past version (ADR-10). Each is a request that has no smaller form,
+   and each carries the same discipline — mounted only while open, gone when it
+   closes.
 3. **The store is the user's, not ours.** Every write stays byte-compatible with
    the CLI; nothing is added to the format for our convenience; **a name or file
    we cannot handle is shown as unusable rather than silently hidden**
@@ -374,7 +462,9 @@ password-store-gui/
         │                     #   ours outright (F-1, F-6); prs.rs holds the impl
         ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib for *decrypt*,
         │                     #   gnupg.rs spawns gpg for *encrypt* (ADR-6)
-        ├── git.rs            # status, commit, pull, push, per-entry history
+        ├── git/              # our Vcs trait; mod.rs is git2-backed and local
+        │                     #   (commit, status, per-entry history, blobs),
+        │                     #   remote.rs spawns the user's `git` (ADR-9)
         ├── generate.rs       # password generation (CSPRNG, no modulo bias)
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
         ├── secret.rs         # zeroizing secret newtypes
@@ -629,10 +719,67 @@ password-store-gui/
   - *Still unverified locally:* the GUI has not been click-tested against a real
     store. The mutation paths are covered at the core, not through the webview.
 
-### Phase 4 — Git sync — Status: ☐
-- `git`: status, pull, push, per-entry history, basic conflict surfacing.
-- Decide network-auth path (see Open Decisions).
-- Frontend: sync button, ahead/behind indicator, history/diff view (metadata only, never plaintext diffs on screen without reveal).
+### Phase 4 — Git sync — Status: ☑
+- ☑ **Open Decision 2 resolved (ADR-9):** `git2` for everything local, the
+  user's own `git` spawned for anything that reaches the network. The reasoning
+  is Invariant 3's, applied to a different credential — we do not handle their
+  SSH passphrase or their token for the same reason we do not handle their GPG
+  passphrase. `git.rs` becomes `git/`, with the spawning half in
+  `git/remote.rs`.
+- ☑ `status`: branch, upstream, ahead/behind, and a count of files the history
+  does not have. **Local only** — it reads the remote-tracking ref rather than
+  the remote, so the window can draw an indicator on arrival without that being
+  an operation which can hang or prompt.
+  - The uncommitted count is not redundant with Phase 3's auto-commit: it is
+    exactly what a *failed* commit leaves behind, and a sync that pushed without
+    mentioning it would leave the user believing those changes had gone out.
+  - Scoped to the store's own prefix, so a store inside a dotfiles checkout does
+    not report the user's unrelated work.
+- ☑ `sync`: fetch → merge → push, in one command, with three answers that are
+  states rather than failures — `NoRemote`, `UpToDate`, `Synced { pulled,
+  pushed }` — and one that is neither, `Conflicted`.
+  - **A conflicted merge is rolled back (ADR-10).** Conflict markers written
+    into ciphertext produce a file that decrypts nowhere, so the store is
+    restored byte for byte and the interface names the entries instead. The
+    common case never reaches it: one file per entry means two people changing
+    two different entries merges cleanly.
+  - A store with no remote and a store with no repository give the same answer,
+    because it is the same answer.
+- ☑ Per-entry history: `entry_history` lists the commits that touched a name —
+  message, author, date, and whether it was created, changed or deleted —
+  **decrypting nothing**, so opening a history costs no pinentry and no key tap
+  (§4.1 principle 1). A removal is listed rather than skipped: it is the commit
+  before it that holds the version worth recovering.
+- ☑ Reading a past version: `reveal_revision` decrypts one chosen commit's blob
+  (ADR-10 — the same whole-body exception ADR-8 records), and
+  `copy_revision_password` serves the ordinary recovery without a reveal at all.
+  `Gpg::decrypt(&[u8])` was added for it, since a git blob was never a file.
+- ☑ Frontend: a sync control in the sidebar with the ahead/behind indicator, the
+  upstream named, and what pressing it may cost said *before* it is pressed; a
+  history dialog per entry with per-version open and copy.
+  - Results are raised to `App`'s notice bar rather than shown in the sidebar:
+    a conflict names entries, that column is too narrow to name them in, and a
+    conflict is the one result the user must not be able to miss. Same bar, same
+    non-fading `warn` tone as a failed commit.
+  - The history dialog holds **one** open version at a time — opening a second
+    closes the first — and unmounts with the dialog, which is ADR-8's discipline
+    applied to ADR-10's exception.
+- ☑ **Definition of done:** `tests/git_sync.rs` stands up two real stores over a
+  real `file://` remote with a real `gpg` behind both, and drives the command
+  surface: a change made in one store reaches the other **and decrypts there**;
+  two people changing different entries merges with nobody asked anything; two
+  people changing the same entry is reported and leaves the store byte-identical
+  and still decryptable by `gpg` itself. It then drives the history over real
+  ciphertext — asserting the listing carries no plaintext, and that a version
+  decrypted out of a git object matches what was written — and finally scans
+  every file under both stores, `.git` included, for plaintext (Invariant 1).
+  Skipped around where `git` is absent, as `pass` is in `write_store.rs`.
+  - *Unverified:* every remote in the tests is a local path. Nothing here has
+    been run against a real SSH or HTTPS remote, so the credential-helper
+    behaviour ADR-9 is entirely built around is **argued, not demonstrated**.
+    That is the largest gap in this phase.
+  - *Also unverified:* the conflict path was driven through the stub in the
+    webview, but a real conflicted sync has not been click-tested.
 
 ### Phase 5 — Hardening & packaging — Status: ☐
 - Auto-lock / idle-clear / blur-clear (Invariant 7).
@@ -685,7 +832,13 @@ being read as more than it is:
   Vite default — placeholders, not identity.
 - **No benchmarks**, despite speed being the positioning (§1).
 - **No users, downloads, stars, or testimonials.**
-- **The GUI has never been click-tested against a real store.** Phases 1–3 are
+- **No sync has ever run against a real remote.** `tests/git_sync.rs` drives two
+  real repositories end to end, but every remote in it is a local path. The
+  credential-helper behaviour ADR-9 is entirely built around — `ssh-agent`, a
+  keychain, an HTTPS token, `GIT_TERMINAL_PROMPT=0` turning a hang into a
+  message — is **argued from how `git` works, not demonstrated**. This is the
+  largest unverified claim in Phase 4.
+- **The GUI has never been click-tested against a real store.** Phases 1–4 are
   verified at the command surface by `src-tauri/tests/`, not through the webview.
   This is the single largest gap between "☑" and "works", and Phase 3 widened
   it: the mutation dialogs are the first screens that can *destroy* something.
@@ -698,6 +851,13 @@ being read as more than it is:
     defect: the edit dialog's textarea was not getting the `bg-exposed` wash
     ADR-8 claims for it, because `inputClass` also sets a background and won on
     stylesheet order rather than class order.
+  - **Phase 4's screens were driven the same way on 2026-08-02**: the sync panel
+    in all four of its states (tracking with ahead/behind, no remote, no
+    repository, uncommitted changes), a sync reporting each outcome including
+    the conflict notice, and the history dialog — listing, opening a version,
+    the one-at-a-time rule, and copying a past password. It found one defect
+    too: every row claimed "Copied" after any one of them was, because the row
+    matched on the clipboard notice's label rather than on the revision.
   - **It establishes nothing about the core, and the sentence above still
     stands.** No GnuPG runs, nothing is decrypted, no file is written, and the
     clipboard is a variable. The stub *mirrors* the Rust rules — the separator
@@ -756,9 +916,12 @@ being read as more than it is:
 
 1. ~~**ADR-4 — own core vs wrap `prs-lib`.**~~ Resolved: wrap it behind our own
    traits. See §3 ADR-4 for the consequences, including the required §4 audit.
-2. **Git network auth.** `git2` credential callbacks (SSH/HTTPS in-process) vs.
-   shelling to the user's `git` for remote ops so their credential helpers just work.
-   Leaning: shell to `git` for network ops, `git2` for local — simplest and most compatible.
+2. ~~**Git network auth.**~~ **Resolved in Phase 4 (ADR-9): `git2` for local
+   operations, the user's own `git` spawned for anything on the network.** The
+   deciding argument was not simplicity but Invariant 3's, applied to a
+   different credential: we do not prompt for their SSH passphrase or hold their
+   token for the same reason we do not handle their GPG passphrase. `git2`'s
+   network features stay off, and `git` becomes a prerequisite for syncing only.
 3. **Reveal policy.** Partly settled by Phase 1: reveal is **per field**, and a
    revealed value is dropped when the entry is deselected. Still open: auto-hide
    on blur, and re-hide after N seconds — both belong with Invariant 7's
@@ -815,8 +978,11 @@ being read as more than it is:
   `which`/known install paths. Watch path separators and CRLF line endings.
 - **macOS:** `pinentry-mac` for the passphrase prompt; notarization + hardened runtime for distribution.
 - **Linux:** `pinentry-gtk`/`-qt`; package as AppImage/Flatpak/deb as desired.
-- `git2` links libgit2 vendored, so local git needs no system git; network SSH may
-  still pull in libssh2 — see Open Decision 2.
+- `git2` links libgit2 vendored, so reading and writing a store — and its local
+  history — need no system git. **Syncing does** (ADR-9): `fetch`/`merge`/`push`
+  spawn the user's own `git`, which is what makes their credential helper,
+  `ssh-agent` and platform keychain work untouched. On Windows that means Git
+  for Windows alongside Gpg4win, but only for a store shared with a remote.
 
 **A working `gpg` binary is a hard prerequisite on every platform** — Gpg4win on
 Windows, `pinentry-mac` on macOS, `pinentry-gtk`/`-qt` on Linux. Its absence is a
