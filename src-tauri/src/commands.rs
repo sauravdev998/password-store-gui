@@ -20,6 +20,8 @@
 //! it can be tested against a fake store and a fake backend without standing up
 //! a Tauri app.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 use tauri::State;
 
@@ -77,6 +79,25 @@ impl Core {
     pub fn with_clipboard(clipboard: Clipboard) -> Self {
         Self::from_parts(
             Box::new(|| Ok(Box::new(PrsStore::open_default()?))),
+            Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            clipboard,
+        )
+    }
+
+    /// A core over the store at `root`, rather than the default location.
+    ///
+    /// Phase 5's settings will want this for a user-configured store path. The
+    /// integration tests want it sooner, and for a sharper reason: the only
+    /// other way to point a `Core` at a fixture is `PASSWORD_STORE_DIR`, and
+    /// setting that means `std::env::set_var` — process-global mutation that
+    /// races anything else in the binary, and which **edition 2024 makes
+    /// `unsafe`**. This crate forbids `unsafe_code` across every target and
+    /// `forbid` cannot be locally allowed, so on the day the edition is bumped
+    /// that call site stops compiling. A parameter has none of those problems.
+    pub fn with_store_root(root: impl Into<PathBuf>, clipboard: Clipboard) -> Self {
+        let root = root.into();
+        Self::from_parts(
+            Box::new(move || Ok(Box::new(PrsStore::open(&root)?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
             clipboard,
         )

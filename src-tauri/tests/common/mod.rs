@@ -62,6 +62,19 @@ impl GpgFixture {
         harden(home.path());
         // The one piece of process-global mutation in the suite, kept in a
         // single place. Safe because a binary using this holds one test.
+        //
+        // It cannot be replaced by a per-command `.env()`, which is why this is
+        // the only `set_var` left: decryption goes through `prs-lib`, which
+        // builds its own `Command` for `gpg` and offers no hook to add an
+        // environment variable to it. The child inherits ours or it finds the
+        // developer's real keyring.
+        //
+        // Note for whoever bumps the crate to edition 2024: this call becomes
+        // `unsafe` there, and `unsafe_code = "forbid"` in `Cargo.toml` covers
+        // every target and cannot be locally allowed. The fix at that point is
+        // to move the lint out of `[lints.rust]` and into a `#![forbid(...)]`
+        // in `src/lib.rs`, so it still guards the code that handles secrets
+        // while leaving the test harness able to do this.
         std::env::set_var("GNUPGHOME", home.path());
 
         let fixture = Self { gpg_bin, home };

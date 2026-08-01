@@ -117,18 +117,23 @@ fn an_entry_written_here_is_readable_by_the_pass_cli() {
         format!("{}\n", common::RECIPIENT),
     )
     .unwrap();
-    // `Core` resolves the store the way the app does, so pointing the variable
-    // at the fixture is what makes this the real command surface and not a
-    // special-cased one.
-    std::env::set_var("PASSWORD_STORE_DIR", store.path());
-
-    // Never `Core::new()` here: see [`TestClipboard`].
+    // The store root is passed rather than exported through
+    // `PASSWORD_STORE_DIR`: that would be `std::env::set_var`, which races
+    // anything else in the binary and which edition 2024 makes `unsafe` — a
+    // thing this crate forbids across every target. `read_store.rs` still
+    // covers the variable end to end, and `store::resolve_root` covers the
+    // rule itself, so nothing is lost by not repeating it here.
+    //
+    // Never `Core::new()` either: see [`TestClipboard`].
     let clipboard = TestClipboard::default();
-    let core = Core::with_clipboard(Clipboard::new(
-        Box::new(clipboard.clone()),
-        Box::new(NeverFires),
-        Duration::from_secs(45),
-    ));
+    let core = Core::with_store_root(
+        store.path(),
+        Clipboard::new(
+            Box::new(clipboard.clone()),
+            Box::new(NeverFires),
+            Duration::from_secs(45),
+        ),
+    );
 
     // --- insert ---------------------------------------------------------
     let gmail = name("Email/gmail.com");
