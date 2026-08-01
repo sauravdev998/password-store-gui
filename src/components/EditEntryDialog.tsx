@@ -91,7 +91,11 @@ export function EditEntryDialog({ name, onCancel, onSaved }: Props) {
               </p>
               {/* The one editable surface holding a whole plaintext. `bg-exposed`
                   is the same wash a revealed row gets: warm means something is
-                  showing, and this is the most of it anywhere in the app. */}
+                  showing, and this is the most of it anywhere in the app.
+                  Marked important because `inputClass` also sets a background:
+                  the two utilities have equal specificity, so without it the
+                  winner is decided by their order in the generated stylesheet
+                  rather than by the order here, and `bg-raised` takes it. */}
               <textarea
                 id="entry-body"
                 aria-describedby="entry-body-hint"
@@ -101,7 +105,7 @@ export function EditEntryDialog({ name, onCancel, onSaved }: Props) {
                 spellCheck={false}
                 autoCapitalize="off"
                 autoCorrect="off"
-                className={`${inputClass} mt-1.5 resize-y bg-exposed font-mono leading-relaxed`}
+                className={`${inputClass} mt-1.5 resize-y bg-exposed! font-mono leading-relaxed`}
                 onChange={(event) => setBody(event.target.value)}
               />
             </>

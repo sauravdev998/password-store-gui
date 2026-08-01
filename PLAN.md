@@ -688,10 +688,30 @@ being read as more than it is:
 - **The GUI has never been click-tested against a real store.** Phases 1–3 are
   verified at the command surface by `src-tauri/tests/`, not through the webview.
   This is the single largest gap between "☑" and "works", and Phase 3 widened
-  it: the mutation dialogs are the first screens that can *destroy* something,
-  and no one has yet used them.
+  it: the mutation dialogs are the first screens that can *destroy* something.
+  - **The webview half was driven on 2026-08-01, against a stub.** `pnpm
+    dev:mock` serves the frontend with `@tauri-apps/api/core` aliased to
+    `src/lib/mockInvoke.ts`, so every component is exercised through the real
+    `commands.ts` wrappers. Tree, detail pane, reveal, copy, OTP, and all four
+    mutation dialogs were driven end to end, including the refusal paths
+    (`EntryExists`, a `..` name) and the failed-commit notice. It found one
+    defect: the edit dialog's textarea was not getting the `bg-exposed` wash
+    ADR-8 claims for it, because `inputClass` also sets a background and won on
+    stylesheet order rather than class order.
+  - **It establishes nothing about the core, and the sentence above still
+    stands.** No GnuPG runs, nothing is decrypted, no file is written, and the
+    clipboard is a variable. The stub *mirrors* the Rust rules — the separator
+    in `store/entry.rs`, the validation in `store/name.rs`, the refusals in
+    `Core`, the strings in `error.rs` — rather than sharing them, so the two can
+    drift; when they do, the Rust side is right. Every §4 invariant remains
+    verified only at the command surface.
+  - `scripts/make-fixture-store.sh` builds a throwaway store and `GNUPGHOME`
+    with the same contents, for the un-stubbed path: point `pnpm tauri dev` at
+    it to drive the real core. That run has not been done.
 - **No frontend tests at all.** §8 asks for light component tests for the tree
   and the detail pane; there is no test runner in `package.json` to hold them.
+  The mock harness above is a way to *drive* the frontend, not a test suite — it
+  carries no assertions and nothing runs it in CI.
 
 ---
 
