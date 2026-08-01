@@ -376,6 +376,98 @@ Record decisions here as they're made or changed.
     of the last fetch. An indicator the window draws on arrival must not be an
     operation that can hang, prompt, or fail on a train.
 
+- **ADR-11 — settings are ours, but `pass`'s environment variables outrank them
+  (2026-08-02).** Phase 5 adds `settings.rs`: a JSON file under the platform's
+  config directory holding a store path, a clipboard window, a generated length,
+  an idle timeout, a lock-on-blur switch and an open-on-select switch. Three of
+  those six are things `pass` already lets a user set from the environment, and
+  **where the environment says something it wins.**
+
+  **The argument is byte-compatibility's, one level up.** `PASSWORD_STORE_DIR`
+  in a shell profile is the user's decision about which store is theirs, and the
+  CLI obeys it. If a setting here silently overrode it, this app and their
+  terminal would be looking at two different directories while both called it
+  "the store" — and the failure would present as an empty store rather than as a
+  conflict. §4.1 principle 3 says the store is the user's; this is the same
+  claim about where it is. An unparseable variable falls through to the setting
+  rather than to the built-in default, so a typo in a profile cannot discard a
+  choice made here.
+
+  **Consequences:**
+  - Every value crosses IPC as a `Decided<T>` — the value plus the `Source` that
+    decided it. That exists so the settings panel can show an
+    environment-pinned control as fixed and name the variable pinning it, rather
+    than offering a box that does nothing (§4.1 principle 5). It is the one
+    place the app spells a `PASSWORD_STORE_*` name out, and it earns that by
+    Open Decision 6's own test: the user needs that exact string to act outside
+    the app.
+  - `Effective` also carries the raw `configured` set, and the form edits *that*
+    rather than the resolved values. Without it, a setting the environment is
+    overriding would have no value visible behind it, and saving any unrelated
+    change would erase it — so unsetting the variable later would reveal not the
+    path the user chose but nothing at all.
+  - The clip window moved out of `Clipboard` and into `Clipboard::copy`'s
+    arguments. It is a setting that can change while the app runs, and a module
+    that schedules the clear must not be holding a copy of it from startup.
+  - Settings are written atomically, like ciphertext (ADR-6) — not because they
+    are precious, but because a half-written file fails to parse on the next
+    launch, which the user experiences as their settings vanishing. A file that
+    *does* fail to parse is reported in `Effective::problem` rather than
+    silently replaced by defaults.
+  - Nothing here is secret: a path, four numbers, two booleans. Invariant 1 is
+    about plaintext, and this file has none.
+
+- **ADR-12 — auto-lock: leaving the window and going idle are different events
+  (2026-08-02).** Invariant 7 in a codebase where the core has no cache to
+  clear. A reveal is its own decrypt and nothing survives the command that
+  produced it, so everything holding plaintext is in the webview: a revealed
+  row, the edit form's whole body (ADR-8), an opened past version (ADR-10). The
+  two events act on them differently, and the asymmetry is the decision.
+
+  - **Blur hides revealed values and nothing else.** It does not close a dialog,
+    because switching windows to read something is an ordinary step in the
+    middle of writing an entry, and closing the form would destroy work the user
+    is in the middle of. It clears *values* without remounting the pane, so that
+    a user with "open entries on select" turned on does not get a fresh decrypt
+    — and therefore a pinentry prompt — for the act of alt-tabbing back (§4.1
+    principle 1).
+  - **Idle locks the window.** Dialogs close, the selection is dropped, and a
+    lock screen says so. Unsaved input is lost, which is defensible only because
+    idle means nobody has typed for minutes. Deselecting rather than remounting
+    is what stops the unlock from decrypting on its own: the user picks the
+    entry back up, and picking it up is the request.
+
+  **Neither touches the clipboard**, and that is deliberate rather than an
+  omission. Leaving the window is precisely when a copied password is about to
+  be pasted — clearing on blur would break the feature copying exists for — and
+  by the time the window has gone idle Invariant 6's timer has long since fired,
+  so a clear there could only ever destroy something the user copied from
+  somewhere else.
+
+  **Neither flushes `gpg-agent`.** That cache belongs to the user's agent and
+  their `default-cache-ttl`. Reaching in to reset it would be us managing a
+  credential we deliberately do not handle, which is Invariant 3's whole
+  argument.
+
+  **Consequences:**
+  - The Phase 2 known limit is closed: `Clipboard::clear_if_outstanding` runs
+    the fingerprint check early from `RunEvent::Exit`, so quitting inside the
+    clip window no longer leaves the password behind. It is the *conditional*
+    clear — nobody asked for one on the way out, so a value that was never ours
+    survives. A process killed outright still cannot be helped.
+  - The lock screen is a real `<dialog>` on `showModal`, not an overlay div.
+    Found by driving it: with a plain overlay the tree, the filter, Sync and
+    Settings all stayed on the Tab order behind it, so a locked window could
+    still be operated from the keyboard. On a screen whose entire job is that
+    nothing is reachable, that is the bug.
+  - It is not a password prompt and says so. The clearing already happened when
+    the timer fired, and this app holds no passphrase to authenticate against
+    (Invariant 3), so the screen reports what was done. Escape dismisses it like
+    any other dialog.
+  - Blur is the DOM `window` event rather than Tauri's `onFocusChanged`, so the
+    same code path runs under `pnpm dev:mock` — which is the only way this
+    frontend has ever been driven.
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -407,11 +499,16 @@ These are **not** part of the eight — that list is deliberately fixed, and
 rather than secret handling, and a violation is a defect in the same way.
 
 1. **A decrypt is expensive and always the user's choice.** Nothing decrypts
-   speculatively, on hover, on select, or on a timer. **A pinentry prompt or a
-   hardware-key tap the user did not ask for is a defect.** This is why the OTP
-   row stays hidden until asked for (Phase 2) and why nothing is cached between
-   commands (Phase 1). Smartcards are a *confirmed* operating condition, not a
-   later concern — see §10.8 for the one place this is currently in tension.
+   **unrequested** — not speculatively, not on hover, not on a timer. **A
+   pinentry prompt or a hardware-key tap the user did not ask for is a defect.**
+   This is why the OTP row stays hidden until asked for (Phase 2), why nothing
+   is cached between commands (Phase 1), and why hiding a revealed value on blur
+   does not remount the pane that would re-fetch it (ADR-12). Smartcards are a
+   *confirmed* operating condition, not a later concern.
+   - *"Unrequested" rather than "on select"* — settled by Open Decision 8 in
+     Phase 5. A standing opt-in is a request made once instead of per click, and
+     the setting that carries it states its cost. The default stays off, which
+     is what protects the user holding a security key.
 2. **Hidden by default, revealed one field at a time.** A revealed value lives
    on screen and nowhere else — not in a store, not in a URL, not across a
    selection change. Implemented in Phase 1; overlaps Invariants 2 and 7.
@@ -449,9 +546,9 @@ password-store-gui/
 ├── src/                      # React / TS frontend (no long-lived secrets)
 │   ├── main.tsx
 │   ├── App.tsx
-│   ├── components/           # Tree, EntryDetail, SearchBar, GitStatus, ...
-│   ├── hooks/                # useEntries, useEntry, useGit, ...
-│   └── lib/                  # typed wrappers over Tauri commands
+│   ├── components/           # Tree, EntryDetail, SettingsDialog, SyncPanel, ...
+│   ├── hooks/                # useNow, useAutoLock (Invariant 7, ADR-12)
+│   └── lib/                  # typed wrappers over Tauri commands; settings.ts
 └── src-tauri/
     ├── Cargo.toml
     ├── tauri.conf.json
@@ -465,6 +562,7 @@ password-store-gui/
         ├── git/              # our Vcs trait; mod.rs is git2-backed and local
         │                     #   (commit, status, per-entry history, blobs),
         │                     #   remote.rs spawns the user's `git` (ADR-9)
+        ├── settings.rs       # user settings; `pass`'s env vars win (ADR-11)
         ├── generate.rs       # password generation (CSPRNG, no modulo bias)
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
         ├── secret.rs         # zeroizing secret newtypes
@@ -582,9 +680,11 @@ password-store-gui/
     asks the platform to keep the value out of clipboard history: Windows'
     cloud clipboard, macOS' Universal Clipboard, the Wayland password-manager
     hint. All three platforms spell it `Set::exclude_from_history`.
-  - *Known limit:* the clear runs on a thread that dies with the process, so
-    quitting inside the clip window leaves the secret on the clipboard. Clearing
-    on exit belongs with Invariant 7's auto-lock in Phase 5.
+  - *Known limit, closed in Phase 5:* the clear runs on a thread that dies with
+    the process, so quitting inside the clip window left the secret on the
+    clipboard. `Clipboard::clear_if_outstanding` now runs the same fingerprint
+    check from the app's exit handler (ADR-12). A process killed outright —
+    SIGKILL, a force quit, a crash — still never reaches it.
 - ☑ `otp`: `otpauth://` → TOTP via `totp-rs` (`otpauth` + `zeroize` features
   only). Parsed with `from_url_unchecked` deliberately — the checked constructor
   enforces RFC 4226's 128-bit minimum seed and real provisioning URIs are
@@ -781,11 +881,70 @@ password-store-gui/
   - *Also unverified:* the conflict path was driven through the stub in the
     webview, but a real conflicted sync has not been click-tested.
 
-### Phase 5 — Hardening & packaging — Status: ☐
-- Auto-lock / idle-clear / blur-clear (Invariant 7).
-- Global search/filter across entry names (and optionally fields, decrypt-on-demand).
-- Settings: store path, clip time, generated length, lock timeout.
-- Per-OS packaging + code signing (see Cross-Platform Notes).
+### Phase 5 — Hardening & packaging — Status: ◐
+
+Three of the four items are done; packaging is not started and is the reason
+this is not ☑.
+
+- ☑ **Settings (ADR-11):** `settings.rs` holds store path, clip time, generated
+  length, idle timeout, lock-on-blur and open-on-select, in a JSON file under
+  the platform's config directory, written atomically. **`pass`'s environment
+  variables outrank all of it**, and every value crosses IPC with the `Source`
+  that decided it so the panel can show a pinned control as fixed and name the
+  variable — the alternative being a box that silently does nothing.
+  - The store root, the clip window and the generated length are read *per use*
+    rather than captured, so a change takes effect on the next click. That is
+    the same property opening the store per command already bought.
+  - `Core::with_store_root` uses `SettingsFile::ephemeral`, for the reason
+    `with_clipboard` exists: a test must not read the developer's own
+    configuration and must certainly not write it. An explicit root also
+    outranks `PASSWORD_STORE_DIR`, so a variable in the developer's shell cannot
+    point a test at their real store.
+  - `src/lib/prefs.ts` is gone. Its `localStorage` boolean was always a
+    placeholder for this (Open Decision 8), and the store path was never
+    something the webview could have told the core anyway.
+- ☑ **Auto-lock (Invariant 7, ADR-12):** blur hides revealed values; idle closes
+  everything to a lock screen. Neither touches the clipboard and neither flushes
+  `gpg-agent` — see the ADR for why both are deliberate. Closes the Phase 2
+  clipboard-on-quit limit along the way.
+- ☑ **Global search:** a filter over entry *names*, in the sidebar, reachable
+  with Cmd/Ctrl+F and cleared with Escape. It prunes the tree to the branches
+  leading to a match and opens them, since a match inside a collapsed folder is
+  a result the user cannot see.
+  - **Names only, and not "optionally fields" as this line used to read.**
+    Searching contents means decrypting every entry to answer a keystroke — a
+    pinentry prompt per character, or a security key blinking through the
+    alphabet. That is §4.1 principle 1's central case, not an edge of it. If it
+    is ever wanted it has to be an explicit, one-shot, opt-in action with its
+    cost stated, not a filter box.
+- ☐ Per-OS packaging + code signing (see Cross-Platform Notes). Untouched.
+  Blocked in practice on things this repo does not have: an Apple Developer ID,
+  a Windows signing certificate, and any visual identity at all — the bundled
+  icons are still Tauri's scaffold mark.
+- ☑ **Definition of done, so far:** the precedence rule is a unit test rather
+  than something to be checked by reading (`settings.rs` — environment beats
+  configured beats default, a pinned value keeps the configured one behind it,
+  a rejected change leaves the previous settings in place, and a file round
+  trips). The early clipboard clear is pinned against the stub backend in
+  `clipboard.rs`: it wipes a password still inside its window, and leaves a
+  value the user copied afterwards, a window that already fired, and a clipboard
+  with nothing outstanding.
+  - *Driven in the webview on 2026-08-02*, through `pnpm dev:mock`: search
+    (match, folder match, no match, Escape), the settings panel (a refused
+    value, a saved value flowing through to the new-entry form's length, and the
+    environment-pinned state under `?env=`), blur-clear, and the idle lock. It
+    found two defects. The settings form's refusal message rendered at the
+    bottom of a scrolling area, so pressing Save on a rejected value looked like
+    pressing Save and nothing happening; it now sits outside the scroll, beside
+    the button that caused it. And the lock screen was an overlay `div`, which
+    left the tree, the filter, Sync and Settings on the Tab order behind it —
+    it is a `<dialog>` on `showModal` now, verified inert by trying to focus
+    through it.
+  - *Not covered:* there is still no frontend test runner, so none of that is
+    a regression test. The settings *file* is never written in any test that
+    runs — `SettingsFile::ephemeral` deliberately has no path, and the atomic
+    write is exercised only by `settings.rs`'s own round-trip test against a
+    temp directory.
 
 ### Phase 6 — Optional / later — Status: ☐
 - `rpgp` pure-Rust backend for a fully bundled build.
@@ -851,6 +1010,12 @@ being read as more than it is:
     defect: the edit dialog's textarea was not getting the `bg-exposed` wash
     ADR-8 claims for it, because `inputClass` also sets a background and won on
     stylesheet order rather than class order.
+  - **Phase 5's screens were driven the same way on 2026-08-02**: search in all
+    four of its states, the settings panel including a refusal and an
+    environment-pinned control, blur-clear, and the idle lock closing an open
+    edit form. It found two defects — a refusal message rendered below the fold
+    of a scrolling form, and a lock screen that left the app behind it on the
+    Tab order. Both fixed; see Phase 5's definition of done.
   - **Phase 4's screens were driven the same way on 2026-08-02**: the sync panel
     in all four of its states (tracking with ahead/behind, no remote, no
     repository, uncommitted changes), a sync reporting each outcome including
@@ -922,10 +1087,17 @@ being read as more than it is:
    different credential: we do not prompt for their SSH passphrase or hold their
    token for the same reason we do not handle their GPG passphrase. `git2`'s
    network features stay off, and `git` becomes a prerequisite for syncing only.
-3. **Reveal policy.** Partly settled by Phase 1: reveal is **per field**, and a
-   revealed value is dropped when the entry is deselected. Still open: auto-hide
-   on blur, and re-hide after N seconds — both belong with Invariant 7's
-   auto-lock in Phase 5, since neither exists in isolation.
+3. ~~**Reveal policy.**~~ **Resolved in Phase 5 (ADR-12).** Reveal stays per
+   field and a revealed value is still dropped on deselect. Auto-hide on blur is
+   now real, on by default, and a setting — because re-revealing costs a
+   decrypt, which is free behind a cached agent and another tap on a security
+   key.
+   **Re-hide after N seconds is deliberately not built.** The case it would
+   serve — a screen left showing a password — is the idle lock's, and the idle
+   lock already covers it without the cost. A per-reveal timer instead fires
+   while the user is *actively reading*, so its most likely effect is a second
+   pinentry prompt for a value that is on screen because it was just asked for.
+   That is §4.1 principle 1 pointing the other way.
 4. ~~**Clipboard mechanism.**~~ Resolved in Phase 2: core `arboard`, for the
    no-JS-plaintext property. Taken with `default-features = false` (the default
    set pulls in the `image` crate for clipboard images we never touch) plus
@@ -952,6 +1124,12 @@ being read as more than it is:
      the app: **store**, which is the product's name and every other client's,
      and **GnuPG**, which is the string they have to search for when it is
      missing or broken. Both appear beside an explanation on first use.
+   - **Phase 5 adds a third case under the same test, not an exception to it:**
+     the settings panel names `PASSWORD_STORE_DIR`, `PASSWORD_STORE_CLIP_TIME`
+     and `PASSWORD_STORE_GENERATED_LENGTH` where one of them is overriding a
+     control (ADR-11). The user needs that exact string to act — it is what they
+     have to find and change in a shell profile — and it appears only on the
+     control it has taken over, with what to do about it.
 
    What settles it is §4.1 principle 4 plus the audience test in §1: where the
    CLI-averse user and the CLI user conflict, the CLI-averse user wins, and the
@@ -960,15 +1138,14 @@ being read as more than it is:
 7. **Accessibility.** No product-specific standard has been committed
    (`PRODUCT.md`). Sensible defaults apply; nothing is currently a stated
    obligation. Worth deciding before Phase 5 rather than retrofitting.
-8. **Decrypt-on-select, versus §4.1 principle 1.** `src/lib/prefs.ts` ships a
-   `useAutoOpen` preference that decrypts on selection — **off by default**, in
-   `localStorage`, holding a boolean and never a secret. The principle as
-   written forbids decrypting "on select"; the preference's defence is that a
-   user who opted in *did* ask, once, instead of per click. That is a real
-   distinction for a cached-agent user and a bad one for a YubiKey user, whom
-   the default correctly protects. Decide whether the principle should read
-   "unrequested" rather than "on select", and note that `prefs.ts` is written to
-   move into Phase 5's settings plumbing when that lands.
+8. ~~**Decrypt-on-select, versus §4.1 principle 1.**~~ **Resolved in Phase 5
+   (2026-08-02): the principle now reads "unrequested", and the preference is a
+   real setting.** A standing opt-in is a request made once rather than per
+   click, which is a genuine distinction for a cached-agent user; the default
+   stays off, which is what protects the YubiKey user, and the settings panel
+   states the cost where the switch is. `src/lib/prefs.ts` and its `localStorage`
+   boolean are gone — the setting lives in `settings.rs` with the other five
+   (ADR-11).
 
 ---
 
