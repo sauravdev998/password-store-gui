@@ -61,6 +61,34 @@ export type OtpCode = {
   periodSecs: number
 }
 
+/** How a generated password should be built. Mirrors `generate::Recipe`. */
+export type Recipe = {
+  length: number
+  /** Whether punctuation may appear. `pass generate --no-symbols` inverts it. */
+  symbols: boolean
+}
+
+/** Whether a change reached the store's git history. */
+export type Commit = { status: 'committed' } | { status: 'failed'; reason: string }
+
+/**
+ * What a mutation reports: what happened *around* the write.
+ *
+ * Nothing about what was written — the write itself is reported by the call
+ * resolving at all. A failed commit is not a failed write: by the time git runs
+ * the entry is already encrypted on disk, so `commit.status === 'failed'` means
+ * the password is saved and the history is not.
+ */
+export type WriteReceipt = {
+  /** `null` when the store is not a git repository, which is the usual case. */
+  commit: Commit | null
+  /**
+   * Only a generate fills this: the password it made went straight to the
+   * clipboard from inside the core and never came through here.
+   */
+  clipboard: CopyReceipt | null
+}
+
 /** Liveness/version probe for the Rust core. */
 export function coreVersion(): Promise<string> {
   return invoke<string>('core_version')
@@ -130,4 +158,92 @@ export function otpCode(name: string): Promise<OtpCode> {
 /** Wipe the clipboard now, ahead of its timer. */
 export function clearClipboard(): Promise<void> {
   return invoke<void>('clear_clipboard')
+}
+
+/**
+ * Whether the store keeps a git history.
+ *
+ * Asked so the interface can say what deleting an entry actually costs — a
+ * versioned store keeps it, an unversioned one does not — rather than guessing
+ * at one of the two.
+ */
+export function storeHasHistory(): Promise<boolean> {
+  return invoke<boolean>('store_has_history')
+}
+
+/**
+ * An entry's whole plaintext, for the edit form and nothing else.
+ *
+ * The one call that returns more than a single value, and the only one that can
+ * hand over an `otpauth://` URI — which is why {@link otpCode} exists and there
+ * is no `revealOtp`. Editing an entry is asking for its whole text: the core
+ * replaces the entire body on write, so writing one means having read one.
+ *
+ * The obligation on this side is the same as any reveal, only larger: the
+ * string belongs in the open form's state and nowhere else, and goes when the
+ * form closes.
+ */
+export function revealEntry(name: string): Promise<string> {
+  return invoke<string>('reveal_entry', { name })
+}
+
+/**
+ * Create an entry. Rejects rather than overwriting an existing one.
+ *
+ * `content` is the whole file: the first line is the password, `key: value`
+ * lines become fields, and the rest is kept as notes. This is the one direction
+ * plaintext travels *into* the core, which is not a hole in the reveal rules —
+ * the user typed it, so it is already here.
+ */
+export function insertEntry(name: string, content: string): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('insert_entry', { name, content })
+}
+
+/** Replace an existing entry's contents. Rejects if it does not exist. */
+export function editEntry(name: string, content: string): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('edit_entry', { name, content })
+}
+
+/**
+ * Create an entry whose password the core generates.
+ *
+ * The password is never returned: it is written and put on the clipboard from
+ * inside the core, so the usual flow — generate, paste into the site that asked
+ * — happens without it being rendered anywhere. `receipt.clipboard` is `null`
+ * on a machine with no display server, where the entry is still created.
+ *
+ * `content` is everything *after* the password line, or `null` for a bare one.
+ */
+export function generateEntry(
+  name: string,
+  recipe: Recipe,
+  content: string | null,
+): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('generate_entry', { name, recipe, content })
+}
+
+/** Delete an entry, and any folder its removal empties. */
+export function removeEntry(name: string): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('remove_entry', { name })
+}
+
+/**
+ * Move an entry to a new name.
+ *
+ * Within one set of keys the encrypted file simply moves, so a rename inside a
+ * folder costs no passphrase prompt. Across folders protected by different keys
+ * the core decrypts and re-encrypts, which can.
+ */
+export function renameEntry(from: string, to: string): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('rename_entry', { from, to })
+}
+
+/** Copy an entry to a new name, leaving the original. Moves like a rename. */
+export function copyEntry(from: string, to: string): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('copy_entry', { from, to })
+}
+
+/** The generation defaults, so the dialog opens on what `pass` would do. */
+export function generateDefaults(): Promise<Recipe> {
+  return invoke<Recipe>('generate_defaults')
 }

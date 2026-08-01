@@ -44,6 +44,7 @@ pub fn run() {
             commands::copy_otp,
             commands::otp_code,
             commands::clear_clipboard,
+            commands::store_has_history,
             commands::insert_entry,
             commands::edit_entry,
             commands::generate_entry,

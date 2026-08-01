@@ -67,7 +67,7 @@ Phase 7).
 ### Rust crates (initial)
 - `tauri` (2.x) + relevant plugins
 - `prs-lib` (GPL-3) — store, recipients, GPG backends, git; wrapped, never exposed (ADR-4)
-- `git2` — git operations
+- `git2` — git operations, `default-features = false` (local only; see Phase 3)
 - `arboard` — clipboard (used from the core, not JS)
 - `zeroize`, `secrecy` — wipe/guard plaintext
 - `totp-rs` — TOTP from `otpauth://` URIs
@@ -261,6 +261,37 @@ Record decisions here as they're made or changed.
     a later phase finds a reason to own decryption too, dropping the dependency
     becomes a live option — but that is an ADR-4 reversal and needs its own
     entry, not a drive-by.
+
+- **ADR-8 — the edit form reveals the whole entry (2026-08-01).** Phase 3's edit
+  flow rests on `reveal_entry`, which returns an entire decrypted body across
+  IPC. It is the only command that returns more than one value, and the only
+  path by which an `otpauth://` URI — and so a TOTP seed — can reach the
+  webview. That is a deliberate exception to §4.1 principle 2's "one field at a
+  time", recorded rather than left to be discovered.
+
+  **There is no smaller request to serve.** `Core::edit` replaces the whole
+  body, so producing one means having read one. Both alternatives were
+  rejected: per-field editing would have to hold the unedited remainder
+  decrypted between commands — precisely the cache Phase 1 does not have and
+  Invariant 7 would then have to clear — and rebuilding the body from the
+  existing reveals is lossy, since the OTP line has no reveal by design and
+  repeated keys and unparsed lines would have to round-trip byte-exactly.
+
+  **It is still within Invariant 2,** which permits what the user explicitly
+  reveals. Choosing "Edit" *is* the request, and `pass edit` answers the same
+  request by opening the plaintext in `$EDITOR` — the same act with the same
+  exposure. Nothing is decrypted until the dialog opens, so a pinentry raised
+  here is one the user asked for (§4.1 principle 1).
+
+  **Consequences:**
+  - The dialog is mounted only while open. Closing it unmounts the component
+    and the string goes with it; it is never lifted to a parent, a store, or
+    `localStorage`.
+  - `reveal_entry` must not be reused as the OTP row's reveal. That row exists
+    so the code can be had without the seed, and `otp_code` is how.
+  - The editor's textarea carries the same `bg-exposed` wash a revealed row
+    does. The colour rule — warm means something is showing — holds here, at
+    the largest scale it reaches anywhere in the app.
 
 ---
 
@@ -498,7 +529,7 @@ password-store-gui/
     store; the copy and OTP paths are covered at the core, not through the
     webview.
 
-### Phase 3 — Mutations — Status: ◐
+### Phase 3 — Mutations — Status: ☑
 - ☑ **Audit `prs-lib`'s write path against §4** — done, findings in ADR-6.
   Verdict: unlike the read path, this one cannot be made safe from outside the
   crate. `crypto/gnupg.rs` spawns `gpg` itself with `pass`'s flag set, passing
@@ -538,9 +569,48 @@ password-store-gui/
   - Inbound plaintext is not a hole in Invariant 2: a password the user just
     typed is *in* the webview because they typed it, and the invariant governs
     what comes back out. `commands::body` is where core custody begins.
-- ☐ Auto-commit to git after each mutation (conventional message like the CLI).
-- ☐ Frontend: add/edit forms, generate dialog (length + symbol options), delete/rename with confirm.
-- ◐ **Definition of done:** an entry created here is readable by the `pass` CLI.
+- ☑ Auto-commit to git after each mutation, in `pass`'s own wording — a store's
+  history is shared with the CLI, so `git log` should not betray which client
+  wrote which commit. `git.rs` discovers the repository by searching upward, as
+  `pass`'s `set_git` does, so a store kept inside a dotfiles checkout is
+  versioned by it here exactly as it is there. `git2` is taken with
+  `default-features = false`: a commit is local, and the network features pull
+  in libssh2 and OpenSSL for a question Open Decision 2 has not answered.
+  - **A commit failure is not a write failure.** By the time git runs the entry
+    is already encrypted on disk, so returning `Err` would tell the user their
+    password was not saved when it was — and send them back to retry into an
+    `EntryExists`. The outcome rides in a new `WriteReceipt`, which every
+    mutation now returns, and the interface says which of the two happened.
+    Same shape as `generate`'s optional clipboard receipt, same reason.
+  - A store with no repository is the ordinary case, not a failure: the factory
+    yields `Option`, and `commit: null` means "unversioned", not "went wrong".
+  - `Error::Git` carries libgit2's own message, which the crypto layer's errors
+    deliberately do not. Safe here by construction rather than by audit: git
+    only ever reads and writes what is on disk, and Invariant 1 means what is on
+    disk is ciphertext.
+  - Staging is per-path, as `pass` does it, so a mutation never sweeps up
+    unrelated work in the store. Committing an unchanged tree is skipped —
+    `git commit` refuses an empty commit and the shared history should not
+    accumulate ours.
+- ☑ Frontend: new-entry dialog (generate or type, with length and punctuation
+  options), edit, rename, duplicate, delete-with-confirm — all on the
+  platform's `<dialog>`, which gives Escape, focus trapping and an inert
+  background rather than reimplementing them.
+  - Dialogs are **mounted only while open**. That is a security property, not a
+    rendering choice: the edit form holds a whole decrypted entry (ADR-8), and
+    unmounting is what guarantees the string leaves with the form.
+  - Generating is the default and never renders the password: the core writes it
+    and copies it, and the form says so before the fact. The clipboard notice
+    moved up to `App` for this — a password on the system clipboard is a fact
+    about the machine, not about whichever entry is on screen, and a generated
+    one has no entry on screen at all when it lands.
+  - A failed commit is the one notice that does not fade. It is the only place
+    the divergence is ever mentioned.
+  - `store_has_history` is a small read-only probe added for the delete
+    confirmation: "still recoverable from the history" is true of a versioned
+    store and false of every other one, and guessing which would be exactly the
+    failure §4.1 principle 5 is about. Unknown reads as unversioned.
+- ☑ **Definition of done:** an entry created here is readable by the `pass` CLI.
   `tests/write_store.rs` drives the real command surface against a real `gpg`
   and a temp store, then hands that store to the `pass` binary: insert, edit,
   generate, copy, rename and remove all round-trip, and `pass show` prints back
@@ -549,6 +619,15 @@ password-store-gui/
   behind. `pass` is skipped around where absent — it is a bash script and does
   not exist on Windows, which is why ADR-2 reimplements the format — so on
   Windows CI this degrades to our own round trip.
+  - `tests/git_history.rs` is the same standard for the history: a real store in
+    a real repository, driven through the command surface, then inspected with
+    `git2` rather than through our own receipts. It asserts the log reads in
+    `pass`'s words, that a rename removes the old path from the tree rather than
+    only from the working directory, that nothing is left uncommitted, and that
+    the blob the history holds decrypts back to what was written — so a store
+    cloned from that repository is a store `pass` can use.
+  - *Still unverified locally:* the GUI has not been click-tested against a real
+    store. The mutation paths are covered at the core, not through the webview.
 
 ### Phase 4 — Git sync — Status: ☐
 - `git`: status, pull, push, per-entry history, basic conflict surfacing.
@@ -608,7 +687,11 @@ being read as more than it is:
 - **No users, downloads, stars, or testimonials.**
 - **The GUI has never been click-tested against a real store.** Phases 1–3 are
   verified at the command surface by `src-tauri/tests/`, not through the webview.
-  This is the single largest gap between "☑" and "works".
+  This is the single largest gap between "☑" and "works", and Phase 3 widened
+  it: the mutation dialogs are the first screens that can *destroy* something,
+  and no one has yet used them.
+- **No frontend tests at all.** §8 asks for light component tests for the tree
+  and the detail pane; there is no test runner in `package.json` to hold them.
 
 ---
 
@@ -668,13 +751,29 @@ being read as more than it is:
 5. **Onboarding scope (ADR-7).** Committed by `PRODUCT.md`, unscoped, blocking
    Phase 7. The hard edge is Invariant 3: pinentry-driven key generation only.
    See Phase 7 for the open questions.
-6. **How much `pass` vocabulary to expose.** The domain words — *store*,
-   *entry*, *recipients*, `.gpg-id`, *pinentry*, *clip time* — are accurate and
-   are what every other client and all the documentation use, but the primary
-   user does not know them. Expose, translate, or teach? Currently unresolved
-   and answered ad hoc per screen, which is itself the problem. §4.1 principle 4
-   says plain language wins where the concept must surface; it does not say what
-   to *call* things. Resolve before the Phase 3 mutation UI hardens the wording.
+6. ~~**How much `pass` vocabulary to expose.**~~ **Resolved with the Phase 3
+   mutation UI (2026-08-01): translate by default; keep the format's own word
+   only where the user needs that exact string to act, and gloss it there.**
+   The rule, in three parts:
+   - **Actions and things get plain words.** *Entry*, *folder*, *password*,
+     *notes*, *one-time password*, *your store's history*. Not *secret*, not
+     *node*, not *commit*.
+   - **Concepts the format forces into view are described by what they do,
+     never named.** Recipients → "the keys that can open it"; a differing
+     `.gpg-id` → "if the new folder is protected by different keys, the entry is
+     decrypted and encrypted again for them"; pinentry → "your system may ask
+     for your passphrase, or your security key may need a touch"; clip time →
+     "the clipboard clears in 45s". The user is never sent to a file they did
+     not know existed.
+   - **Two words stay untranslated,** because the user needs them to act outside
+     the app: **store**, which is the product's name and every other client's,
+     and **GnuPG**, which is the string they have to search for when it is
+     missing or broken. Both appear beside an explanation on first use.
+
+   What settles it is §4.1 principle 4 plus the audience test in §1: where the
+   CLI-averse user and the CLI user conflict, the CLI-averse user wins, and the
+   CLI user loses nothing here — the *store* is unchanged, only the labels over
+   it. Byte-compatibility is a property of the files, not of the wording.
 7. **Accessibility.** No product-specific standard has been committed
    (`PRODUCT.md`). Sensible defaults apply; nothing is currently a stated
    obligation. Worth deciding before Phase 5 rather than retrofitting.

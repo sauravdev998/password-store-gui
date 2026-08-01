@@ -137,3 +137,83 @@ export function StoreIcon({ className }: IconProps) {
     </Svg>
   )
 }
+
+/** Add an entry. */
+export function PlusIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </Svg>
+  )
+}
+
+/** Edit an entry's contents. */
+export function PencilIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M4 20h4L19.5 8.5a2.12 2.12 0 0 0-3-3L5 17v3Z" />
+      <path d="M14.5 6.5l3 3" />
+    </Svg>
+  )
+}
+
+/** Move an entry to another name. */
+export function MoveIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M4 8h11" />
+      <path d="m12 5 3 3-3 3" />
+      <path d="M20 16H9" />
+      <path d="m12 13-3 3 3 3" />
+    </Svg>
+  )
+}
+
+/**
+ * Duplicate an entry — stacked sheets, deliberately unlike {@link CopyIcon}.
+ * On this surface "copy" already means the clipboard, and the two actions must
+ * not look alike.
+ */
+export function DuplicateIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M9.5 3.5h8A1.5 1.5 0 0 1 19 5v8" />
+      <rect x="5" y="7.5" width="10.5" height="13" rx="1.5" />
+    </Svg>
+  )
+}
+
+export function TrashIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M4.5 6.5h15" />
+      <path d="M9.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 14.5 5v1.5" />
+      <path d="M6.5 6.5 7.4 19a1.5 1.5 0 0 0 1.5 1.4h6.2a1.5 1.5 0 0 0 1.5-1.4l.9-12.5" />
+    </Svg>
+  )
+}
+
+/** The store's git history, for the notice that says whether a change reached it. */
+export function HistoryIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <circle cx="6.5" cy="6" r="2.5" />
+      <circle cx="6.5" cy="18" r="2.5" />
+      <circle cx="17.5" cy="12" r="2.5" />
+      <path d="M6.5 8.5v7" />
+      <path d="M9 6h4a2 2 0 0 1 2 2v1.6" />
+      <path d="M9 18h4a2 2 0 0 0 2-2v-1.6" />
+    </Svg>
+  )
+}
+
+/** Close a dialog. */
+export function CloseIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="m6 6 12 12" />
+      <path d="m18 6-12 12" />
+    </Svg>
+  )
+}

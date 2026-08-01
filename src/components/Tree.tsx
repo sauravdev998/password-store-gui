@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronIcon, EntryIcon, FolderIcon } from '../lib/icons'
+import { ChevronIcon, EntryIcon, FolderIcon, PlusIcon } from '../lib/icons'
 import type { Node } from '../lib/commands'
 
 /**
@@ -24,6 +24,8 @@ type Props = {
   /** Path of the selected entry, or `null`. */
   selected: string | null
   onSelect: (path: string) => void
+  /** Offered from the empty state, where there is nothing else to do. */
+  onCreate: () => void
 }
 
 type FlatRow = {
@@ -56,7 +58,7 @@ function flatten(
   return out
 }
 
-export function Tree({ nodes, selected, onSelect }: Props) {
+export function Tree({ nodes, selected, onSelect, onCreate }: Props) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
   const rows = useMemo(() => flatten(nodes, expanded, 1, null, []), [nodes, expanded])
 
@@ -165,9 +167,17 @@ export function Tree({ nodes, selected, onSelect }: Props) {
       <div className="px-3 py-6 text-center">
         <p className="text-sm font-medium text-ink">This store is empty</p>
         <p className="mt-1 text-xs leading-relaxed text-ink-muted">
-          Entries added with <code className="font-mono">pass</code> or another client will appear
-          here.
+          Add the first entry, or open one added with <code className="font-mono">pass</code> or
+          another client.
         </p>
+        <button
+          type="button"
+          className="mt-3 inline-flex items-center gap-1.5 rounded-row border border-line-strong/45 px-2.5 py-1 text-xs font-medium text-ink-muted transition-colors hover:border-line-strong hover:bg-raised hover:text-ink"
+          onClick={onCreate}
+        >
+          <PlusIcon className="size-3.5" />
+          New entry
+        </button>
       </div>
     )
   }

@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNow } from '../hooks/useNow'
+import type { Clipped, CopySlot } from './ClipboardNotice'
 import {
   AlertIcon,
   CheckIcon,
   CopyIcon,
+  DuplicateIcon,
   EyeIcon,
   EyeOffIcon,
   LockIcon,
+  MoveIcon,
+  PencilIcon,
+  TrashIcon,
 } from '../lib/icons'
 import {
-  clearClipboard,
   copyField,
   copyNotes,
   copyOtp,
@@ -29,13 +33,16 @@ import {
  * The secret hygiene rule for this component (CLAUDE.md, Frontend): a revealed
  * value lives in `revealed` for as long as it is on screen and no longer. Two
  * things enforce that — hiding deletes the slot, and the parent mounts this
- * with `key={name}`, so selecting another entry unmounts the component and
- * takes every revealed value with it rather than carrying it across.
+ * with a key that includes the entry name, so selecting another entry unmounts
+ * the component and takes every revealed value with it rather than carrying it
+ * across.
  *
  * Copying is the path that avoids all of that: `copy*` puts the value on the
  * clipboard from inside the core, so a copied password is never in this
  * component at all. That is why every row has a Copy next to its Reveal, and
- * why copying an OTP works without ever showing one.
+ * why copying an OTP works without ever showing one. What is on the clipboard
+ * is the window's business rather than this pane's, so the notice for it lives
+ * in `App`; this component only reports what it copied.
  *
  * **Nothing decrypts on arrival.** `show_entry` returns shape rather than
  * content, but it still has to run GnuPG to learn it — which can put a
@@ -53,39 +60,33 @@ type Props = {
   /** Skip the locked state: the user has said selecting is enough. */
   autoOpen: boolean
   onAutoOpenChange: (next: boolean) => void
+  /** What the window believes is on the clipboard, so a row can say "Copied". */
+  clipped: Clipped | null
+  onCopied: (next: Clipped) => void
+  onEdit: () => void
+  onRename: () => void
+  onDuplicate: () => void
+  onDelete: () => void
 }
 
 /** Which value a revealed string belongs to. */
 type Slot = 'password' | 'notes' | `field:${number}`
 
-/** What can be on the clipboard. The OTP has no reveal, but it does copy. */
-type CopySlot = Slot | 'otp'
-
-/** What we put on the clipboard, and when the core will wipe it. */
-type Clipped = {
-  slot: CopySlot
-  label: string
-  clearsAt: number
-  /** The full window, so the countdown can be drawn to scale. */
-  windowMs: number
-}
-
-export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
+export function EntryDetail({
+  name,
+  autoOpen,
+  onAutoOpenChange,
+  clipped,
+  onCopied,
+  onEdit,
+  onRename,
+  onDuplicate,
+  onDelete,
+}: Props) {
   const [opened, setOpened] = useState(autoOpen)
   const [metadata, setMetadata] = useState<EntryMetadata | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [revealed, setRevealed] = useState<Partial<Record<Slot, string>>>({})
-  const [clipped, setClipped] = useState<Clipped | null>(null)
-
-  // Only ticks while there is a clipboard window to count down.
-  const now = useNow(clipped ? 500 : null)
-
-  // The window is over: drop it, which also stops the tick above. Without this
-  // the interval outlives what it was counting and runs for as long as the
-  // entry stays on screen.
-  useEffect(() => {
-    if (clipped && now >= clipped.clearsAt) setClipped(null)
-  }, [clipped, now])
 
   useEffect(() => {
     if (!opened) return
@@ -128,26 +129,26 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
       // The receipt carries the window, never the value — there is nothing
       // here to hold onto but a deadline.
       const windowMs = receipt.clearsInSecs * 1000
-      setClipped({ slot, label, clearsAt: Date.now() + windowMs, windowMs })
+      onCopied({ entry: name, slot, label, clearsAt: Date.now() + windowMs, windowMs })
     } catch (e: unknown) {
       setError(String(e))
     }
   }
 
-  async function clearNow() {
-    setClipped(null)
-    try {
-      await clearClipboard()
-    } catch (e: unknown) {
-      setError(String(e))
-    }
-  }
+  /** Whether `slot` of *this* entry is what the clipboard holds. */
+  const isCopied = (slot: CopySlot) => clipped?.entry === name && clipped.slot === slot
 
   const loading = opened && !metadata && !error
 
   return (
     <section className="@container flex h-full flex-col">
-      <EntryHeading name={name} />
+      <EntryHeading
+        name={name}
+        onEdit={onEdit}
+        onRename={onRename}
+        onDuplicate={onDuplicate}
+        onDelete={onDelete}
+      />
 
       <div className="flex-1 overflow-y-auto px-6 pt-2 pb-6">
         {error && (
@@ -189,7 +190,7 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
               label="Password"
               value={revealed.password}
               empty={!metadata.hasPassword}
-              copied={clipped?.slot === 'password'}
+              copied={isCopied('password')}
               onReveal={() => reveal('password', () => revealPassword(name))}
               onHide={() => hide('password')}
               onCopy={() => copy('password', 'Password', () => copyPassword(name))}
@@ -204,7 +205,7 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
                   key={slot}
                   label={key}
                   value={revealed[slot]}
-                  copied={clipped?.slot === slot}
+                  copied={isCopied(slot)}
                   onReveal={() => reveal(slot, () => revealField(name, index))}
                   onHide={() => hide(slot)}
                   onCopy={() => copy(slot, key, () => copyField(name, index))}
@@ -217,7 +218,7 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
                 label="Notes"
                 value={revealed.notes}
                 multiline
-                copied={clipped?.slot === 'notes'}
+                copied={isCopied('notes')}
                 onReveal={() => reveal('notes', () => revealNotes(name))}
                 onHide={() => hide('notes')}
                 onCopy={() => copy('notes', 'Notes', () => copyNotes(name))}
@@ -227,7 +228,7 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
             {metadata.hasOtp && (
               <OtpRow
                 name={name}
-                copied={clipped?.slot === 'otp'}
+                copied={isCopied('otp')}
                 onError={setError}
                 onCopy={() => copy('otp', 'One-time password', () => copyOtp(name))}
               />
@@ -235,41 +236,98 @@ export function EntryDetail({ name, autoOpen, onAutoOpenChange }: Props) {
           </dl>
         )}
       </div>
-
-      {clipped && (
-        <ClipboardNotice
-          label={clipped.label}
-          secondsLeft={Math.max(0, Math.ceil((clipped.clearsAt - now) / 1000))}
-          fraction={Math.max(0, Math.min(1, (clipped.clearsAt - now) / clipped.windowMs))}
-          onClear={clearNow}
-        />
-      )}
     </section>
   )
 }
 
 /**
- * The entry's name, split at the separators.
+ * The entry's name, split at the separators, and what can be done to it.
  *
  * A store name like `Email/work/fastmail.com` is a path, and the leaf is what
  * the user came for — so the folders recede and the last segment carries the
  * weight. It also tells them where they are without a second breadcrumb.
+ *
+ * The actions sit here, beside the name, rather than at the foot of the values:
+ * they act on the entry as a whole, and none of them needs the pane to have
+ * been unlocked first. Editing decrypts, but it decrypts when it is chosen —
+ * which is a request, not a side effect of looking.
  */
-function EntryHeading({ name }: { name: string }) {
+function EntryHeading({
+  name,
+  onEdit,
+  onRename,
+  onDuplicate,
+  onDelete,
+}: {
+  name: string
+  onEdit: () => void
+  onRename: () => void
+  onDuplicate: () => void
+  onDelete: () => void
+}) {
   const segments = name.split('/')
   const leaf = segments.pop() ?? name
 
   return (
     <header className="shrink-0 border-b border-line px-6 pt-5 pb-4">
-      {segments.length > 0 && (
-        <p className="mb-1 truncate font-mono text-xs text-ink-faint" title={name}>
-          {segments.join(' / ')}
-        </p>
-      )}
-      <h2 className="font-mono text-xl leading-tight font-semibold tracking-tight break-all">
-        {leaf}
-      </h2>
+      <div className="flex items-start gap-4">
+        <div className="min-w-0 flex-1">
+          {segments.length > 0 && (
+            <p className="mb-1 truncate font-mono text-xs text-ink-faint" title={name}>
+              {segments.join(' / ')}
+            </p>
+          )}
+          <h2 className="font-mono text-xl leading-tight font-semibold tracking-tight break-all">
+            {leaf}
+          </h2>
+        </div>
+
+        <div className="flex shrink-0 gap-1">
+          <HeaderButton label="Edit entry" icon={<PencilIcon className="size-4" />} onClick={onEdit} />
+          <HeaderButton label="Rename entry" icon={<MoveIcon className="size-4" />} onClick={onRename} />
+          <HeaderButton
+            label="Duplicate entry"
+            icon={<DuplicateIcon className="size-4" />}
+            onClick={onDuplicate}
+          />
+          <HeaderButton
+            label="Delete entry"
+            icon={<TrashIcon className="size-4" />}
+            danger
+            onClick={onDelete}
+          />
+        </div>
+      </div>
     </header>
+  )
+}
+
+function HeaderButton({
+  label,
+  icon,
+  danger,
+  onClick,
+}: {
+  /** The accessible name; the buttons are icon-only, so this is the only one. */
+  label: string
+  icon: React.ReactNode
+  danger?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      className={`rounded-row p-1.5 transition-colors duration-100 ${
+        danger
+          ? 'text-ink-faint hover:bg-danger-soft hover:text-danger-ink'
+          : 'text-ink-faint hover:bg-raised hover:text-ink'
+      }`}
+      onClick={onClick}
+    >
+      {icon}
+    </button>
   )
 }
 
@@ -388,10 +446,7 @@ function SecretRow({
     >
       <dt className="flex min-w-0 items-center gap-1.5 text-sm text-ink-muted">
         {shown && (
-          <span
-            aria-hidden="true"
-            className="size-1.5 shrink-0 rounded-full bg-accent-ink"
-          />
+          <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-accent-ink" />
         )}
         <span className="truncate" title={label}>
           {label}
@@ -435,9 +490,7 @@ function SecretRow({
             <RowButton
               onClick={shown ? onHide : onReveal}
               label={shown ? `Hide ${label}` : `Reveal ${label}`}
-              icon={
-                shown ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />
-              }
+              icon={shown ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
             >
               {shown ? 'Hide' : 'Reveal'}
             </RowButton>
@@ -568,7 +621,15 @@ function ExpiryDial({ secondsLeft, periodSecs }: { secondsLeft: number; periodSe
   return (
     <span className="flex items-center gap-1.5 text-xs text-ink-muted">
       <svg viewBox="0 0 16 16" className="size-3.5 shrink-0 -rotate-90" aria-hidden="true">
-        <circle cx="8" cy="8" r={radius} fill="none" stroke="currentColor" strokeWidth="2" opacity="0.25" />
+        <circle
+          cx="8"
+          cy="8"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          opacity="0.25"
+        />
         <circle
           cx="8"
           cy="8"
@@ -586,51 +647,6 @@ function ExpiryDial({ secondsLeft, periodSecs }: { secondsLeft: number; periodSe
         {secondsLeft}s
       </span>
     </span>
-  )
-}
-
-type ClipboardNoticeProps = {
-  label: string
-  secondsLeft: number
-  /** How much of the clip window is left, 1 → 0. */
-  fraction: number
-  onClear: () => void
-}
-
-/**
- * What is on the clipboard and how long the core will leave it there.
- *
- * Pinned below the scroll area rather than appended to it: a password sitting
- * on the system clipboard is true of the whole machine, not of whatever part of
- * the entry happens to be scrolled into view.
- */
-function ClipboardNotice({ label, secondsLeft, fraction, onClear }: ClipboardNoticeProps) {
-  return (
-    <div
-      role="status"
-      aria-live="polite"
-      className="shrink-0 border-t border-accent-line bg-accent-soft"
-    >
-      {/* The window, draining. It is the same number as the text, at a glance. */}
-      <div
-        aria-hidden="true"
-        className="h-0.5 origin-left bg-accent transition-transform duration-500 ease-linear"
-        style={{ transform: `scaleX(${fraction})` }}
-      />
-      <p className="flex items-center gap-3 px-6 py-3 text-xs text-accent-ink">
-        <span className="min-w-0 flex-1 leading-relaxed">
-          <span className="font-medium">{label}</span> copied — the clipboard clears in{' '}
-          <span className="tabular-nums">{secondsLeft}s</span>
-        </span>
-        <button
-          type="button"
-          className="shrink-0 rounded-row border border-accent-line px-2 py-1 font-medium transition-colors hover:bg-accent-line/40"
-          onClick={onClear}
-        >
-          Clear now
-        </button>
-      </p>
-    </div>
   )
 }
 

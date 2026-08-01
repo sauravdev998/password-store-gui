@@ -93,6 +93,9 @@
   --c-focus: oklch(0.5 0.08 255);
   --c-shadow-near: oklch(0.2 0.02 260 / 0.06);
   --c-shadow-far: oklch(0.2 0.02 260 / 0.22);
+  /* Behind a modal. Cool and neutral like the rest of the chrome: a dialog is
+     not an exposure, so it does not get to be warm. */
+  --c-scrim: oklch(0.35 0.015 260 / 0.4);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -119,6 +122,7 @@
     --c-focus: oklch(0.78 0.07 255);
     --c-shadow-near: oklch(0 0 0 / 0.3);
     --c-shadow-far: oklch(0 0 0 / 0.55);
+    --c-scrim: oklch(0.1 0.01 260 / 0.62);
   }
 }
 
@@ -139,6 +143,21 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+  }
+
+  /* The global `user-select: none` above is about stray drags over revealed
+     values. A field the user is typing into is the opposite case: selecting
+     what you just typed has to work. */
+  input,
+  textarea {
+    user-select: text;
+  }
+
+  /* Modal dialogs run on the platform's `<dialog>` (see `Dialog.tsx`), so the
+     scrim is `::backdrop` rather than a sibling element — which is what keeps
+     it above every stacking context without a `z-index` argument. */
+  dialog::backdrop {
+    background-color: var(--c-scrim);
   }
 
   /* One focus treatment for the whole app. A password manager is used mid-task

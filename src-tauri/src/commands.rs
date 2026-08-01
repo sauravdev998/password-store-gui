@@ -242,6 +242,18 @@ impl Core {
         self.clipboard.clear()
     }
 
+    /// Whether the store keeps a git history.
+    ///
+    /// A capability probe, not Phase 4's status: the interface has to be able
+    /// to say what deleting an entry actually costs, and "still recoverable
+    /// from the history" is true of a versioned store and false of every other
+    /// one. Saying the wrong one of those would be exactly the failure §4.1
+    /// principle 5 is about. Cheap — a repository discovery and nothing else.
+    pub fn has_history(&self) -> Result<bool> {
+        let store = (self.store)()?;
+        Ok((self.git)(store.root()).is_some())
+    }
+
     /// Create a new entry from the text the user typed.
     ///
     /// Refuses to overwrite: replacing an existing entry is [`Core::edit`], and
@@ -575,6 +587,13 @@ pub fn otp_code(name: EntryName, core: State<'_, Core>) -> Result<OtpCode> {
 #[tauri::command]
 pub fn clear_clipboard(core: State<'_, Core>) -> Result<()> {
     core.clear_clipboard()
+}
+
+/// Whether the store keeps a git history, so the interface can say what a
+/// deletion costs. Reads no entry and decrypts nothing.
+#[tauri::command]
+pub fn store_has_history(core: State<'_, Core>) -> Result<bool> {
+    core.has_history()
 }
 
 // The mutation commands are the one direction in which plaintext travels *into*
@@ -1448,6 +1467,15 @@ mod tests {
                 (message.clone(), paths)
             })
             .collect()
+    }
+
+    #[test]
+    fn has_history_answers_for_both_kinds_of_store() {
+        assert!(!core_without_git(&[]).core.has_history().unwrap());
+        assert!(core_with_git(&[], FakeVcs::default())
+            .core
+            .has_history()
+            .unwrap());
     }
 
     /// A store that was never `pass git init`ed has no history to fail at, and
