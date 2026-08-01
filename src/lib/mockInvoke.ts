@@ -83,6 +83,14 @@ const NO_GIT = flags.has('noGit')
 const LATENCY = Number(flags.get('latency') ?? 120)
 /** `?clip=10` — the clip window in seconds, to watch a countdown end to end. */
 const CLIP_SECS = Number(flags.get('clip') ?? 45)
+/** `?noRemote=1` — versioned, but never pushed anywhere: the sync button is off. */
+const NO_REMOTE = flags.has('noRemote')
+/** `?sync=conflicted` — what a sync reports. `synced` is the default. */
+const SYNC_RESULT = flags.get('sync') ?? 'synced'
+/** `?syncFails=1` — the sync itself errors, e.g. no `git` installed. */
+const SYNC_FAILS = flags.has('syncFails')
+/** `?uncommitted=2` — files the history does not have, for the warning line. */
+const UNCOMMITTED = Number(flags.get('uncommitted') ?? 0)
 
 // --- entry parsing, per store/entry.rs ----------------------------------
 
@@ -318,6 +326,59 @@ function receipt(): WriteReceipt {
   }
 }
 
+// --- history ------------------------------------------------------------
+
+/**
+ * A fabricated past for every entry, so the history dialog can be driven.
+ *
+ * Mirrors `git/mod.rs` only in shape: the ids are made up, the bodies are
+ * invented, and no repository exists. What it does reproduce faithfully is the
+ * rule the dialog is built around — listing costs nothing, and opening one
+ * version is a separate request that returns a whole body.
+ */
+type Past = { id: string; summary: string; author: string; committedAt: number; change: string }
+
+/** `id -> the body that version held`, for the reveal. */
+const pastBodies: Record<string, string> = {}
+
+function pastOf(name: string): Past[] {
+  if (NO_GIT) return []
+  const day = 24 * 60 * 60
+  const now = Math.floor(Date.now() / 1000)
+  const current = store[name]
+  if (current === undefined) return []
+
+  const versions: Past[] = [
+    {
+      id: `${name}@2`,
+      summary: `Edit password for ${name} using Password Store.`,
+      author: 'Saurav Mohanta',
+      committedAt: now - 2 * day,
+      change: 'modified',
+    },
+    {
+      id: `${name}@1`,
+      summary: `Add given password for ${name} to store.`,
+      author: 'Saurav Mohanta',
+      committedAt: now - 40 * day,
+      change: 'added',
+    },
+  ]
+
+  pastBodies[`${name}@2`] = current
+  // An older body that visibly differs, so "open a version" shows something
+  // other than what the detail pane already says.
+  pastBodies[`${name}@1`] = current.replace(/^.*$/m, 'an-older-password')
+  return versions
+}
+
+function pastBody(name: string, revision: string): string {
+  pastOf(name)
+  const body = pastBodies[revision]
+  if (body === undefined) throw 'not a valid revision of the store\'s history'
+  return body
+}
+
 // --- argument helpers ---------------------------------------------------
 
 type Args = Record<string, unknown>
@@ -348,6 +409,41 @@ const handlers: Record<string, (args: Args) => unknown> = {
   list_tree: () => ({ nodes: buildTree(), unsupported: UNSUPPORTED }),
 
   store_has_history: () => !NO_GIT,
+
+  sync_status: () => {
+    if (NO_GIT) return null
+    return {
+      branch: 'main',
+      tracking: NO_REMOTE ? null : { upstream: 'origin/main', ahead: 1, behind: 2 },
+      uncommitted: UNCOMMITTED,
+    }
+  },
+
+  sync_store: () => {
+    if (SYNC_FAILS) throw 'syncing needs the git command line tool, which is not installed'
+    if (NO_GIT || NO_REMOTE) return { status: 'noRemote' }
+    switch (SYNC_RESULT) {
+      case 'upToDate':
+        return { status: 'upToDate' }
+      case 'conflicted':
+        return { status: 'conflicted', entries: ['Email/gmail.com', 'wifi'] }
+      default:
+        return { status: 'synced', pulled: 2, pushed: 1 }
+    }
+  },
+
+  entry_history: (args) => {
+    const name = str(args, 'name')
+    bodyOf(name)
+    return pastOf(name)
+  },
+
+  reveal_revision: (args) => pastBody(str(args, 'name'), str(args, 'revision')),
+
+  copy_revision_password: (args) => {
+    const body = pastBody(str(args, 'name'), str(args, 'revision'))
+    return copyToClipboard(parseEntry(body).password)
+  },
 
   generate_defaults: () => ({ length: 25, symbols: true }),
 

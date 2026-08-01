@@ -99,6 +99,37 @@ pub enum Error {
     #[error("failed to decrypt {path}")]
     Decrypt { path: PathBuf },
 
+    /// Decryption failed for ciphertext that has no file behind it.
+    ///
+    /// The in-memory counterpart to [`Error::Decrypt`]: a blob read out of the
+    /// store's git history was never a file, so there is nothing to name. It is
+    /// deliberately thin, and callers that know what they were decrypting
+    /// replace it with something that says so — see
+    /// [`Error::DecryptRevision`]. It should not reach the webview as it
+    /// stands; if it ever does, that is a missing `map_err`, not a message to
+    /// improve here.
+    #[error("failed to decrypt")]
+    DecryptBlob,
+
+    /// A past version of an entry could not be decrypted.
+    ///
+    /// The entry name is store metadata the webview already holds, and the
+    /// commit is named nowhere: what the user needs to know is which entry, and
+    /// that the failure is about an old version rather than the current one.
+    /// Same reasoning as [`Error::Decrypt`] for what is *not* carried — the
+    /// backend's own words never are.
+    #[error("failed to decrypt the version of {name} held in your store's history")]
+    DecryptRevision { name: EntryName },
+
+    /// The webview asked for a version by an id that is not a git object id.
+    ///
+    /// Every id the webview has came from `entry_history`, so this is a
+    /// malformed request rather than something a user can do — but the id is
+    /// parsed rather than trusted, and this is what parsing it says when it
+    /// fails.
+    #[error("not a valid revision of the store's history")]
+    NoSuchRevision,
+
     /// Encryption failed.
     ///
     /// Carries nothing at all — not even the destination path, which on a write
@@ -152,6 +183,31 @@ pub enum Error {
     /// has already dropped its secret.
     #[error("git could not record the change: {reason}")]
     Git { reason: String },
+
+    /// No `git` binary, which only syncing needs.
+    ///
+    /// Worth its own variant because of what it does *not* mean: reading,
+    /// writing and the store's local history all run on vendored libgit2 and
+    /// work fine without it (ADR-9). Only talking to a remote needs the user's
+    /// own `git`, so the message says which part is unavailable rather than
+    /// implying the store is broken (§4.1 principle 5).
+    #[error("syncing needs the git command line tool, which is not installed")]
+    GitBinaryMissing,
+
+    /// Fetching, merging or pushing failed.
+    ///
+    /// Separate from [`Error::Git`] only for its wording: that one is raised
+    /// after a write and says so, and telling a user their change was not
+    /// recorded when what actually failed was a push would be a lie in the
+    /// direction that costs them confidence in the store.
+    ///
+    /// Carries `git`'s own output, which Invariant 1 makes safe — everything
+    /// git touches is ciphertext. It is passed through
+    /// [`crate::git::remote::redact`] first, which is not about store secrets
+    /// but about the *other* credential in play: a remote URL may embed a
+    /// token, and git quotes the URL back on failure.
+    #[error("git could not sync your store: {reason}")]
+    GitSync { reason: String },
 
     #[error(transparent)]
     NotUtf8(#[from] NotUtf8),

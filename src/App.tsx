@@ -4,7 +4,9 @@ import { DeleteDialog } from './components/DeleteDialog'
 import { EditEntryDialog } from './components/EditEntryDialog'
 import { EntryDetail } from './components/EntryDetail'
 import { MoveDialog } from './components/MoveDialog'
+import { HistoryDialog } from './components/HistoryDialog'
 import { NewEntryDialog } from './components/NewEntryDialog'
+import { SyncPanel } from './components/SyncPanel'
 import { Tree } from './components/Tree'
 import { useNow } from './hooks/useNow'
 import { AlertIcon, CheckIcon, LockIcon, PlusIcon, StoreIcon } from './lib/icons'
@@ -14,6 +16,7 @@ import {
   listTree,
   storeHasHistory,
   type Node,
+  type SyncOutcome,
   type Tree as StoreTree,
   type WriteReceipt,
 } from './lib/commands'
@@ -39,6 +42,7 @@ type OpenDialog =
   | { kind: 'edit'; name: string }
   | { kind: 'move'; mode: 'rename' | 'duplicate'; from: string }
   | { kind: 'delete'; name: string }
+  | { kind: 'history'; name: string }
 
 /** What just happened, in one line. */
 type Notice = {
@@ -70,6 +74,49 @@ function noticeFor(done: string, receipt: WriteReceipt): Notice {
   }
 }
 
+/**
+ * Turn a finished sync into something worth saying.
+ *
+ * The interesting case is again the failure: a conflict has to say what was
+ * *not* done. "Nothing on this computer was changed" is the fact that stops the
+ * user hunting for damage — and it is true, because the core rolls a conflicted
+ * merge back rather than leaving markers inside ciphertext.
+ */
+function describeSync(outcome: SyncOutcome): Notice {
+  switch (outcome.status) {
+    case 'noRemote':
+      return {
+        tone: 'ok',
+        message: 'This store is not shared with a remote, so there was nothing to sync.',
+      }
+    case 'upToDate':
+      return { tone: 'ok', message: 'Your store is already in step with its remote.' }
+    case 'synced': {
+      const parts: string[] = []
+      if (outcome.pulled > 0) parts.push(`brought in ${changes(outcome.pulled)}`)
+      if (outcome.pushed > 0) parts.push(`sent ${changes(outcome.pushed)}`)
+      return { tone: 'ok', message: `Synced: ${parts.join(', ')}.` }
+    }
+    case 'conflicted':
+      return {
+        tone: 'warn',
+        message:
+          `Your store and its remote both changed ${listed(outcome.entries)}, so they could not ` +
+          `be combined automatically. Nothing on this computer was changed. Decide which version ` +
+          `you want to keep, then sync again.`,
+      }
+  }
+}
+
+const changes = (count: number) => (count === 1 ? '1 change' : `${count} changes`)
+
+/** Name the entries in a sentence, without letting a long list run away. */
+function listed(entries: string[]): string {
+  if (entries.length === 0) return 'the same entries'
+  if (entries.length <= 3) return entries.join(', ')
+  return `${entries.slice(0, 3).join(', ')} and ${entries.length - 3} more`
+}
+
 function App() {
   const [tree, setTree] = useState<StoreTree | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -83,6 +130,10 @@ function App() {
   // Bumped after an edit so the detail pane remounts: it re-reads the entry's
   // shape, and every revealed value from before the edit goes with the unmount.
   const [revision, setRevision] = useState(0)
+  // Bumped whenever the store changed at all, so the sync panel's counts follow
+  // without it having to know what happened. Kept apart from `revision`, which
+  // costs a remount and is only warranted when revealed values went stale.
+  const [storeRevision, setStoreRevision] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -130,6 +181,7 @@ function App() {
     // history" there is: it comes from the write that just happened.
     setVersioned(receipt.commit !== null)
     if (nextSelection !== undefined) setSelected(nextSelection)
+    setStoreRevision((prev) => prev + 1)
     void refresh()
   }
 
@@ -187,7 +239,25 @@ function App() {
           )}
         </nav>
 
-        <div className="shrink-0 border-t border-line">
+        {/* `divide-y` rather than a border on each: the sync panel renders
+            nothing at all on a store with no history, and a divider drawn by
+            the container only appears between children that exist. */}
+        <div className="shrink-0 divide-y divide-line border-t border-line">
+          <SyncPanel
+            revision={storeRevision}
+            onStarted={() => setNotice(null)}
+            onOutcome={(outcome) => {
+              setNotice(describeSync(outcome))
+              // A sync can bring entries in, so the tree is stale either way —
+              // and after a conflict nothing changed, which `refresh` confirms
+              // rather than assumes.
+              setStoreRevision((prev) => prev + 1)
+              setRevision((prev) => prev + 1)
+              void refresh()
+            }}
+            onError={(message) => setNotice({ tone: 'warn', message })}
+          />
+
           <label className="flex cursor-pointer items-center gap-2.5 px-4 py-3 text-xs text-ink-muted select-none">
             <input
               type="checkbox"
@@ -201,7 +271,7 @@ function App() {
           {tree && tree.unsupported.length > 0 && (
             // Surfaced rather than dropped: a file that exists but is invisible
             // in the GUI is worse than one shown as unusable.
-            <details className="border-t border-line px-4 py-2.5 text-xs text-ink-muted">
+            <details className="px-4 py-2.5 text-xs text-ink-muted">
               <summary className="cursor-pointer rounded-row py-0.5 select-none hover:text-ink">
                 {tree.unsupported.length}{' '}
                 {tree.unsupported.length === 1 ? 'file has' : 'files have'} names this app cannot
@@ -233,6 +303,12 @@ function App() {
               clipped={clipped}
               onCopied={setClipped}
               onEdit={() => setDialog({ kind: 'edit', name: selected })}
+              // Offered only when there is a history to show. Unknown reads as
+              // none, the same way the delete confirmation treats it: a button
+              // that opens an empty list is worse than no button.
+              onHistory={
+                versioned === true ? () => setDialog({ kind: 'history', name: selected }) : undefined
+              }
               onRename={() => setDialog({ kind: 'move', mode: 'rename', from: selected })}
               onDuplicate={() => setDialog({ kind: 'move', mode: 'duplicate', from: selected })}
               onDelete={() => setDialog({ kind: 'delete', name: selected })}
@@ -297,6 +373,18 @@ function App() {
           versioned={versioned === true}
           onCancel={() => setDialog(null)}
           onDeleted={(receipt) => settle(`Deleted ${dialog.name}`, receipt, null)}
+        />
+      )}
+
+      {dialog?.kind === 'history' && (
+        // Mounted only while open, like every other dialog, and for the
+        // sharpest version of the reason: it can hold a whole decrypted past
+        // version (ADR-10), and unmounting is what guarantees that string goes.
+        <HistoryDialog
+          name={dialog.name}
+          clipped={clipped}
+          onCopied={setClipped}
+          onClose={() => setDialog(null)}
         />
       )}
     </div>

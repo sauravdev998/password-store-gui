@@ -56,12 +56,10 @@ impl PrsGpg {
 }
 
 impl Gpg for PrsGpg {
-    fn decrypt_file(&self, path: &Path) -> Result<Secret> {
-        let ciphertext = fs::read(path).map_err(|source| Error::io(path, source))?;
-
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Secret> {
         with_context(|context| {
             let plaintext = context
-                .decrypt(Ciphertext::from(ciphertext))
+                .decrypt(Ciphertext::from(ciphertext.to_vec()))
                 // The source is dropped on purpose. ADR-4a found the variants
                 // reachable here carry only an exit status, but this is the one
                 // path where plaintext exists in the process, so the error
@@ -69,13 +67,22 @@ impl Gpg for PrsGpg {
                 // audit. What the user needs — a bad passphrase, a cancelled
                 // pinentry, a missing secret key — gpg has already told them
                 // through its own prompt.
-                .map_err(|_| Error::Decrypt { path: path.into() })?;
+                .map_err(|_| Error::DecryptBlob)?;
 
             // The copy out of `prs-lib`'s buffer and into ours is the seam
             // ADR-4 asks for: `Plaintext` is zeroized as it drops at the end of
             // this closure, and no `prs-lib` type leaves this module.
             Ok(Secret::from_slice(plaintext.unsecure_ref()))
         })
+    }
+
+    fn decrypt_file(&self, path: &Path) -> Result<Secret> {
+        let ciphertext = fs::read(path).map_err(|source| Error::io(path, source))?;
+        // The pathless failure above becomes one that names the file. Nothing
+        // else is carried across: the discarded error held only an exit status,
+        // and this is the path where plaintext exists in the process.
+        self.decrypt(&ciphertext)
+            .map_err(|_| Error::Decrypt { path: path.into() })
     }
 
     /// Delegated to [`gnupg`] rather than to `prs-lib` — ADR-6, and the module

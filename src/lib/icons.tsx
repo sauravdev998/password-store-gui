@@ -208,6 +208,37 @@ export function HistoryIcon({ className }: IconProps) {
   )
 }
 
+/** Exchange changes with the store's remote. Spun by the caller while it runs. */
+export function SyncIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <path d="M20 12a8 8 0 0 1-13.4 5.9" />
+      <path d="M4 12a8 8 0 0 1 13.4-5.9" />
+      <path d="M17 2.5V6.5h-4" />
+      <path d="M7 21.5V17.5h4" />
+    </Svg>
+  )
+}
+
+/** Commits waiting to go out, or waiting to come in. Direction is the caller's. */
+export function ArrowIcon({ className, up }: IconProps & { up?: boolean }) {
+  return (
+    <Svg className={className}>
+      {up ? (
+        <>
+          <path d="M12 19V5" />
+          <path d="m6 11 6-6 6 6" />
+        </>
+      ) : (
+        <>
+          <path d="M12 5v14" />
+          <path d="m6 13 6 6 6-6" />
+        </>
+      )}
+    </Svg>
+  )
+}
+
 /** Close a dialog. */
 export function CloseIcon({ className }: IconProps) {
   return (

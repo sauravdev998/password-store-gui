@@ -15,6 +15,8 @@ pub mod prs;
 
 use std::path::Path;
 
+#[cfg(doc)]
+use crate::error::Error;
 use crate::error::Result;
 use crate::secret::Secret;
 use crate::store::Recipients;
@@ -27,10 +29,23 @@ pub use prs::PrsGpg;
 /// swapped — ADR-3 lists GPGME and `rpgp` as later options — without touching
 /// the command surface.
 pub trait Gpg: Send + Sync {
-    /// Decrypt the encrypted file at `path`.
+    /// Decrypt ciphertext already in memory.
+    ///
+    /// Exists for the one thing that has no file behind it: a past version of
+    /// an entry, read out of a git object rather than off disk (Phase 4). The
+    /// error it returns therefore names nothing — see [`Error::DecryptBlob`] —
+    /// and the caller, which does know what it asked for, replaces it with
+    /// something that says so.
     ///
     /// Passphrase handling belongs entirely to `gpg-agent` and its pinentry
     /// (Invariant 3); this never sees one, and never prompts.
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Secret>;
+
+    /// Decrypt the encrypted file at `path`.
+    ///
+    /// The same operation as [`Gpg::decrypt`] with the read attached, kept
+    /// separate so the error can carry the path — which is what makes a failure
+    /// here actionable and a failure there not.
     fn decrypt_file(&self, path: &Path) -> Result<Secret>;
 
     /// Encrypt `plaintext` to `recipients` and write it to `path`.
