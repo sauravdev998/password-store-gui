@@ -6,7 +6,10 @@
 //! - **Metadata by default.** [`show_entry`] returns shape, never content. The
 //!   only values that cross into the webview are the ones a user asked to see,
 //!   one at a time, through a `reveal_*` command (Invariant 2). [`reveal`] is
-//!   the single place a [`Secret`] becomes a `String`.
+//!   the single place a [`Secret`] becomes a `String`. A `copy_*` command does
+//!   not go through it at all: the value goes to the clipboard from inside the
+//!   core, and what comes back is a [`CopyReceipt`] that says only when the
+//!   clipboard will be wiped.
 //! - **Nothing decrypted is kept.** A command decrypts, answers, and drops the
 //!   plaintext before it returns. There is no cache in Phase 1 — which is also
 //!   why there is nothing for Invariant 7's auto-lock to clear yet.
@@ -17,26 +20,37 @@
 //! it can be tested against a fake store and a fake backend without standing up
 //! a Tauri app.
 
+use serde::Serialize;
 use tauri::State;
 
+use crate::clipboard::Clipboard;
 use crate::crypto::{Gpg, PrsGpg};
 use crate::error::{Error, Result};
+use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
 use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
 
-/// What every command needs: a store to read and a backend to decrypt with.
+/// What every command needs: a store to read, a backend to decrypt with, and a
+/// clipboard to copy into.
 ///
-/// Both are opened per command rather than once at startup. That is
-/// deliberate — each can fail for a reason the user can fix while the app is
-/// running (no store directory yet, no `gpg` on `PATH`), and reopening means
-/// the fix takes effect on the next click instead of the next launch. Neither
-/// is expensive: opening the store is a `canonicalize`, and the `gpg` probe
-/// hits the thread-local context cache in `crypto::prs` after the first call.
+/// The store and the backend are opened per command rather than once at
+/// startup. That is deliberate — each can fail for a reason the user can fix
+/// while the app is running (no store directory yet, no `gpg` on `PATH`), and
+/// reopening means the fix takes effect on the next click instead of the next
+/// launch. Neither is expensive: opening the store is a `canonicalize`, and the
+/// `gpg` probe hits the thread-local context cache in `crypto::prs` after the
+/// first call.
+///
+/// The clipboard is the exception: on X11 and Wayland the process that set the
+/// clipboard is the one that serves it, so the handle has to outlive the
+/// command. It opens lazily, so a machine with no display server still starts
+/// and still reads.
 ///
 /// Holds no decrypted state, so it is `Send + Sync` without a lock.
 pub struct Core {
     store: StoreFactory,
     gpg: GpgFactory,
+    clipboard: Clipboard,
 }
 
 type StoreFactory = Box<dyn Fn() -> Result<Box<dyn Store>> + Send + Sync>;
@@ -44,17 +58,22 @@ type GpgFactory = Box<dyn Fn() -> Result<Box<dyn Gpg>> + Send + Sync>;
 
 impl Core {
     /// The real store — `PASSWORD_STORE_DIR`, else `~/.password-store` — read
-    /// through the user's `gpg`.
+    /// through the user's `gpg`, copying to the system clipboard.
     pub fn new() -> Self {
-        Self::from_factories(
+        Self::from_parts(
             Box::new(|| Ok(Box::new(PrsStore::open_default()?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            Clipboard::system(),
         )
     }
 
-    /// Seam for the tests below: any [`Store`] and any [`Gpg`].
-    fn from_factories(store: StoreFactory, gpg: GpgFactory) -> Self {
-        Self { store, gpg }
+    /// Seam for the tests below: any [`Store`], any [`Gpg`], any clipboard.
+    fn from_parts(store: StoreFactory, gpg: GpgFactory, clipboard: Clipboard) -> Self {
+        Self {
+            store,
+            gpg,
+            clipboard,
+        }
     }
 
     /// The store's directories and entries. Names only — nothing is decrypted.
@@ -98,6 +117,57 @@ impl Core {
         reveal(notes)
     }
 
+    /// Copy the password to the clipboard.
+    pub fn copy_password(&self, name: &EntryName) -> Result<CopyReceipt> {
+        self.copy(self.entry(name)?.password())
+    }
+
+    /// Copy the value of the field at `index`.
+    pub fn copy_field(&self, name: &EntryName, index: usize) -> Result<CopyReceipt> {
+        let entry = self.entry(name)?;
+        let field = entry.field(index).ok_or_else(|| Error::NoSuchField {
+            name: name.clone(),
+            index,
+        })?;
+        self.copy(field.value())
+    }
+
+    /// Copy the entry's free text.
+    pub fn copy_notes(&self, name: &EntryName) -> Result<CopyReceipt> {
+        let entry = self.entry(name)?;
+        let notes = entry
+            .notes()
+            .ok_or_else(|| Error::NoNotes { name: name.clone() })?;
+        self.copy(notes)
+    }
+
+    /// Copy the current one-time password — the code, never the URI.
+    pub fn copy_otp(&self, name: &EntryName) -> Result<CopyReceipt> {
+        let code = self.otp_code(name)?;
+        // Re-wrapped so every copy takes the same path: the code is already a
+        // `String` — it is what `otp_code` puts on the wire — but the clipboard
+        // has exactly one entry point, and that entry point takes a `Secret`.
+        self.copy(&Secret::from_slice(code.code.as_bytes()))
+    }
+
+    /// The current one-time password for `name`, with its countdown.
+    ///
+    /// The `otpauth://` URI is decrypted, used, and dropped inside this call.
+    /// Only the digits leave the core (Invariant 2) — which is why there is no
+    /// `reveal_otp` to go with the other reveals.
+    pub fn otp_code(&self, name: &EntryName) -> Result<OtpCode> {
+        let entry = self.entry(name)?;
+        let uri = entry
+            .otp()
+            .ok_or_else(|| Error::NoOtp { name: name.clone() })?;
+        Otp::parse(uri)?.code()
+    }
+
+    /// Wipe the clipboard now, without waiting for the timer.
+    pub fn clear_clipboard(&self) -> Result<()> {
+        self.clipboard.clear()
+    }
+
     /// Decrypt `name` and parse it.
     ///
     /// The returned [`Entry`] holds the whole plaintext, so it is built to
@@ -108,6 +178,29 @@ impl Core {
         let plaintext = (self.gpg)()?.decrypt_file(&path)?;
         Entry::parse(plaintext)
     }
+
+    /// The single place a [`Secret`] reaches the clipboard.
+    ///
+    /// The counterpart to [`reveal`]: that one is where a secret becomes a
+    /// string for the webview, this one is where a secret leaves the core
+    /// without becoming one.
+    fn copy(&self, secret: &Secret) -> Result<CopyReceipt> {
+        Ok(CopyReceipt {
+            clears_in_secs: self.clipboard.copy(secret)?.as_secs(),
+        })
+    }
+}
+
+/// What the webview learns from a copy: when the clipboard will be wiped.
+///
+/// Nothing about the value — the point of copying in the core is that the value
+/// never comes back here (Invariant 2). Adding a field that describes what was
+/// copied would undo that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyReceipt {
+    /// Seconds until the auto-clear fires, so the UI can count down with it.
+    pub clears_in_secs: u64,
 }
 
 impl Default for Core {
@@ -167,8 +260,44 @@ pub fn reveal_notes(name: EntryName, core: State<'_, Core>) -> Result<String> {
 }
 
 // The OTP URI deliberately has no reveal command: it embeds the shared TOTP
-// seed, and what a user actually wants to see is the six-digit code. Phase 2
-// computes that in the core and sends only the code.
+// seed, and what a user actually wants to see is the six-digit code. That is
+// what `otp_code` returns, computed in the core.
+
+/// Copy the password to the clipboard, without it passing through the webview.
+#[tauri::command]
+pub fn copy_password(name: EntryName, core: State<'_, Core>) -> Result<CopyReceipt> {
+    core.copy_password(&name)
+}
+
+/// Copy one field's value, addressed by its index in `EntryMetadata::fields`.
+#[tauri::command]
+pub fn copy_field(name: EntryName, index: usize, core: State<'_, Core>) -> Result<CopyReceipt> {
+    core.copy_field(&name, index)
+}
+
+/// Copy the entry's free text.
+#[tauri::command]
+pub fn copy_notes(name: EntryName, core: State<'_, Core>) -> Result<CopyReceipt> {
+    core.copy_notes(&name)
+}
+
+/// Copy the current one-time password.
+#[tauri::command]
+pub fn copy_otp(name: EntryName, core: State<'_, Core>) -> Result<CopyReceipt> {
+    core.copy_otp(&name)
+}
+
+/// The current one-time password and how long it lasts. Never the URI.
+#[tauri::command]
+pub fn otp_code(name: EntryName, core: State<'_, Core>) -> Result<OtpCode> {
+    core.otp_code(&name)
+}
+
+/// Wipe the clipboard now.
+#[tauri::command]
+pub fn clear_clipboard(core: State<'_, Core>) -> Result<()> {
+    core.clear_clipboard()
+}
 
 #[cfg(test)]
 // Test code handles fixtures, never real secrets: the plaintexts below are
@@ -177,8 +306,10 @@ pub fn reveal_notes(name: EntryName, core: State<'_, Core>) -> Result<String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use super::*;
+    use crate::clipboard::stub::{StubBackend, StubScheduler};
     use crate::store::{tree, Recipients};
 
     /// Root the fakes agree on. No file is ever opened under it.
@@ -233,15 +364,24 @@ mod tests {
         }
     }
 
-    /// A core over the given `name -> plaintext` pairs.
-    fn core(entries: &[(&'static str, &'static str)]) -> Core {
+    /// The clip window the fake clipboard reports, distinct from the default so
+    /// a receipt carrying it is evidence it came from the configured value.
+    const CLIP_TIME: Duration = Duration::from_secs(20);
+
+    /// A core over the given `name -> plaintext` pairs, plus the handles a test
+    /// needs to see what reached the clipboard and to fire its timer.
+    fn core_with_clipboard(
+        entries: &[(&'static str, &'static str)],
+    ) -> (Core, StubBackend, StubScheduler) {
         let names: Vec<EntryName> = entries.iter().map(|(name, _)| name_of(name)).collect();
         let plaintexts: BTreeMap<PathBuf, &'static str> = entries
             .iter()
             .map(|(name, text)| (name_of(name).to_secret_path(Path::new(ROOT)), *text))
             .collect();
 
-        Core::from_factories(
+        let backend = StubBackend::default();
+        let scheduler = StubScheduler::default();
+        let core = Core::from_parts(
             Box::new(move || {
                 Ok(Box::new(FakeStore {
                     root: PathBuf::from(ROOT),
@@ -253,6 +393,26 @@ mod tests {
                     plaintexts: plaintexts.clone(),
                 }))
             }),
+            Clipboard::new(
+                Box::new(backend.clone()),
+                Box::new(scheduler.clone()),
+                CLIP_TIME,
+            ),
+        );
+        (core, backend, scheduler)
+    }
+
+    /// A core over the given `name -> plaintext` pairs.
+    fn core(entries: &[(&'static str, &'static str)]) -> Core {
+        core_with_clipboard(entries).0
+    }
+
+    /// A clipboard nothing is expected to reach.
+    fn unused_clipboard() -> Clipboard {
+        Clipboard::new(
+            Box::new(StubBackend::default()),
+            Box::new(StubScheduler::default()),
+            CLIP_TIME,
         )
     }
 
@@ -272,7 +432,7 @@ mod tests {
     fn list_tree_returns_names_without_decrypting() {
         // The backend fails if it is used at all, so a decrypt on the listing
         // path would fail this test rather than pass unnoticed.
-        let core = Core::from_factories(
+        let core = Core::from_parts(
             Box::new(|| {
                 Ok(Box::new(FakeStore {
                     root: PathBuf::from(ROOT),
@@ -284,6 +444,7 @@ mod tests {
                     reason: "listing must not decrypt".into(),
                 })
             }),
+            unused_clipboard(),
         );
 
         let tree = core.tree().unwrap();
@@ -388,6 +549,114 @@ mod tests {
             Err(other) => panic!("expected EntryNotFound, got {other:?}"),
             Ok(_) => panic!("expected EntryNotFound for a name not in the store"),
         }
+    }
+
+    /// Invariant 2 for the copy path: the value goes to the clipboard from
+    /// inside the core, and the caller is told only when it will be wiped.
+    #[test]
+    fn copy_password_reaches_the_clipboard_and_not_the_caller() {
+        let (core, clipboard, scheduler) = core_with_clipboard(&[("wifi", "correct horse")]);
+
+        let receipt = core.copy_password(&name_of("wifi")).unwrap();
+
+        assert_eq!(receipt.clears_in_secs, CLIP_TIME.as_secs());
+        assert_eq!(clipboard.contents().as_deref(), Some("correct horse"));
+        assert_eq!(scheduler.pending(), 1, "the copy must schedule its clear");
+    }
+
+    #[test]
+    fn a_copied_value_is_wiped_when_its_timer_runs() {
+        let (core, clipboard, scheduler) = core_with_clipboard(&[("wifi", "correct horse")]);
+        core.copy_password(&name_of("wifi")).unwrap();
+
+        scheduler.fire();
+
+        assert_eq!(clipboard.contents(), None);
+    }
+
+    #[test]
+    fn copy_field_is_addressed_by_index_like_reveal() {
+        let (core, clipboard, _) = core_with_clipboard(&[("Email/gmail.com", GMAIL)]);
+        let gmail = name_of("Email/gmail.com");
+
+        core.copy_field(&gmail, 2).unwrap();
+        assert_eq!(clipboard.contents().as_deref(), Some("other.example"));
+
+        match core.copy_field(&gmail, 9) {
+            Err(Error::NoSuchField { index, .. }) => assert_eq!(index, 9),
+            Err(other) => panic!("expected NoSuchField, got {other:?}"),
+            Ok(_) => panic!("expected NoSuchField for an out-of-range index"),
+        }
+    }
+
+    #[test]
+    fn copy_notes_copies_the_free_text() {
+        let (core, clipboard, _) = core_with_clipboard(&[("Email/gmail.com", GMAIL)]);
+
+        core.copy_notes(&name_of("Email/gmail.com")).unwrap();
+
+        assert_eq!(clipboard.contents().as_deref(), Some("remember the milk"));
+    }
+
+    /// The whole reason the OTP has no reveal: what leaves the core is the
+    /// code, and the URI that would give away the seed stays behind.
+    #[test]
+    fn copy_otp_copies_the_code_and_never_the_uri() {
+        let (core, clipboard, _) = core_with_clipboard(&[("Email/gmail.com", GMAIL)]);
+
+        core.copy_otp(&name_of("Email/gmail.com")).unwrap();
+
+        let copied = clipboard.contents().unwrap();
+        assert_eq!(copied.len(), 6);
+        assert!(copied.chars().all(|c| c.is_ascii_digit()), "{copied:?}");
+        assert!(!copied.contains("JBSWY3DP"));
+        assert!(!copied.contains("otpauth"));
+    }
+
+    #[test]
+    fn otp_code_returns_a_code_and_a_live_countdown() {
+        let code = store().otp_code(&name_of("Email/gmail.com")).unwrap();
+
+        assert_eq!(code.code.len(), 6);
+        assert!(code.code.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(code.period_secs, 30);
+        assert!(
+            (1..=30).contains(&code.valid_for_secs),
+            "{}",
+            code.valid_for_secs
+        );
+    }
+
+    #[test]
+    fn otp_code_reports_an_entry_that_has_no_otp() {
+        match store().otp_code(&name_of("wifi")) {
+            Err(Error::NoOtp { name }) => assert_eq!(name.as_str(), "wifi"),
+            Err(other) => panic!("expected NoOtp, got {other:?}"),
+            Ok(_) => panic!("expected NoOtp for an entry without an otpauth:// line"),
+        }
+    }
+
+    #[test]
+    fn clear_clipboard_wipes_it_on_demand() {
+        let (core, clipboard, _) = core_with_clipboard(&[("wifi", "correct horse")]);
+        core.copy_password(&name_of("wifi")).unwrap();
+
+        core.clear_clipboard().unwrap();
+
+        assert_eq!(clipboard.contents(), None);
+    }
+
+    /// The IPC-facing half of the copy path: a receipt describes the timer, not
+    /// the value.
+    #[test]
+    fn the_serialized_receipt_carries_no_value() {
+        let (core, _, _) = core_with_clipboard(&[("wifi", "correct horse")]);
+        let receipt = core.copy_password(&name_of("wifi")).unwrap();
+
+        let json = serde_json::to_string(&receipt).unwrap();
+
+        assert_eq!(json, r#"{"clearsInSecs":20}"#);
+        assert!(!json.contains("correct horse"));
     }
 
     /// Invariant 5 at the boundary: the string the webview receives for a

@@ -35,6 +35,12 @@ pub fn run() {
             commands::reveal_password,
             commands::reveal_field,
             commands::reveal_notes,
+            commands::copy_password,
+            commands::copy_field,
+            commands::copy_notes,
+            commands::copy_otp,
+            commands::otp_code,
+            commands::clear_clipboard,
         ])
         .run(tauri::generate_context!())
         // Startup failure only; the message carries no store data.

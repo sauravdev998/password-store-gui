@@ -318,10 +318,62 @@ password-store-gui/
   - *Unverified locally:* the GUI itself has not been click-tested against a
     real store — the read path is covered at the core, not through the webview.
 
-### Phase 2 — Clipboard & OTP — Status: ☐
-- `clipboard`: copy-in-core + auto-clear timer (Invariant 6).
-- `otp`: parse `otpauth://`, render TOTP with live countdown.
-- Frontend: copy buttons per field; OTP widget.
+### Phase 2 — Clipboard & OTP — Status: ☑
+- ☑ `clipboard`: the copy happens in the core (Invariant 2) and auto-clears
+  after `PASSWORD_STORE_CLIP_TIME` — default 45s — **only if the clipboard still
+  holds what we put there** (Invariant 6). Three decisions worth recording:
+  - What we keep in order to answer "is it still ours" is a `RandomState`-keyed
+    SipHash of the value, **not the value**. `pass` parks the password in a
+    background subshell for the whole window; a second live plaintext sitting in
+    memory for 45s is the kind of thing §4 exists to prevent. A hash collision
+    would mean clearing a clipboard we did not set — the harmless direction.
+  - A generation counter, bumped per copy and per manual clear, keeps a first
+    copy's expired timer from cutting a second copy's window short. It earns its
+    keep in the case the fingerprint cannot see: the *same* value copied twice.
+  - `Backend` and `Scheduler` are traits, so the clear rule is a deterministic
+    unit test instead of a 45-second sleep. `SystemClipboard` (`arboard`, no
+    default features, `wayland-data-control` on) opens **lazily but is then
+    kept** — unlike the store and the `gpg` backend, because on X11 and Wayland
+    the process that set the clipboard is the one that serves it. Every write
+    asks the platform to keep the value out of clipboard history: Windows'
+    cloud clipboard, macOS' Universal Clipboard, the Wayland password-manager
+    hint. All three platforms spell it `Set::exclude_from_history`.
+  - *Known limit:* the clear runs on a thread that dies with the process, so
+    quitting inside the clip window leaves the secret on the clipboard. Clearing
+    on exit belongs with Invariant 7's auto-lock in Phase 5.
+- ☑ `otp`: `otpauth://` → TOTP via `totp-rs` (`otpauth` + `zeroize` features
+  only). Parsed with `from_url_unchecked` deliberately — the checked constructor
+  enforces RFC 4226's 128-bit minimum seed and real provisioning URIs are
+  routinely shorter (Google's are 80-bit); `pass otp` reads those, so refusing
+  them would be us disagreeing with the user's store. `TotpUrlError` quotes the
+  URI it rejected and that URI carries the seed, so `Error::InvalidOtpUri` has
+  no payload at all (Invariant 5). `Otp` takes the Unix second as a parameter,
+  which makes the RFC 6238 vectors a test rather than a comment.
+- ☑ Commands: `copy_password` / `copy_field` / `copy_notes` / `copy_otp`, each
+  returning a `CopyReceipt` that carries the clip window and nothing about the
+  value, plus `otp_code` and `clear_clipboard`. `Core::copy` is the single place
+  a `Secret` reaches the clipboard, mirroring `reveal`. Still no `reveal_otp`.
+- ☑ Frontend: Copy beside Reveal on every row, and an OTP row that stays hidden
+  until asked for, then counts down and refetches from the core as each window
+  expires. Copying an OTP works *without* showing one, so the common case never
+  renders a code. A notice at the foot of the detail view says what is on the
+  clipboard, counts down with it, and offers "Clear now". `useNow` subtracts a
+  stored deadline from the clock rather than decrementing a counter, so a
+  suspend cannot leave a countdown claiming more life than there is.
+  - *Why the OTP is hidden by default:* showing it means decrypting on select,
+    which would pop a pinentry at a user who only clicked an entry to look at
+    it — and again every period, for as long as they left it open.
+- ☑ **Definition of done:** the clipboard rules are pinned against a stub
+  backend and a hand-fired scheduler (clears what is ours, leaves what is not,
+  cancels on a later copy); the OTP against the RFC 6238 vectors; and
+  `tests/read_store.rs` now drives `otp_code` over real ciphertext and asserts
+  the payload carries neither seed nor URI.
+  - *Unverified in CI:* the real `SystemClipboard` has an `#[ignore]`d
+    round-trip test — `cargo test --lib -- --ignored the_system_clipboard` —
+    since CI has no display server. Run against a live Wayland session.
+  - *Still unverified locally:* the GUI has not been click-tested against a real
+    store; the copy and OTP paths are covered at the core, not through the
+    webview.
 
 ### Phase 3 — Mutations — Status: ☐
 - `insert`, `edit`, `generate`, `rm`, `mv`, `cp` — each re-encrypting to correct recipients.
@@ -388,8 +440,11 @@ password-store-gui/
    revealed value is dropped when the entry is deselected. Still open: auto-hide
    on blur, and re-hide after N seconds — both belong with Invariant 7's
    auto-lock in Phase 5, since neither exists in isolation.
-4. **Clipboard mechanism.** Core `arboard` (chosen, for the no-JS-plaintext property)
-   vs Tauri clipboard plugin — keep `arboard` unless a platform quirk forces otherwise.
+4. ~~**Clipboard mechanism.**~~ Resolved in Phase 2: core `arboard`, for the
+   no-JS-plaintext property. Taken with `default-features = false` (the default
+   set pulls in the `image` crate for clipboard images we never touch) plus
+   `wayland-data-control`, so a native Wayland session does not have to go
+   through XWayland.
 
 ---
 

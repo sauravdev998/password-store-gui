@@ -9,6 +9,13 @@
 //!
 //! One `#[test]` only: [`common::GpgFixture`] sets `GNUPGHOME`, and this test
 //! also sets `PASSWORD_STORE_DIR` — both are process-global.
+//!
+//! The Phase 2 copy path is *not* here, deliberately: exercising it for real
+//! would need a display server that CI does not have, and driving it against a
+//! stub backend adds nothing the `clipboard` unit tests do not already pin —
+//! including the part that matters, that the auto-clear fires and leaves a
+//! value the user copied afterwards alone. What this file adds for Phase 2 is
+//! the OTP, which needs no clipboard and does need real ciphertext.
 
 // Test-only: the harness captures these, and a silent skip is worse than a
 // noisy one when the reason is "this machine has no gpg".
@@ -93,6 +100,18 @@ fn browses_a_real_store_and_reveals_a_password() {
     // Repeated keys are addressed by index, so the second `url` is reachable.
     assert_eq!(core.reveal_field(&gmail, 2).unwrap(), "other.example");
     assert_eq!(core.reveal_notes(&gmail).unwrap(), "remember the milk");
+
+    // The OTP is the one value with no reveal: the URI holds the shared seed,
+    // so the core computes the code from real ciphertext and sends only that.
+    let code = core.otp_code(&gmail).unwrap();
+    assert_eq!(code.code.len(), 6);
+    assert!(code.code.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(code.period_secs, 30);
+    let payload = serde_json::to_string(&code).unwrap();
+    assert!(
+        !payload.contains("JBSWY3DP") && !payload.contains("otpauth"),
+        "the OTP payload leaked the URI it came from"
+    );
 
     let wifi = EntryName::new("wifi").unwrap();
     assert_eq!(
