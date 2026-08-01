@@ -61,6 +61,15 @@ type Props = {
   /** Skip the locked state: the user has said selecting is enough. */
   autoOpen: boolean
   onAutoOpenChange: (next: boolean) => void
+  /**
+   * Bumped when everything showing should stop showing (Invariant 7).
+   *
+   * A counter rather than a remount, and the difference is the point: leaving
+   * the window must hide the *values* without re-running the decrypt that a
+   * fresh mount would trigger under "open entries on select". Hiding a password
+   * is not a reason to make GnuPG ask for a passphrase.
+   */
+  relock: number
   /** What the window believes is on the clipboard, so a row can say "Copied". */
   clipped: Clipped | null
   onCopied: (next: Clipped) => void
@@ -79,6 +88,7 @@ export function EntryDetail({
   name,
   autoOpen,
   onAutoOpenChange,
+  relock,
   clipped,
   onCopied,
   onEdit,
@@ -107,6 +117,14 @@ export function EntryDetail({
       cancelled = true
     }
   }, [name, opened])
+
+  // Invariant 7. Every revealed string is dropped; `metadata` is left, since it
+  // is field *keys* and flags rather than values, and keeping it is what avoids
+  // a decrypt on the way back. The one-time password lives in its own component
+  // and is remounted below, which is how its code goes with the rest.
+  useEffect(() => {
+    setRevealed({})
+  }, [relock])
 
   async function reveal(slot: Slot, load: () => Promise<string>) {
     setError(null)
@@ -232,6 +250,7 @@ export function EntryDetail({
 
             {metadata.hasOtp && (
               <OtpRow
+                key={relock}
                 name={name}
                 copied={isCopied('otp')}
                 onError={setError}

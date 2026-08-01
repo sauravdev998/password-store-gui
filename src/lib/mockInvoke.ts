@@ -28,8 +28,9 @@
  * - name validation follows `store/name.rs` (F-6)
  * - the refusal rules follow `Core` in `commands.rs`
  * - the rejection strings follow `error.rs`
+ * - the settings precedence follows `settings.rs` (ADR-11)
  *
- * Keep those four in step when the core changes, or this stops testing the app
+ * Keep those five in step when the core changes, or this stops testing the app
  * and starts testing a fiction.
  */
 
@@ -91,6 +92,16 @@ const SYNC_RESULT = flags.get('sync') ?? 'synced'
 const SYNC_FAILS = flags.has('syncFails')
 /** `?uncommitted=2` — files the history does not have, for the warning line. */
 const UNCOMMITTED = Number(flags.get('uncommitted') ?? 0)
+/**
+ * `?env=storeDir,clipTimeSecs` — pretend these are pinned by a `PASSWORD_STORE_*`
+ * variable, so the settings panel's fixed-and-explained state can be driven
+ * without setting anything in the developer's own shell.
+ */
+const PINNED = new Set((flags.get('env') ?? '').split(',').filter(Boolean))
+/** `?lockAfter=60` — a short idle timeout, so the lock screen is reachable. */
+const LOCK_AFTER = Number(flags.get('lockAfter') ?? 15 * 60)
+/** `?settingsBroken=1` — the settings file exists and will not parse. */
+const SETTINGS_BROKEN = flags.has('settingsBroken')
 
 // --- entry parsing, per store/entry.rs ----------------------------------
 
@@ -401,6 +412,55 @@ function mustBeFree(name: string): void {
   if (store[name] !== undefined) throw `an entry named ${name} already exists`
 }
 
+// --- settings, per settings.rs ------------------------------------------
+
+/**
+ * What the "user" has configured. Starts empty, as a fresh install would.
+ *
+ * Held in memory only: the stub has no file, which is also why saving here
+ * proves nothing about the atomic write in `settings::write`.
+ */
+const configured: Record<string, unknown> = {
+  storeDir: null,
+  clipTimeSecs: null,
+  generatedLength: null,
+  lockAfterSecs: LOCK_AFTER === 15 * 60 ? null : LOCK_AFTER,
+  lockOnBlur: null,
+  openOnSelect: null,
+}
+
+/** What the environment claims, for whichever keys `?env=` named. */
+const ENV: Record<string, unknown> = {
+  storeDir: '/mnt/shared/store',
+  clipTimeSecs: 90,
+  generatedLength: 40,
+}
+
+/** The precedence rule from `settings::resolve`: environment, then configured, then default. */
+function decide(key: string, fallback: unknown) {
+  if (PINNED.has(key)) return { value: ENV[key], source: 'environment' }
+  const set = configured[key]
+  if (set !== null && set !== undefined) return { value: set, source: 'configured' }
+  return { value: fallback, source: 'default' }
+}
+
+function effective() {
+  return {
+    storeDir: decide('storeDir', '/home/you/.password-store'),
+    clipTimeSecs: decide('clipTimeSecs', CLIP_SECS),
+    generatedLength: decide('generatedLength', 25),
+    lockAfterSecs: decide('lockAfterSecs', 15 * 60),
+    lockOnBlur: decide('lockOnBlur', true),
+    openOnSelect: decide('openOnSelect', false),
+    configured: { ...configured },
+    path: '/home/you/.config/password-store-gui/settings.json',
+    problem: SETTINGS_BROKEN
+      ? '/home/you/.config/password-store-gui/settings.json is not readable as settings: ' +
+        'expected value at line 1 column 3'
+      : null,
+  }
+}
+
 // --- the command surface ------------------------------------------------
 
 const handlers: Record<string, (args: Args) => unknown> = {
@@ -445,7 +505,25 @@ const handlers: Record<string, (args: Args) => unknown> = {
     return copyToClipboard(parseEntry(body).password)
   },
 
-  generate_defaults: () => ({ length: 25, symbols: true }),
+  generate_defaults: () => ({ length: effective().generatedLength.value, symbols: true }),
+
+  get_settings: () => effective(),
+
+  set_settings: (args) => {
+    const next = args.settings as Record<string, unknown>
+    // The refusals mirror `settings::validate`. Only the two that a user can
+    // actually reach through the form are worth mirroring; the rest of the
+    // bounds are the core's to enforce.
+    const length = next.generatedLength as number | null
+    if (length !== null && (length < 8 || length > 256))
+      throw 'password length must be between 8 and 256'
+    const clip = next.clipTimeSecs as number | null
+    if (clip !== null && clip > 3600)
+      throw 'the time before the clipboard is cleared cannot be more than 3600 seconds'
+
+    Object.assign(configured, next)
+    return effective()
+  },
 
   show_entry: (args) => {
     const entry = entryOf(str(args, 'name'))
