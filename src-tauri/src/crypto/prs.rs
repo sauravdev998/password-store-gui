@@ -26,9 +26,10 @@ use prs_lib::crypto::prelude::*;
 use prs_lib::crypto::{Config, Context, Proto};
 use prs_lib::Ciphertext;
 
-use crate::crypto::Gpg;
+use crate::crypto::{gnupg, Gpg};
 use crate::error::{Error, Result};
 use crate::secret::Secret;
+use crate::store::Recipients;
 
 /// Decryption through the user's `gpg` binary.
 pub struct PrsGpg {
@@ -47,6 +48,9 @@ impl PrsGpg {
     /// rules that out.
     pub fn new() -> Result<Self> {
         with_context(|_| Ok(()))?;
+        // The write path resolves `gpg` itself (ADR-6), so its precondition is
+        // checked here too rather than first failing on a save.
+        gnupg::bin()?;
         Ok(Self { _validated: () })
     }
 }
@@ -72,6 +76,13 @@ impl Gpg for PrsGpg {
             // this closure, and no `prs-lib` type leaves this module.
             Ok(Secret::from_slice(plaintext.unsecure_ref()))
         })
+    }
+
+    /// Delegated to [`gnupg`] rather than to `prs-lib` — ADR-6, and the module
+    /// doc above lists the three behaviours that force it. Nothing about this
+    /// path touches the `prs-lib` context.
+    fn encrypt_file(&self, path: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<()> {
+        gnupg::encrypt_to_file(path, recipients, plaintext)
     }
 }
 

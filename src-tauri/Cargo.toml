@@ -31,6 +31,10 @@ secrecy = "0.10"
 zeroize = "1"
 arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 totp-rs = { version = "5.7.2", default-features = false, features = ["otpauth", "zeroize"] }
+# Both serve the write path (ADR-6): `which` locates the same `gpg` prs-lib's
+# context does, and `tempfile` makes a ciphertext write atomic.
+which = "8"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

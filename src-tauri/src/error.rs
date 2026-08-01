@@ -83,6 +83,26 @@ pub enum Error {
     #[error("failed to decrypt {path}")]
     Decrypt { path: PathBuf },
 
+    /// Encryption failed.
+    ///
+    /// Carries nothing at all — not even the destination path, which on a write
+    /// is a name the user just typed rather than one they picked from the tree.
+    /// `gpg`'s own output is dropped for the same reason [`Error::Decrypt`]
+    /// drops it: this is a path with a live plaintext on it.
+    #[error("failed to encrypt")]
+    Encrypt,
+
+    /// A `.gpg-id` lists a recipient `gpg` cannot resolve to a public key.
+    ///
+    /// Both fields are public store metadata — the id as the `.gpg-id` spells
+    /// it, and the path of that file — and this is raised before any plaintext
+    /// exists in the process. Naming them is what makes the error actionable:
+    /// the fix is to import the key or correct the file.
+    /// The field is `gpg_id` rather than `source`, which `thiserror` would take
+    /// for the error's cause.
+    #[error("no public key for recipient {id}, listed in {gpg_id}")]
+    UnknownRecipient { id: String, gpg_id: PathBuf },
+
     /// Clipboard failures, with none of the platform's own error text.
     ///
     /// `arboard`'s messages are not known to quote clipboard *contents*, but

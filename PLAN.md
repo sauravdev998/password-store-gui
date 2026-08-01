@@ -173,6 +173,72 @@ Record decisions here as they're made or changed.
   crypto path. F-1 and F-6 mean `store/` owns recipient resolution and name
   validation outright rather than delegating them.
 
+- **ADR-6 — encryption is ours, decryption stays wrapped (2026-08-01).** The
+  ADR-4a audit covered the read path. Auditing `prs-lib`'s *write* path for
+  Phase 3 found three problems, and unlike the read-path findings these are not
+  fixable from outside the crate. So `crypto/gnupg.rs` spawns `gpg` itself for
+  encryption, while `crypto/prs.rs` keeps `prs-lib` for decryption. Both sit
+  behind the same `Gpg` trait, which is the seam ADR-4 was built for: "replace
+  any piece whose behavior conflicts with §4 without touching the command
+  surface."
+
+  **Why the asymmetry is the point, not an inconsistency:** decrypting has no
+  flag-compatibility surface — `gpg --decrypt` reads what the file says it is.
+  Encrypting has nothing but: the argument list *is* the access-control
+  decision, so the flags below are what determine who can read the entry
+  afterwards. That is §4 territory; reading is not.
+
+  **Findings:**
+  - **F-8 (Invariant 8).** `IsContext::encrypt` takes `Recipients`, a list of
+    resolved `Key`s, and the only way to build one from `.gpg-id` text is
+    `find_public_keys`. That matches by `util::fingerprints_equal`, which
+    normalizes both sides, requires 8+ characters, and does a **substring**
+    test — then `filter_map`s away every id it could not match, silently. A
+    `.gpg-id` line that is a *user id* (`Me <me@example.com>`) matches no
+    fingerprint at all, so that recipient is dropped and the entry is encrypted
+    to fewer people than the store demands, with no error. `pass` supports user
+    ids and `store/gpg_id.rs` already goes out of its way to preserve them
+    verbatim, so this is not a corner case.
+  - **F-9 (Invariant 8, the other direction).** `raw::encrypt` omits
+    `--no-encrypt-to`, which `pass` sets. An `encrypt-to` line in the user's
+    `gpg.conf` therefore adds a recipient the `.gpg-id` never authorized, and
+    the resulting file looks entirely normal.
+  - **F-10 (hang, plus a compatibility gap).** `gpg_stdin_output`
+    (`raw_cmd.rs:35-44`) writes the whole stdin and only then calls
+    `wait_with_output`. For decryption the plaintext is the *output*, so it is
+    survivable; for encryption both sides are large, and once the unread
+    ciphertext fills the stdout pipe buffer `gpg` stops reading stdin and the
+    two deadlock. It also omits `--compress-algo=none`, which `pass` sets so
+    that ciphertext length is not a function of plaintext redundancy.
+
+  **Consequences:**
+  - We pass recipient ids to `gpg --recipient` exactly as the `.gpg-id` spells
+    them, which is what makes fingerprints, key ids, and user ids all work:
+    resolving them is `gpg`'s job, and it fails loudly where `find_public_keys`
+    failed silently. `verify_recipients` probes each id first so the error can
+    name the id and the `.gpg-id` that listed it, rather than being a bare
+    "encryption failed".
+  - The plaintext is fed on a scoped thread while the main one drains stdout,
+    so F-10 cannot recur. Scoped so the feeder borrows the `Secret` instead of
+    needing a second copy of it.
+  - `--trust-model always`, as `prs` uses and our own test fixture uses. The
+    `.gpg-id` *is* the store's authorization decision, so the web of trust is a
+    second gate rather than the relevant one — and the way `gpg` asks about an
+    untrusted key is an interactive prompt a GUI with no TTY cannot answer.
+    With `--batch` the alternative is not a prompt but a refusal to encrypt to
+    a key the user deliberately listed. This is a deliberate deviation from
+    `pass`, which sets no trust model.
+  - Writes are atomic: ciphertext goes to a temporary file in the target's own
+    directory and is renamed over it, after an `fsync`. `pass` writes in place,
+    so an interrupted write there truncates the entry. The temporary holds
+    ciphertext only — Invariant 1 is about plaintext, which never leaves the
+    pipe. On Unix `tempfile` creates it `0600` and persisting keeps those bits,
+    which is tighter than the umask-derived permissions `pass` leaves.
+  - `prs-lib` is now used for decryption, the store walk, and nothing else. If
+    a later phase finds a reason to own decryption too, dropping the dependency
+    becomes a live option — but that is an ADR-4 reversal and needs its own
+    entry, not a drive-by.
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -375,8 +441,16 @@ password-store-gui/
     store; the copy and OTP paths are covered at the core, not through the
     webview.
 
-### Phase 3 — Mutations — Status: ☐
-- `insert`, `edit`, `generate`, `rm`, `mv`, `cp` — each re-encrypting to correct recipients.
+### Phase 3 — Mutations — Status: ◐
+- ☑ **Audit `prs-lib`'s write path against §4** — done, findings in ADR-6.
+  Verdict: unlike the read path, this one cannot be made safe from outside the
+  crate. `crypto/gnupg.rs` spawns `gpg` itself with `pass`'s flag set, passing
+  `.gpg-id` ids through verbatim; `Gpg::encrypt_file` is the trait method, and
+  the write is atomic. `tests/gpg_encrypt.rs` checks the result against a real
+  `gpg`: it decrypts, it carries exactly the `.gpg-id`'s recipients and no
+  others (F-9), an unresolvable recipient is refused by name before anything is
+  written (F-8), and the store directory holds nothing but the ciphertext.
+- ☐ `insert`, `edit`, `generate`, `rm`, `mv`, `cp` — each re-encrypting to correct recipients.
 - Auto-commit to git after each mutation (conventional message like the CLI).
 - Frontend: add/edit forms, generate dialog (length + symbol options), delete/rename with confirm.
 - **Definition of done:** an entry created here is readable by the `pass` CLI.

@@ -5,17 +5,19 @@
 //! serialized payload. In particular `prs_lib::Plaintext` stops at that
 //! module's boundary; everything outside it sees [`Secret`].
 //!
-//! The trait is decrypt-only because Phase 1 is read-only. Encryption arrives
-//! in Phase 3, where it also has to answer a question reading does not: turning
-//! the recipient ids from our own `.gpg-id` walk-up (Invariant 8) into the keys
-//! a backend wants.
+//! The two halves are backed differently, which ADR-6 explains: decryption is
+//! wrapped from `prs-lib` in [`prs`], encryption is our own `gpg` invocation in
+//! [`gnupg`]. Reading a file has no flag-compatibility surface; writing one has
+//! nothing but, since the argument list decides who can read the result.
 
+pub mod gnupg;
 pub mod prs;
 
 use std::path::Path;
 
 use crate::error::Result;
 use crate::secret::Secret;
+use crate::store::Recipients;
 
 pub use prs::PrsGpg;
 
@@ -30,4 +32,15 @@ pub trait Gpg: Send + Sync {
     /// Passphrase handling belongs entirely to `gpg-agent` and its pinentry
     /// (Invariant 3); this never sees one, and never prompts.
     fn decrypt_file(&self, path: &Path) -> Result<Secret>;
+
+    /// Encrypt `plaintext` to `recipients` and write it to `path`.
+    ///
+    /// `recipients` must be the ones our own `.gpg-id` walk-up resolved
+    /// (Invariant 8), and an implementation must encrypt to **all** of them or
+    /// fail — quietly dropping one produces a file that looks correct and is
+    /// unreadable to someone the store says may read it.
+    ///
+    /// Creating the entry's directory is the implementation's job, so a new
+    /// entry in a new folder is one call.
+    fn encrypt_file(&self, path: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<()>;
 }

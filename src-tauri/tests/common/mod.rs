@@ -94,6 +94,44 @@ impl GpgFixture {
         );
     }
 
+    /// Decrypt `path` with the real `gpg`, independently of our own code.
+    ///
+    /// The other direction from [`GpgFixture::encrypt`]: it is what lets a test
+    /// assert that a file *we* wrote is readable by the tool the store belongs
+    /// to, rather than only by us.
+    pub fn decrypt(&self, path: &Path) -> Vec<u8> {
+        let output = Command::new(&self.gpg_bin)
+            .args(["--batch", "--quiet", "--decrypt"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "decryption failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// Recipient key ids a ciphertext is encrypted to, as `gpg` reports them.
+    ///
+    /// Used to check Invariant 8 from the outside: what the file says, not what
+    /// we believe we asked for.
+    pub fn recipients_of(&self, path: &Path) -> Vec<String> {
+        let output = Command::new(&self.gpg_bin)
+            .args(["--batch", "--list-packets"])
+            .arg(path)
+            .output()
+            .unwrap();
+        // A `:pubkey enc packet:` line per recipient, each ending in its key id.
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.trim_start().starts_with(":pubkey enc packet:"))
+            .filter_map(|line| line.rsplit_once("keyid "))
+            .map(|(_, id)| id.trim().to_owned())
+            .collect()
+    }
+
     fn generate_key(&self) {
         let params = self.home().join("key-params.txt");
         fs::write(&params, KEY_PARAMS).unwrap();

@@ -306,6 +306,7 @@ pub fn clear_clipboard(core: State<'_, Core>) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -319,10 +320,22 @@ mod tests {
     ///
     /// `secret_path` returns a path that need not exist, since [`FakeGpg`]
     /// never opens it — together they model the store and the backend agreeing
-    /// on a name, which is the only contract [`Core::entry`] depends on.
+    /// on a name, which is the only contract [`Core::entry`] depends on. The
+    /// two share one table, so an entry written through the backend is an entry
+    /// this store lists.
     struct FakeStore {
         root: PathBuf,
-        names: Vec<EntryName>,
+        gpg: FakeGpg,
+    }
+
+    impl FakeStore {
+        fn names(&self) -> Vec<EntryName> {
+            self.gpg
+                .paths()
+                .iter()
+                .filter_map(|path| EntryName::from_secret_path(&self.root, path).ok())
+                .collect()
+        }
     }
 
     impl Store for FakeStore {
@@ -332,36 +345,95 @@ mod tests {
 
         fn tree(&self) -> Result<Tree> {
             Ok(Tree {
-                nodes: tree::build(&self.names),
+                nodes: tree::build(&self.names()),
                 unsupported: Vec::new(),
             })
         }
 
         fn secret_path(&self, name: &EntryName) -> Result<PathBuf> {
-            if self.names.contains(name) {
+            if self.names().contains(name) {
                 Ok(name.to_secret_path(&self.root))
             } else {
                 Err(Error::EntryNotFound { name: name.clone() })
             }
         }
 
-        fn recipients(&self, _name: &EntryName) -> Result<Recipients> {
-            unimplemented!("Phase 1 never writes")
+        fn recipients(&self, name: &EntryName) -> Result<Recipients> {
+            let _ = name;
+            Ok(Recipients {
+                ids: vec![RECIPIENT.to_owned()],
+                source: self.root.join(crate::store::gpg_id::GPG_ID_FILE),
+            })
         }
     }
 
-    /// A backend that "decrypts" by looking the path up in a table.
+    /// The id [`FakeStore`] reports for every entry, so a test can tell what a
+    /// write was encrypted to apart from what it contained.
+    const RECIPIENT: &str = "fake-key";
+
+    /// A backend that "decrypts" by looking the path up in a table, and
+    /// "encrypts" by writing back into it.
+    ///
+    /// The table is shared rather than copied per call, so a write through one
+    /// handle is visible to the next command's read — which is the property a
+    /// mutation test needs. `written_to` records the recipients each write was
+    /// encrypted to, so Invariant 8 is checkable without a real key.
+    #[derive(Clone, Default)]
     struct FakeGpg {
-        plaintexts: BTreeMap<PathBuf, &'static str>,
+        plaintexts: Arc<Mutex<BTreeMap<PathBuf, String>>>,
+        written_to: Arc<Mutex<Vec<Write>>>,
+    }
+
+    /// One encryption: where it went, and to whom.
+    type Write = (PathBuf, Vec<String>);
+
+    impl FakeGpg {
+        fn with(entries: &[(&str, &str)], root: &Path) -> Self {
+            let plaintexts = entries
+                .iter()
+                .map(|(name, text)| (name_of(name).to_secret_path(root), (*text).to_owned()))
+                .collect();
+            Self {
+                plaintexts: Arc::new(Mutex::new(plaintexts)),
+                written_to: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Paths currently holding ciphertext, as [`FakeStore`] sees them.
+        fn paths(&self) -> Vec<PathBuf> {
+            lock(&self.plaintexts).keys().cloned().collect()
+        }
     }
 
     impl Gpg for FakeGpg {
         fn decrypt_file(&self, path: &Path) -> Result<Secret> {
-            match self.plaintexts.get(path) {
+            match lock(&self.plaintexts).get(path) {
                 Some(text) => Ok(Secret::from_slice(text.as_bytes())),
                 None => Err(Error::Decrypt { path: path.into() }),
             }
         }
+
+        fn encrypt_file(
+            &self,
+            path: &Path,
+            recipients: &Recipients,
+            plaintext: &Secret,
+        ) -> Result<()> {
+            let text = plaintext.expose_str()?.to_owned();
+            lock(&self.plaintexts).insert(path.to_path_buf(), text);
+            lock(&self.written_to).push((path.to_path_buf(), recipients.ids.clone()));
+            Ok(())
+        }
+    }
+
+    /// Take a lock, treating poisoning as the panic it already was.
+    ///
+    /// Test-only: the alternative is `unwrap()` at every call site, and a
+    /// poisoned mutex here means another test thread panicked mid-assertion.
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The clip window the fake clipboard reports, distinct from the default so
@@ -373,33 +445,36 @@ mod tests {
     fn core_with_clipboard(
         entries: &[(&'static str, &'static str)],
     ) -> (Core, StubBackend, StubScheduler) {
-        let names: Vec<EntryName> = entries.iter().map(|(name, _)| name_of(name)).collect();
-        let plaintexts: BTreeMap<PathBuf, &'static str> = entries
-            .iter()
-            .map(|(name, text)| (name_of(name).to_secret_path(Path::new(ROOT)), *text))
-            .collect();
+        let (core, backend, scheduler, _) = core_with_parts(entries);
+        (core, backend, scheduler)
+    }
 
+    /// As [`core_with_clipboard`], plus the backend handle a write test needs to
+    /// see what was encrypted and to whom.
+    fn core_with_parts(
+        entries: &[(&'static str, &'static str)],
+    ) -> (Core, StubBackend, StubScheduler, FakeGpg) {
+        let gpg = FakeGpg::with(entries, Path::new(ROOT));
         let backend = StubBackend::default();
         let scheduler = StubScheduler::default();
+
+        let store_gpg = gpg.clone();
+        let command_gpg = gpg.clone();
         let core = Core::from_parts(
             Box::new(move || {
                 Ok(Box::new(FakeStore {
                     root: PathBuf::from(ROOT),
-                    names: names.clone(),
+                    gpg: store_gpg.clone(),
                 }))
             }),
-            Box::new(move || {
-                Ok(Box::new(FakeGpg {
-                    plaintexts: plaintexts.clone(),
-                }))
-            }),
+            Box::new(move || Ok(Box::new(command_gpg.clone()))),
             Clipboard::new(
                 Box::new(backend.clone()),
                 Box::new(scheduler.clone()),
                 CLIP_TIME,
             ),
         );
-        (core, backend, scheduler)
+        (core, backend, scheduler, gpg)
     }
 
     /// A core over the given `name -> plaintext` pairs.
@@ -432,11 +507,15 @@ mod tests {
     fn list_tree_returns_names_without_decrypting() {
         // The backend fails if it is used at all, so a decrypt on the listing
         // path would fail this test rather than pass unnoticed.
+        let listed = FakeGpg::with(
+            &[("Email/gmail.com", GMAIL), ("wifi", "correct horse")],
+            Path::new(ROOT),
+        );
         let core = Core::from_parts(
-            Box::new(|| {
+            Box::new(move || {
                 Ok(Box::new(FakeStore {
                     root: PathBuf::from(ROOT),
-                    names: vec![name_of("Email/gmail.com"), name_of("wifi")],
+                    gpg: listed.clone(),
                 }))
             }),
             Box::new(|| {
