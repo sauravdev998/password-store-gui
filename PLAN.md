@@ -91,12 +91,87 @@ Record decisions here as they're made or changed.
   and never reach `commands.rs` or the frontend. That seam lets us replace any
   piece whose behavior conflicts with §4 without touching the command surface.
   **Consequences:**
-  - The app is **GPL-3.0-or-later** (`prs-lib` is GPL-3). Set in `Cargo.toml`.
-  - **Before we trust it**, audit `prs-lib`'s plaintext handling against §4:
-    does it ever write plaintext to disk, does it zeroize, does it use loopback
-    pinentry, can an error carry secret material? Record findings here. Wrap or
-    replace anything that fails.
+  - `prs-lib` is **LGPL-3.0** (not GPL-3 as first recorded). We link it
+    statically, which triggers LGPL §4's relinking obligation; shipping the app
+    as **GPL-3.0-or-later** with published source satisfies it. `Cargo.toml`
+    stays `GPL-3.0-or-later`.
+  - `prs-lib` 0.5.7 is edition 2024, `rust-version = "1.88.0"`. Bump our
+    `rust-version` (currently `1.77.2`) when the dependency is added.
   - Phases 2–4 become integration work rather than reimplementation.
+  - **Audit against §4 completed — see ADR-4a.**
+
+- **ADR-4a — `prs-lib` 0.5.7 §4 audit (2026-08-01).** Read of `types.rs`,
+  `store.rs`, `crypto/{mod,store,recipients}.rs`, and the whole
+  `crypto/backend/gnupg_bin/` tree, against the default feature set
+  (`backend-gnupg-bin` only; `tomb`, `backend-gpgme`, `backend-rpgpie` off).
+
+  **Clears §4 as-is:**
+  - *Invariant 1 (no plaintext on disk).* Decrypt and encrypt are pure
+    stdin→stdout pipes (`gnupg_bin/raw.rs:52-58`, `:28-46`). Every `fs::write`
+    in the crate writes ciphertext, `.gpg-id` fingerprints, or exported
+    **public** keys. No `tempfile`, no `temp_dir`, no `/dev/shm`. The Tomb
+    feature (which mounts a LUKS volume) is off by default.
+  - *Invariant 4 (zeroize).* `Plaintext`/`Ciphertext` wrap `secstr::SecVec<u8>`:
+    zeroed on drop, and on Unix `mlock`ed with `MADV_DONTDUMP`. Neither derives
+    `Debug`, `Display`, or `Serialize`, and the `From` conversions zeroize the
+    source buffer. The crate carries quickcheck tests asserting zero-on-drop.
+    Note: `secstr`'s memlock is a no-op on Windows — no anti-swap, no
+    core-dump exclusion there.
+  - *Invariant 5 (errors).* Every error variant carries only a status code,
+    an `io::Error`, a path, or a fingerprint. None interpolate plaintext or raw
+    gpg output.
+
+  **Must be handled by our wrapper — findings:**
+  - **F-1 (Invariant 8, blocks Phase 3).** `.gpg-id` resolution is
+    **root-only**: `crypto/store.rs:19` is `store.root.join(".gpg-id")` and
+    there is no walk-up anywhere in the crate. `Recipients::load` therefore
+    always yields the store-root recipients, which silently mis-encrypts any
+    entry under a subdirectory with its own `.gpg-id`. **We implement nearest-
+    `.gpg-id` resolution ourselves in `store/`, and never use
+    `Recipients::load`/`store_load_recipients` on a write path.**
+  - **F-2 (Invariant 3).** `crypto::Config.gpg_tty` is a public bool that adds
+    `--pinentry-mode loopback` (`gnupg_bin/raw_cmd.rs:105-112`). It defaults to
+    `false` in both `Config::from` and the `crate::CONFIG` const, so the default
+    path is safe — but our `crypto/prs.rs` must build the config itself and
+    never surface the flag. Cover with a test.
+  - **F-3 (Invariant 5).** `Config.verbose` makes the crate `eprintln!` raw gpg
+    stdout/stderr on any non-zero exit (`raw_cmd.rs:127-155`); on a partial
+    decrypt failure that stdout can hold plaintext. `log_cmd` also prints the
+    full quoted command line. Never set `verbose`. Note it writes to **stderr
+    directly, not via `log`**, so our `debug_assertions`-gated log sink does not
+    contain it.
+  - **F-4 (Invariant 1/4, residual, accepted).** Decrypted plaintext first
+    lands in `std::process::Output.stdout` — a plain `Vec<u8>` grown from the
+    pipe — before `Plaintext::from` copies it into a `SecVec` and zeroizes the
+    original. Reallocations during that read leave un-zeroed copies on the heap.
+    Not fixable without replacing `std::process` with a fixed pre-`mlock`ed read
+    buffer. Accepted: it is the same exposure the `pass` CLI has.
+  - **F-5.** `can_decrypt` / `store::can_decrypt` fully decrypt a real secret
+    and inspect `Output.stdout`/`stderr` as `&str` with no zeroize. Do not call
+    them; write our own store-readability probe if we need one.
+  - **F-6 (path traversal).** `Store::find_at` (`root.join(path)`) and
+    `normalize_secret_path` never reject `..`, and both `normalize_secret_path`
+    and `Store::open` run the caller's string through `shellexpand::full`, which
+    expands `~` and `$VAR`. Any entry name from the frontend must be validated
+    (no `..`, not absolute, no `$`, no NUL) before it reaches either — our
+    `store/` wrapper is the single choke point for that.
+  - **F-7 (panics on the secret path).** `raw_cmd.rs:35-36`
+    (`cmd.spawn().unwrap()`, `child.stdin.as_mut().unwrap()`), `raw.rs:29`
+    (assert on empty recipients), `raw.rs:111,139` (`expect` on non-UTF-8 key
+    data), `store.rs:176,238` (`parent().unwrap()`). Release builds already use
+    `panic = "abort"`, so nothing unwinds through a secret buffer — but these
+    abort the app. Our wrapper pre-validates (gpg binary present, recipient list
+    non-empty, path well-formed) so we return a typed error instead.
+
+  **Non-security gaps to fill ourselves:**
+  - `PASSWORD_STORE_DIR` is never read; `STORE_DEFAULT_ROOT` is a hardcoded
+    `~/.password-store`. We resolve the store path ourselves.
+  - `SecretIter` is flat — it yields every `.gpg` file with a relative name and
+    no directory nodes. We build the tree from those names.
+
+  **Verdict:** wrap, as ADR-4 decided. Nothing found requires replacing the
+  crypto path. F-1 and F-6 mean `store/` owns recipient resolution and name
+  validation outright rather than delegating them.
 
 ---
 
@@ -181,10 +256,12 @@ password-store-gui/
 - ☑ Add `CLAUDE.md` with conventions from §9.
 - ☑ **ADR-4 resolved:** wrap `prs-lib` behind our own traits (see §3).
 
-### Phase 1 — Read-only core — Status: ☐
-- **Audit `prs-lib` against §4 first** (ADR-4) — the result may change what we wrap.
-- `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate store,
-  walk tree, resolve `.gpg-id`.
+### Phase 1 — Read-only core — Status: ◐
+- ☑ **Audit `prs-lib` against §4** (ADR-4) — done, findings in ADR-4a. Verdict:
+  wrap. `store/` must own `.gpg-id` walk-up (F-1) and name validation (F-6).
+- `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate store
+  (incl. `PASSWORD_STORE_DIR`, which `prs-lib` ignores), walk tree, resolve the
+  nearest `.gpg-id` **ourselves** — `Recipients::load` is root-only (F-1).
 - `crypto`: our `Gpg` trait; `prs-lib`'s `backend-gnupg-bin` behind it (spawns
   `gpg`, stdin→stdout, no disk). No `prs-lib` type crosses out of these modules.
 - Parse decrypted plaintext into the Entry model.
