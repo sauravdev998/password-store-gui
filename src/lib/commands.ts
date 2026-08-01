@@ -140,6 +140,63 @@ export type Revision = {
   change: RevisionKind
 }
 
+/**
+ * What decided a setting's current value.
+ *
+ * `environment` means a `pass` variable is in charge and this app cannot
+ * override it (ADR-11) — the control for it is shown fixed, with the reason,
+ * rather than offered and quietly ignored.
+ */
+export type SettingSource = 'environment' | 'configured' | 'default'
+
+/** A resolved setting, with what decided it. */
+export type Decided<T> = { value: T; source: SettingSource }
+
+/**
+ * Every setting as it currently stands.
+ *
+ * Carries no store content: a path, four numbers and two booleans.
+ */
+export type EffectiveSettings = {
+  storeDir: Decided<string>
+  clipTimeSecs: Decided<number>
+  generatedLength: Decided<number>
+  /** Idle seconds before the window locks. `0` never locks. */
+  lockAfterSecs: Decided<number>
+  /** Whether leaving the window hides what is revealed in it. */
+  lockOnBlur: Decided<boolean>
+  /** Whether selecting an entry decrypts it. */
+  openOnSelect: Decided<boolean>
+  /**
+   * What the user has actually configured, underneath the resolved values.
+   *
+   * The settings form edits this rather than the values above, so that a
+   * setting the environment is currently overriding keeps the value behind it
+   * instead of being erased by the next unrelated save.
+   */
+  configured: Settings
+  /** Where settings are written, to name in the interface. */
+  path: string | null
+  /** Why the settings file was not used, when it exists and could not be read. */
+  problem: string | null
+}
+
+/**
+ * What the user has configured, and only that.
+ *
+ * `null` means *not set here*, which is what lets the environment or the
+ * built-in default show through. Sent whole: a field omitted is a field the
+ * user cleared.
+ */
+export type Settings = {
+  storeDir: string | null
+  clipTimeSecs: number | null
+  generatedLength: number | null
+  lockAfterSecs: number | null
+  lockOnBlur: boolean | null
+  openOnSelect: boolean | null
+}
+
 /** Liveness/version probe for the Rust core. */
 export function coreVersion(): Promise<string> {
   return invoke<string>('core_version')
@@ -353,4 +410,20 @@ export function copyEntry(from: string, to: string): Promise<WriteReceipt> {
 /** The generation defaults, so the dialog opens on what `pass` would do. */
 export function generateDefaults(): Promise<Recipe> {
   return invoke<Recipe>('generate_defaults')
+}
+
+/** Every setting as it stands, with what decided each one. */
+export function getSettings(): Promise<EffectiveSettings> {
+  return invoke<EffectiveSettings>('get_settings')
+}
+
+/**
+ * Replace the configured settings.
+ *
+ * What comes back is not necessarily what was sent: a `pass` environment
+ * variable still outranks anything set here, so the result is the settings as
+ * they now stand rather than an echo.
+ */
+export function setSettings(settings: Settings): Promise<EffectiveSettings> {
+  return invoke<EffectiveSettings>('set_settings', { settings })
 }

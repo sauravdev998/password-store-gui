@@ -26,6 +26,15 @@ type Props = {
   onSelect: (path: string) => void
   /** Offered from the empty state, where there is nothing else to do. */
   onCreate: () => void
+  /**
+   * Narrow the tree to names containing this, matched against the whole path.
+   *
+   * Names only. Searching what entries *contain* would mean decrypting every
+   * one of them to answer a keystroke — a pinentry prompt per character, or a
+   * security key blinking through the alphabet — which is §4.1 principle 1's
+   * central case, not an edge of it.
+   */
+  filter?: string
 }
 
 type FlatRow = {
@@ -58,9 +67,56 @@ function flatten(
   return out
 }
 
-export function Tree({ nodes, selected, onSelect, onCreate }: Props) {
+/**
+ * Keep the branches that lead to a match, and drop the rest.
+ *
+ * A folder whose own name matches is kept whole — searching `Email` should show
+ * what is in `Email`, not an empty folder — while a folder that merely contains
+ * a match keeps only the matching part of itself.
+ */
+function prune(nodes: Node[], needle: string): Node[] {
+  const kept: Node[] = []
+  for (const node of nodes) {
+    const hit = node.path.toLowerCase().includes(needle)
+    if (node.kind === 'entry') {
+      if (hit) kept.push(node)
+      continue
+    }
+    if (hit) {
+      kept.push(node)
+      continue
+    }
+    const children = prune(node.children, needle)
+    if (children.length > 0) kept.push({ ...node, children })
+  }
+  return kept
+}
+
+/** Every folder path in a set of nodes, so a filtered tree opens itself. */
+function allFolders(nodes: Node[], out: Set<string> = new Set()): Set<string> {
+  for (const node of nodes) {
+    if (node.kind === 'dir') {
+      out.add(node.path)
+      allFolders(node.children, out)
+    }
+  }
+  return out
+}
+
+export function Tree({ nodes, selected, onSelect, onCreate, filter = '' }: Props) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set())
-  const rows = useMemo(() => flatten(nodes, expanded, 1, null, []), [nodes, expanded])
+
+  const needle = filter.trim().toLowerCase()
+  const shown = useMemo(() => (needle ? prune(nodes, needle) : nodes), [nodes, needle])
+
+  // While filtering, every surviving folder is open: the point of the filter is
+  // that a match is on screen, and a match hidden inside a collapsed folder is
+  // a result the user cannot see.
+  const openFolders = useMemo(
+    () => (needle ? allFolders(shown) : expanded),
+    [needle, shown, expanded],
+  )
+  const rows = useMemo(() => flatten(shown, openFolders, 1, null, []), [shown, openFolders])
 
   // Roving tabindex: the tree is one tab stop, and this is the row that owns
   // it. Falls back to the first row so the tree is always reachable.
@@ -94,8 +150,9 @@ export function Tree({ nodes, selected, onSelect, onCreate }: Props) {
   }, [])
 
   // Typeahead. Letters typed in quick succession seek the next row whose name
-  // starts with them, wrapping — standard tree behaviour, and the fastest way
-  // through a store with hundreds of entries until Phase 5 brings search.
+  // starts with them, wrapping — standard tree behaviour, and what the keyboard
+  // is expected to do inside a tree. The search box above is the other half:
+  // this one moves within what is shown, that one changes what is shown.
   const seek = useRef({ buffer: '', at: 0 })
 
   function typeahead(char: string, fromIndex: number) {
@@ -160,6 +217,14 @@ export function Tree({ nodes, selected, onSelect, onCreate }: Props) {
         break
     }
     event.preventDefault()
+  }
+
+  if (needle && rows.length === 0) {
+    return (
+      <p className="px-3 py-6 text-center text-xs leading-relaxed text-ink-muted">
+        No entry name contains <span className="font-medium text-ink">{filter.trim()}</span>.
+      </p>
+    )
   }
 
   if (nodes.length === 0) {
@@ -238,11 +303,35 @@ export function Tree({ nodes, selected, onSelect, onCreate }: Props) {
                   className={`size-4 shrink-0 ${active ? 'text-ink-muted' : 'text-ink-faint'}`}
                 />
               )}
-              <span className="truncate">{node.name}</span>
+              <span className="truncate">
+                <Highlighted text={node.name} needle={needle} />
+              </span>
             </button>
           </li>
         )
       })}
     </ul>
+  )
+}
+
+/**
+ * A name with the searched-for part picked out.
+ *
+ * The filter matches the whole path, so a row can be shown because its *folder*
+ * matched and have nothing to mark in its own name — which is why this falls
+ * through to plain text rather than assuming a hit.
+ */
+function Highlighted({ text, needle }: { text: string; needle: string }) {
+  const at = needle ? text.toLowerCase().indexOf(needle) : -1
+  if (at === -1) return <>{text}</>
+
+  return (
+    <>
+      {text.slice(0, at)}
+      <mark className="rounded-[2px] bg-accent/25 text-inherit">
+        {text.slice(at, at + needle.length)}
+      </mark>
+      {text.slice(at + needle.length)}
+    </>
   )
 }

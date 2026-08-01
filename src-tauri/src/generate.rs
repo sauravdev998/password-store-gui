@@ -53,10 +53,14 @@ pub struct Recipe {
 }
 
 impl Default for Recipe {
-    /// `pass`'s defaults, including its length variable.
+    /// `pass`'s defaults, with nothing configured.
+    ///
+    /// The length the app actually offers comes from
+    /// [`crate::settings::SettingsFile::recipe`], which layers
+    /// [`LENGTH_ENV`] and the user's setting over this (ADR-11).
     fn default() -> Self {
         Self {
-            length: default_length(),
+            length: DEFAULT_LENGTH,
             symbols: true,
         }
     }
@@ -131,23 +135,25 @@ fn os_byte() -> Result<u8> {
     Ok(byte)
 }
 
-/// The default length: `PASSWORD_STORE_GENERATED_LENGTH`, else 25.
-fn default_length() -> usize {
+/// What `PASSWORD_STORE_GENERATED_LENGTH` says, if it says anything usable.
+pub fn length_from_env() -> Option<usize> {
     parse_length(std::env::var_os(LENGTH_ENV))
 }
 
-/// The rule behind [`default_length`], separated so it is testable without
+/// The rule behind [`length_from_env`], separated so it is testable without
 /// mutating process-global environment state.
 ///
-/// An unparseable or out-of-range value falls back to the default rather than
-/// failing: the variable is the user's shell configuration, and refusing to
-/// generate at all because of it would be a worse answer than `pass`'s.
-fn parse_length(value: Option<std::ffi::OsString>) -> usize {
+/// An unparseable or out-of-range value yields `None` rather than failing: the
+/// variable is the user's shell configuration, and refusing to generate at all
+/// because of it would be a worse answer than `pass`'s. `None` then falls
+/// through to whatever they configured in the app, and only then to the default
+/// — so a typo in a profile does not silently discard a setting they made here
+/// (ADR-11).
+fn parse_length(value: Option<std::ffi::OsString>) -> Option<usize> {
     value
         .and_then(|raw| raw.into_string().ok())
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|length| (MIN_LENGTH..=MAX_LENGTH).contains(length))
-        .unwrap_or(DEFAULT_LENGTH)
 }
 
 #[cfg(test)]
@@ -278,19 +284,17 @@ mod tests {
 
     #[test]
     fn the_length_variable_is_read_like_pass_reads_it() {
-        assert_eq!(parse_length(None), DEFAULT_LENGTH);
-        assert_eq!(parse_length(Some(OsString::from("32"))), 32);
-        assert_eq!(parse_length(Some(OsString::from("  32  "))), 32);
+        assert_eq!(parse_length(None), None);
+        assert_eq!(parse_length(Some(OsString::from("32"))), Some(32));
+        assert_eq!(parse_length(Some(OsString::from("  32  "))), Some(32));
     }
 
+    /// Nothing usable means "the variable did not decide this", which lets the
+    /// user's own setting answer instead (ADR-11).
     #[test]
     fn an_unusable_length_variable_falls_back_rather_than_failing() {
         for raw in ["", "eleven", "0", "1", "999999"] {
-            assert_eq!(
-                parse_length(Some(OsString::from(raw))),
-                DEFAULT_LENGTH,
-                "for {raw:?}"
-            );
+            assert_eq!(parse_length(Some(OsString::from(raw))), None, "for {raw:?}");
         }
     }
 }

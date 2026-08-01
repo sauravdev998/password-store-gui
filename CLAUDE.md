@@ -21,8 +21,10 @@ that violates one is a bug even if the feature works. The short version:
 3. We never handle passphrases — `gpg-agent` + pinentry do. No loopback pinentry.
 4. Secret buffers are wrapped in `secrecy`/`zeroize`, never `Debug`/`Display`.
 5. Nothing secret reaches logs, errors, traces, or panics.
-6. Clipboard auto-clears, and only if it still holds what we put there.
-7. Auto-lock clears the in-memory cache on idle and on blur.
+6. Clipboard auto-clears — on its timer and on exit — and only if it still holds
+   what we put there.
+7. Auto-lock: leaving the window hides revealed values, going idle closes
+   everything to a lock screen. Neither touches the clipboard (ADR-12).
 8. Writes encrypt to the recipients from the nearest `.gpg-id`, walking up.
 
 When unsure whether something leaks a secret, assume it does.
@@ -34,6 +36,7 @@ pnpm install            # once
 pnpm tauri dev          # run the app (starts Vite + cargo)
 pnpm tauri build        # release bundle for the current OS
 pnpm dev                # frontend only, no Rust core
+pnpm dev:mock           # frontend against a stubbed core (see below)
 pnpm build              # typecheck + bundle the frontend
 pnpm lint               # oxlint
 
@@ -59,10 +62,51 @@ cargo clippy --all-targets -- -D warnings
 
 - The webview holds no long-lived secrets. A revealed field lives in component
   state for as long as it is on screen and no longer — never in a store, never
-  in `localStorage`, never in a URL.
+  in `localStorage`, never in a URL. Nothing writes to `localStorage` at all
+  since Phase 5; settings live in the core.
 - All IPC goes through typed wrappers in `src/lib/commands.ts`; components do
   not call `invoke` directly.
+- A dialog holding plaintext is **mounted only while open** — unmounting is what
+  guarantees the string goes with it. Two commands return a whole body rather
+  than one field, both recorded rather than left to be discovered: the edit form
+  (ADR-8) and reading a past version (ADR-10). Do not add a third without an
+  ADR.
+- Anything new that puts a decrypted value on screen must answer to `relock` in
+  `EntryDetail` or unmount with its dialog, or auto-lock will not reach it
+  (ADR-12). Clear values; do not remount the pane, which would decrypt again.
 - Tailwind v4 (CSS-first config in `src/index.css`), no heavyweight UI kit.
+- Modals use the platform `<dialog>` with `showModal`, including the lock
+  screen. A `z-index` overlay is not a substitute: it leaves everything behind
+  it on the Tab order.
+
+## Driving the frontend
+
+`pnpm dev:mock` serves the app with `@tauri-apps/api/core` aliased to
+`src/lib/mockInvoke.ts`, so every component runs through the real
+`commands.ts` wrappers with no Rust behind them. It is how each phase since 3
+has been click-tested, and it has found a defect every time. URL flags drive
+the awkward states (`?noGit=1`, `?sync=conflicted`, `?env=storeDir`,
+`?lockAfter=5`, …) — see the file.
+
+**It establishes nothing about the core.** No GnuPG runs, nothing is decrypted,
+no file is written, and the clipboard is a variable. The stub *mirrors* the
+Rust rules rather than sharing them — the entry parser, name validation, the
+refusals in `Core`, the strings in `error.rs`, and the settings precedence — so
+when you change one of those, change the stub too, or it stops testing the app
+and starts testing a fiction. When they disagree, the Rust side is right.
+
+## Settings
+
+`settings.rs` owns the six user settings; `src/lib/settings.ts` is the frontend
+half. Three of them duplicate a `pass` environment variable, and **the variable
+wins** (ADR-11): the CLI obeys it, and a GUI that quietly disagreed would have
+the two looking at different stores. A new setting that shadows a
+`PASSWORD_STORE_*` variable follows the same rule, and surfaces its `Source` so
+the panel can say what is in charge rather than offering a control that does
+nothing.
+
+Read settings at the point of use, not at startup — like the store and the
+`gpg` backend, so a change takes effect on the next click.
 
 ## Dependencies
 

@@ -21,6 +21,7 @@
 //! a Tauri app.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
@@ -32,6 +33,7 @@ use crate::generate;
 use crate::git::{Change, GitRepo, Revision, SyncOutcome, SyncStatus, Vcs};
 use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
+use crate::settings::{Effective, Settings, SettingsFile};
 use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
 
 /// What every command needs: a store to read, a backend to decrypt with, and a
@@ -50,12 +52,18 @@ use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
 /// command. It opens lazily, so a machine with no display server still starts
 /// and still reads.
 ///
+/// Settings are the one thing kept rather than re-derived, and only because
+/// they are a file the user edits through this app rather than a condition of
+/// the machine. What they *say* is still consulted per command, so a change
+/// takes effect on the next click like everything else here.
+///
 /// Holds no decrypted state, so it is `Send + Sync` without a lock.
 pub struct Core {
     store: StoreFactory,
     gpg: GpgFactory,
     git: VcsFactory,
     clipboard: Clipboard,
+    settings: Arc<SettingsFile>,
 }
 
 type StoreFactory = Box<dyn Fn() -> Result<Box<dyn Store>> + Send + Sync>;
@@ -86,11 +94,18 @@ impl Core {
     /// cannot catch that, because CI has no display server for the copy to
     /// succeed on. So the seam is here rather than left to be remembered.
     pub fn with_clipboard(clipboard: Clipboard) -> Self {
+        let settings = Arc::new(SettingsFile::user());
+        let for_store = Arc::clone(&settings);
         Self::from_parts(
-            Box::new(|| Ok(Box::new(PrsStore::open_default()?))),
+            // The root is asked for per command rather than captured, so
+            // pointing the app at another store in Settings takes effect on the
+            // next click — the same property opening the store per command
+            // already buys for a store that did not exist yet.
+            Box::new(move || Ok(Box::new(PrsStore::open(&for_store.store_root()?)?))),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
             Box::new(real_git),
             clipboard,
+            settings,
         )
     }
 
@@ -104,6 +119,12 @@ impl Core {
     /// `unsafe`**. This crate forbids `unsafe_code` across every target and
     /// `forbid` cannot be locally allowed, so on the day the edition is bumped
     /// that call site stops compiling. A parameter has none of those problems.
+    /// Settings are [`SettingsFile::ephemeral`] here for the same reason the
+    /// clipboard is a parameter: a test must not read the developer's own
+    /// configuration and must certainly not write it. It also makes the root
+    /// unambiguous — an explicit root outranks even `PASSWORD_STORE_DIR`, so a
+    /// variable in the developer's shell cannot redirect a test at their real
+    /// store.
     pub fn with_store_root(root: impl Into<PathBuf>, clipboard: Clipboard) -> Self {
         let root = root.into();
         Self::from_parts(
@@ -111,23 +132,50 @@ impl Core {
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
             Box::new(real_git),
             clipboard,
+            Arc::new(SettingsFile::ephemeral()),
         )
     }
 
     /// Seam for the tests below: any [`Store`], any [`Gpg`], any history, any
-    /// clipboard.
+    /// clipboard, any settings.
     fn from_parts(
         store: StoreFactory,
         gpg: GpgFactory,
         git: VcsFactory,
         clipboard: Clipboard,
+        settings: Arc<SettingsFile>,
     ) -> Self {
         Self {
             store,
             gpg,
             git,
             clipboard,
+            settings,
         }
+    }
+
+    /// Every setting as it stands, with what decided each one (ADR-11).
+    pub fn settings(&self) -> Effective {
+        self.settings.effective()
+    }
+
+    /// Replace the configured settings, and report them as they now stand.
+    pub fn set_settings(&self, next: Settings) -> Result<Effective> {
+        self.settings.set(next)
+    }
+
+    /// How a generated password should be shaped before the form adjusts it.
+    pub fn generate_defaults(&self) -> generate::Recipe {
+        self.settings.recipe()
+    }
+
+    /// Wipe the clipboard if it still holds a password we put there.
+    ///
+    /// The app's way out (Invariant 6): see
+    /// [`Clipboard::clear_if_outstanding`] for why this is not
+    /// [`Core::clear_clipboard`].
+    pub fn release_clipboard(&self) {
+        self.clipboard.clear_if_outstanding();
     }
 
     /// The store's directories and entries. Names only — nothing is decrypted.
@@ -514,8 +562,11 @@ impl Core {
     /// string for the webview, this one is where a secret leaves the core
     /// without becoming one.
     fn copy(&self, secret: &Secret) -> Result<CopyReceipt> {
+        // Read now rather than at startup: the window is a setting, and the one
+        // the user is owed is the one in force when they pressed Copy.
+        let clip_time = self.settings.clip_time();
         Ok(CopyReceipt {
-            clears_in_secs: self.clipboard.copy(secret)?.as_secs(),
+            clears_in_secs: self.clipboard.copy(secret, clip_time)?.as_secs(),
         })
     }
 }
@@ -778,8 +829,25 @@ pub fn copy_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Resu
 
 /// The generation defaults, so the dialog opens on what `pass` would do.
 #[tauri::command]
-pub fn generate_defaults() -> generate::Recipe {
-    generate::Recipe::default()
+pub fn generate_defaults(core: State<'_, Core>) -> generate::Recipe {
+    core.generate_defaults()
+}
+
+/// Every setting, with what decided it. Carries no store content.
+#[tauri::command]
+pub fn get_settings(core: State<'_, Core>) -> Effective {
+    core.settings()
+}
+
+/// Replace the configured settings.
+///
+/// Takes the whole set rather than one field, so what the webview sends is
+/// exactly what the file ends up holding and a value it omits is one the user
+/// cleared. Returns the settings as they now stand — which is not necessarily
+/// what was sent, since an environment variable still outranks them (ADR-11).
+#[tauri::command]
+pub fn set_settings(settings: Settings, core: State<'_, Core>) -> Result<Effective> {
+    core.set_settings(settings)
 }
 
 #[cfg(test)]
@@ -1101,11 +1169,8 @@ mod tests {
             }),
             Box::new(move || Ok(Box::new(command_gpg.clone()))),
             git,
-            Clipboard::new(
-                Box::new(backend.clone()),
-                Box::new(scheduler.clone()),
-                CLIP_TIME,
-            ),
+            Clipboard::new(Box::new(backend.clone()), Box::new(scheduler.clone())),
+            Arc::new(settings_with_clip_time(CLIP_TIME)),
         );
         Parts {
             core,
@@ -1133,8 +1198,23 @@ mod tests {
         Clipboard::new(
             Box::new(StubBackend::default()),
             Box::new(StubScheduler::default()),
-            CLIP_TIME,
         )
+    }
+
+    /// In-memory settings with a clip window a test can assert on.
+    ///
+    /// Deliberately *configured* rather than left at the default: it is what
+    /// makes `clears_in_secs` a check that the setting reaches the clipboard
+    /// (ADR-11) rather than a check that two constants are still equal.
+    fn settings_with_clip_time(clip_time: Duration) -> SettingsFile {
+        let settings = SettingsFile::ephemeral();
+        settings
+            .set(Settings {
+                clip_time_secs: Some(clip_time.as_secs()),
+                ..Settings::default()
+            })
+            .unwrap();
+        settings
     }
 
     fn name_of(name: &str) -> EntryName {
@@ -1171,6 +1251,7 @@ mod tests {
             }),
             Box::new(|_| None),
             unused_clipboard(),
+            Arc::new(SettingsFile::ephemeral()),
         );
 
         let tree = core.tree().unwrap();
@@ -1879,6 +1960,7 @@ mod tests {
             }),
             Box::new(move |_| Some(Box::new(git.clone()))),
             unused_clipboard(),
+            Arc::new(SettingsFile::ephemeral()),
         );
 
         let history = core.history(&name_of("wifi")).unwrap();

@@ -79,17 +79,40 @@ pub trait Store: Send + Sync {
     fn copy_file(&self, from: &EntryName, to: &EntryName) -> Result<()>;
 }
 
-/// Where the store lives: `PASSWORD_STORE_DIR`, else `~/.password-store`.
+/// Where the store lives with nothing configured: `PASSWORD_STORE_DIR`, else
+/// `~/.password-store`.
+///
+/// The settings-aware version is [`crate::settings::SettingsFile::store_root`];
+/// this is what a core with no settings behind it uses.
 pub fn default_root() -> Result<PathBuf> {
-    resolve_root(std::env::var_os(STORE_DIR_ENV), dirs::home_dir())
+    resolve_root(std::env::var_os(STORE_DIR_ENV), None, dirs::home_dir())
+}
+
+/// The user's home directory, as the store's default location is derived from.
+///
+/// Re-exported so `settings` does not have to reach for `dirs` itself to answer
+/// a question this module owns.
+pub fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
 }
 
 /// The path rule behind [`default_root`], separated so it is testable without
 /// mutating process-global environment state.
-fn resolve_root(env_dir: Option<OsString>, home: Option<PathBuf>) -> Result<PathBuf> {
+///
+/// Precedence is ADR-11's: the environment first, because `PASSWORD_STORE_DIR`
+/// is what the `pass` CLI obeys and the two must not disagree about which store
+/// is the user's; then whatever they configured in this app; then the default.
+pub fn resolve_root(
+    env_dir: Option<OsString>,
+    configured: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
     // An empty variable is treated as unset, as the shell would.
     if let Some(dir) = env_dir.filter(|dir| !dir.is_empty()) {
         return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = configured.filter(|dir| !dir.as_os_str().is_empty()) {
+        return Ok(dir);
     }
     home.map(|home| home.join(DEFAULT_STORE_DIR))
         .ok_or(Error::StoreLocationUnknown)
@@ -105,6 +128,19 @@ mod tests {
     fn env_var_wins_over_home() {
         let root = resolve_root(
             Some(OsString::from("/srv/passwords")),
+            None,
+            Some(PathBuf::from("/home/u")),
+        )
+        .unwrap();
+        assert_eq!(root, Path::new("/srv/passwords"));
+    }
+
+    /// ADR-11: the variable the `pass` CLI obeys also wins here.
+    #[test]
+    fn env_var_wins_over_a_configured_path() {
+        let root = resolve_root(
+            Some(OsString::from("/srv/passwords")),
+            Some(PathBuf::from("/mnt/configured")),
             Some(PathBuf::from("/home/u")),
         )
         .unwrap();
@@ -112,21 +148,40 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_path_wins_over_home() {
+        let root = resolve_root(
+            None,
+            Some(PathBuf::from("/mnt/configured")),
+            Some(PathBuf::from("/home/u")),
+        )
+        .unwrap();
+        assert_eq!(root, Path::new("/mnt/configured"));
+    }
+
+    #[test]
     fn falls_back_to_home() {
-        let root = resolve_root(None, Some(PathBuf::from("/home/u"))).unwrap();
+        let root = resolve_root(None, None, Some(PathBuf::from("/home/u"))).unwrap();
         assert_eq!(root, Path::new("/home/u/.password-store"));
     }
 
     #[test]
     fn an_empty_env_var_counts_as_unset() {
-        let root = resolve_root(Some(OsString::new()), Some(PathBuf::from("/home/u"))).unwrap();
+        let root =
+            resolve_root(Some(OsString::new()), None, Some(PathBuf::from("/home/u"))).unwrap();
+        assert_eq!(root, Path::new("/home/u/.password-store"));
+    }
+
+    #[test]
+    fn an_empty_configured_path_counts_as_unset() {
+        let root =
+            resolve_root(None, Some(PathBuf::new()), Some(PathBuf::from("/home/u"))).unwrap();
         assert_eq!(root, Path::new("/home/u/.password-store"));
     }
 
     #[test]
     fn errors_without_a_home_or_a_variable() {
         assert!(matches!(
-            resolve_root(None, None),
+            resolve_root(None, None, None),
             Err(Error::StoreLocationUnknown)
         ));
     }
