@@ -1,4 +1,6 @@
 mod commands;
+pub mod error;
+pub mod store;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 // The only sanctioned panic in the crate: the webview failed to start, before

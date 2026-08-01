@@ -259,9 +259,12 @@ password-store-gui/
 ### Phase 1 — Read-only core — Status: ◐
 - ☑ **Audit `prs-lib` against §4** (ADR-4) — done, findings in ADR-4a. Verdict:
   wrap. `store/` must own `.gpg-id` walk-up (F-1) and name validation (F-6).
-- `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate store
-  (incl. `PASSWORD_STORE_DIR`, which `prs-lib` ignores), walk tree, resolve the
-  nearest `.gpg-id` **ourselves** — `Recipients::load` is root-only (F-1).
+- ☑ `store`: our `Store` trait + domain types; `prs-lib`-backed impl. Locate
+  store (incl. `PASSWORD_STORE_DIR`, which `prs-lib` ignores), walk tree,
+  resolve the nearest `.gpg-id` **ourselves** — `Recipients::load` is root-only
+  (F-1). `EntryName` is the validation choke point for F-6 and constructs
+  `prs_lib::Store` field-wise to bypass `shellexpand`. Names we reject surface
+  as `Tree::unsupported` rather than disappearing from the tree.
 - `crypto`: our `Gpg` trait; `prs-lib`'s `backend-gnupg-bin` behind it (spawns
   `gpg`, stdin→stdout, no disk). No `prs-lib` type crosses out of these modules.
 - Parse decrypted plaintext into the Entry model.
