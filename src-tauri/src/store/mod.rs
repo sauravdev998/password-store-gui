@@ -6,6 +6,7 @@
 //! delegated, because `prs-lib` gets them wrong for our purposes: recipient
 //! resolution ([`gpg_id`], F-1) and name validation ([`name`], F-6).
 
+pub mod entry;
 pub mod gpg_id;
 pub mod name;
 pub mod prs;
@@ -14,6 +15,7 @@ pub mod tree;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub use entry::{Entry, EntryMetadata, Field};
 pub use gpg_id::Recipients;
 pub use name::{EntryName, InvalidName};
 pub use tree::{Node, Tree};

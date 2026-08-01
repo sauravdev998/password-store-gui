@@ -277,7 +277,17 @@ password-store-gui/
     bound, so it cannot live in Tauri's shared state and `unsafe_code` is
     forbidden. It is cached in a `thread_local!` instead — it holds no secret,
     only the `gpg` path and the two flags above.
-- Parse decrypted plaintext into the Entry model.
+- ☑ Parse decrypted plaintext into the Entry model (`store/entry.rs`). First
+  line is the password; a field separator is a colon **followed by whitespace or
+  end of line**, so a bare `https://…` line stays free text rather than becoming
+  a `https` field. Unparsed lines survive as `notes` rather than being dropped,
+  for the same reason `Tree::unsupported` exists. `otpauth://` (bare or as a
+  field value) fills a dedicated slot for Phase 2. `Entry` holds `Secret`s and so
+  has no `Debug`/`Serialize`; the only serializable view is `EntryMetadata`
+  (flags plus field keys, no values), which is what `show_entry` will return.
+  - *Deliberate Invariant 4 exception:* a field **key** is a plain `String`, not
+    a `Secret` — the UI cannot offer a reveal without rendering the label. Keys
+    only; a value never becomes a `String`.
 - Commands: `list_tree`, `show_entry` (returns metadata; password revealed only on demand).
 - Frontend: tree browser + entry detail with password **hidden by default** and a reveal toggle.
 - **Definition of done:** browse a real store and reveal a password; nothing written to disk; no plaintext in logs.
