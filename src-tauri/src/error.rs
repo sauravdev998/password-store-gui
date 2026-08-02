@@ -92,6 +92,16 @@ pub enum Error {
     #[error("the .gpg-id file at {path} lists no recipients")]
     EmptyRecipients { path: PathBuf },
 
+    /// A recipient id that could not survive being written to a `.gpg-id`.
+    ///
+    /// The file is line-delimited and read back trimmed, so an id holding a
+    /// newline would come back as *two* recipients — a way to add a key to a
+    /// store by typing it inside another one's name. Echoing the id back is safe
+    /// and necessary: it is what the user just typed, not anything decrypted,
+    /// and they cannot fix it without seeing which one was refused.
+    #[error("{id} is not a usable recipient: it must be one line with no surrounding spaces")]
+    InvalidRecipientId { id: String },
+
     /// No usable `gpg` binary.
     ///
     /// `reason` comes from the backend, which is safe only because this is
@@ -159,6 +169,35 @@ pub enum Error {
     /// for the error's cause.
     #[error("no public key for recipient {id}, listed in {gpg_id}")]
     UnknownRecipient { id: String, gpg_id: PathBuf },
+
+    /// A key the user just named cannot be resolved.
+    ///
+    /// The sibling of [`Error::UnknownRecipient`], separated by *where the id
+    /// came from*. That one is raised for an id already written in a `.gpg-id`,
+    /// and names the file so the user can go and correct it. This one is raised
+    /// while validating ids typed into a form, before anything has been
+    /// written — there is no file to name yet, and naming one would send the
+    /// user looking for a problem in a file that does not have it.
+    #[error("no public key for {id}")]
+    UnknownKey { id: String },
+
+    /// A key resolves, but nothing in it can encrypt.
+    ///
+    /// Every encryption subkey revoked, expired or disabled. `gpg` would refuse
+    /// the encrypt eventually; catching it while validating means the refusal
+    /// can name the key, which a failed encrypt could not (§4.1 principle 5).
+    #[error("{id} has no usable encryption key: it may have expired or been revoked")]
+    UnusableKey { id: String },
+
+    /// A file under the store could not be read as OpenPGP ciphertext.
+    ///
+    /// Deliberately not [`Error::Decrypt`]: nothing was decrypted and no key was
+    /// involved, so reporting it as a decryption failure would send the user
+    /// looking for a key problem. Raised while inspecting which keys an entry is
+    /// encrypted to, where the file being unreadable or not ciphertext at all is
+    /// the likelier cause.
+    #[error("{path} could not be read as an encrypted entry")]
+    UnreadableCiphertext { path: PathBuf },
 
     /// Clipboard failures, with none of the platform's own error text.
     ///

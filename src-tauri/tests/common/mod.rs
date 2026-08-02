@@ -26,20 +26,25 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
-const KEY_PARAMS: &str = "\
+/// The test key's user id, and so the `.gpg-id` a fixture store lists.
+pub const RECIPIENT: &str = "test@example.invalid";
+
+/// Batch parameters for one throwaway key.
+fn key_params(email: &str) -> String {
+    format!(
+        "\
 Key-Type: eddsa
 Key-Curve: ed25519
 Subkey-Type: ecdh
 Subkey-Curve: cv25519
 Name-Real: Password Store GUI Test
-Name-Email: test@example.invalid
+Name-Email: {email}
 Expire-Date: 0
 %no-protection
 %commit
-";
-
-/// The test key's user id, and so the `.gpg-id` a fixture store lists.
-pub const RECIPIENT: &str = "test@example.invalid";
+"
+    )
+}
 
 /// An isolated GnuPG home with one generated key.
 pub struct GpgFixture {
@@ -78,8 +83,94 @@ impl GpgFixture {
         std::env::set_var("GNUPGHOME", home.path());
 
         let fixture = Self { gpg_bin, home };
-        fixture.generate_key();
+        fixture.add_key(RECIPIENT);
         Some(fixture)
+    }
+
+    /// Generate another throwaway key, returning the id a `.gpg-id` would list.
+    ///
+    /// A store with a second recipient is what a recipient change is *for*, so
+    /// testing one needs a keyring with more than the single key the read and
+    /// write tests get by with.
+    pub fn add_key(&self, email: &str) -> String {
+        let params = self.home().join(format!("key-params-{email}.txt"));
+        fs::write(&params, key_params(email)).unwrap();
+
+        let output = Command::new(&self.gpg_bin)
+            .args(["--batch", "--quiet", "--generate-key"])
+            .arg(&params)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "key generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        email.to_owned()
+    }
+
+    /// Delete a key's *secret* half, leaving its public key on the keyring.
+    ///
+    /// What a store shared with another person looks like from this side: their
+    /// key can be encrypted to, and their entries cannot be read. It is also the
+    /// only way to make a decrypt fail on demand, which is what the rollback
+    /// test needs.
+    pub fn forget_secret_key(&self, email: &str) {
+        // `--delete-secret-keys` refuses a user id in batch mode and insists on
+        // a fingerprint, so resolve one first.
+        let fingerprint = self.fingerprint_of(email);
+        let output = Command::new(&self.gpg_bin)
+            .args(["--batch", "--yes", "--delete-secret-keys"])
+            .arg(&fingerprint)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "could not delete the secret key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The primary key fingerprint for a user id.
+    pub fn fingerprint_of(&self, email: &str) -> String {
+        let output = Command::new(&self.gpg_bin)
+            .args(["--batch", "--with-colons", "--list-keys"])
+            .arg(email)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "no key for {email}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The `fpr` immediately after `pub` is the primary key's; later ones
+        // belong to subkeys.
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let mut seen_pub = false;
+        for line in listing.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            match fields.first() {
+                Some(&"pub") => seen_pub = true,
+                Some(&"fpr") if seen_pub => return fields[9].to_owned(),
+                _ => {}
+            }
+        }
+        panic!("no fingerprint found for {email}");
+    }
+
+    /// Whether `gpg` can decrypt this file with the keys currently held.
+    ///
+    /// Asked of the real binary rather than of our own code, so "the other
+    /// person can now read it" is a fact about the ciphertext and not about
+    /// what we believe we wrote.
+    pub fn can_decrypt(&self, path: &Path) -> bool {
+        Command::new(&self.gpg_bin)
+            .args(["--batch", "--quiet", "--decrypt"])
+            .arg(path)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     pub fn home(&self) -> &Path {
@@ -143,22 +234,6 @@ impl GpgFixture {
             .filter_map(|line| line.rsplit_once("keyid "))
             .map(|(_, id)| id.trim().to_owned())
             .collect()
-    }
-
-    fn generate_key(&self) {
-        let params = self.home().join("key-params.txt");
-        fs::write(&params, KEY_PARAMS).unwrap();
-
-        let output = Command::new(&self.gpg_bin)
-            .args(["--batch", "--quiet", "--generate-key"])
-            .arg(&params)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "key generation failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 }
 

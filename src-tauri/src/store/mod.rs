@@ -50,6 +50,14 @@ pub trait Store: Send + Sync {
     /// The full tree of directories and entries.
     fn tree(&self) -> Result<Tree>;
 
+    /// Every entry in the store, flat and unordered.
+    ///
+    /// What [`Tree`] is built from, before the hierarchy is put back. A
+    /// recipient change wants it in this form: the question "which entries does
+    /// this `.gpg-id` govern?" is asked of each name independently, by walking
+    /// up from it, and a tree would have to be flattened again to ask it.
+    fn entries(&self) -> Result<Vec<EntryName>>;
+
     /// Path of the encrypted file backing `name`.
     ///
     /// Errors if no such entry exists, so callers never hand a phantom path to

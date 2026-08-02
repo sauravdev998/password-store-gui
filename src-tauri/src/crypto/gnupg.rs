@@ -31,6 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::crypto::{KeyIds, KeyInfo};
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 use crate::store::Recipients;
@@ -103,6 +104,212 @@ fn verify_recipients(bin: &Path, recipients: &Recipients) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What a recipient id resolves to on this machine's keyring.
+///
+/// **Decrypts nothing and needs no secret key.** It reads the public keyring
+/// only, so it costs no pinentry and no security-key tap — which is what makes
+/// it usable for a question asked *before* the user has committed to anything
+/// (§4.1 principle 1). Every spelling a `.gpg-id` may use resolves the same
+/// way, because resolving it is `gpg`'s job and not ours (ADR-6): a bare email,
+/// a full user id, a long key id, a fingerprint, and an `0x`-prefixed key id
+/// all land on the same subkey.
+///
+/// An id `gpg` cannot resolve is an error rather than a description with no
+/// keys in it. Returning nothing would be F-8 rebuilt by hand — the silent drop
+/// that encrypts an entry to fewer people than the store demands.
+pub fn describe_key(bin: &Path, id: &str, secret: &KeyIds) -> Result<KeyInfo> {
+    let output = Command::new(bin)
+        .args(["--batch", "--quiet", "--utf8-strings"])
+        .args(["--with-colons", "--list-keys"])
+        // Ends option parsing, so an id beginning with `-` is an id.
+        .arg("--")
+        .arg(id)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| Error::io(bin, err))?;
+
+    if !output.status.success() {
+        return Err(Error::UnknownKey { id: id.to_owned() });
+    }
+
+    let mut info = parse_key_listing(&String::from_utf8_lossy(&output.stdout), id);
+    if info.keys.is_empty() {
+        // A key that resolves but can encrypt to nothing — every encryption
+        // subkey revoked or expired. `gpg` would refuse the encrypt later; this
+        // says so now, with the id in hand to name.
+        return Err(Error::UnusableKey { id: id.to_owned() });
+    }
+    info.usable_here = !info.keys.is_disjoint(secret);
+    Ok(info)
+}
+
+/// The encryption subkeys this machine holds a secret key for.
+///
+/// Read once per operation rather than per id: it is the whole keyring, and the
+/// question asked of it — "would this change leave the user unable to read their
+/// own store?" — is asked about a set, not about one key.
+///
+/// A smartcard's key counts. `gpg` lists a stub for it exactly as it lists a key
+/// on disk, which is the answer we want: the user can decrypt with it, given
+/// the card. §4.1 principle 1 calls a security key a confirmed operating
+/// condition, not a hypothetical.
+pub fn secret_keys(bin: &Path) -> Result<KeyIds> {
+    let output = Command::new(bin)
+        .args(["--batch", "--quiet", "--utf8-strings"])
+        .args(["--with-colons", "--list-secret-keys"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| Error::io(bin, err))?;
+
+    // A keyring with no secret key at all exits non-zero, which is a state
+    // rather than a failure: it is what a machine that has only ever been
+    // written to looks like.
+    if !output.status.success() {
+        return Ok(KeyIds::new());
+    }
+
+    Ok(parse_subkeys(
+        &String::from_utf8_lossy(&output.stdout),
+        "ssb",
+    ))
+}
+
+/// Pull the label, fingerprint and encryption subkeys out of a key listing.
+///
+/// The colon format is documented and stable, which is why it is parsed rather
+/// than the human listing: field 1 is the record type, 2 the validity, 5 the key
+/// id, 10 the user id and 12 the capabilities. The `fpr` immediately after a
+/// `pub` is the primary key's; the ones after a `sub` belong to that subkey and
+/// are skipped, which is why this tracks the record it is inside rather than
+/// taking the first `fpr` it sees.
+///
+/// An id that matches more than one key contributes all of their subkeys, and
+/// the first key's label. That is the honest reading of an ambiguous id, and
+/// `gpg` refuses to encrypt to one anyway.
+fn parse_key_listing(listing: &str, id: &str) -> KeyInfo {
+    let mut info = KeyInfo {
+        id: id.to_owned(),
+        label: None,
+        fingerprint: None,
+        usable_here: false,
+        keys: KeyIds::new(),
+    };
+    let mut in_primary = false;
+
+    for fields in listing
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+    {
+        match fields.first() {
+            Some(&"pub") => in_primary = true,
+            Some(&"fpr") if in_primary => {
+                if info.fingerprint.is_none() {
+                    info.fingerprint = fields.get(9).map(|fpr| (*fpr).to_owned());
+                }
+                in_primary = false;
+            }
+            Some(&"uid") if info.label.is_none() => {
+                info.label = fields
+                    .get(9)
+                    .map(|uid| unescape_colon_field(uid))
+                    .filter(|uid| !uid.is_empty());
+            }
+            Some(&"sub") => in_primary = false,
+            _ => {}
+        }
+    }
+
+    info.keys = parse_subkeys(listing, "sub");
+    info
+}
+
+/// Encryption-capable subkey ids of the given record type (`sub` or `ssb`).
+///
+/// A subkey counts when it can encrypt (`e`) and is not invalid, disabled or
+/// revoked — the same three exclusions `pass`'s own `reencrypt_path` makes, so
+/// the two agree about which keys a `.gpg-id` line means.
+fn parse_subkeys(listing: &str, record: &str) -> KeyIds {
+    listing
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.first() == Some(&record) && fields.len() > 11)
+        .filter(|fields| fields[11].contains('e'))
+        .filter(|fields| !fields[1].contains(['i', 'd', 'r']))
+        .map(|fields| fields[4].to_owned())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Undo the colon format's `\x3a` escaping of a colon inside a user id.
+///
+/// `gpg` escapes only that one character in this field, so this is the whole
+/// rule rather than a subset of one.
+fn unescape_colon_field(field: &str) -> String {
+    field.replace("\\x3a", ":")
+}
+
+/// The subkeys a ciphertext on disk is actually encrypted to.
+///
+/// The counterpart to [`encryption_keys`]: that one says who the store *wants*
+/// to be able to read an entry, this one says who *can*. Comparing them is how
+/// a recipient change knows which entries it has to touch.
+///
+/// **Decrypts nothing.** `--list-packets` parses the file's structure and stops;
+/// it reports the recipient key ids even for ciphertext this machine holds no
+/// secret key for, so an entry the user cannot read is still one they can be
+/// told about. It is also not localized, unlike the `gpg: public key is …` line
+/// `pass` greps for, which a non-English locale would change out from under us.
+pub fn encrypted_to(bin: &Path, path: &Path) -> Result<KeyIds> {
+    let output = Command::new(bin)
+        .args(["--batch", "--quiet", "--list-packets"])
+        .arg("--")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| Error::io(bin, err))?;
+
+    // **The exit status is deliberately ignored.** `--list-packets` walks into
+    // the encrypted data packet after listing the recipients and exits 2 with
+    // "decryption failed: No secret key" when it cannot open it — which is the
+    // expected outcome for exactly the entries this matters most for, the ones
+    // encrypted to somebody else. The recipient packets are already on stdout by
+    // then. What decides success here is whether we could read the recipient
+    // list, so that is what is checked.
+    let keys = parse_packet_keyids(&String::from_utf8_lossy(&output.stdout));
+
+    if keys.is_empty() {
+        // No recipient packet at all: the file is not OpenPGP ciphertext, or is
+        // unreadable. Not `Error::Decrypt` — nothing was decrypted and no key
+        // was involved, so reporting a key problem would send the user looking
+        // in the wrong place (§4.1 principle 5).
+        return Err(Error::UnreadableCiphertext {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(keys)
+}
+
+/// Pull recipient key ids out of a `--list-packets` listing.
+///
+/// One `:pubkey enc packet:` line per recipient, each ending in `keyid <id>`. A
+/// ciphertext written with `--throw-keyids` reports all-zero ids; those are kept
+/// rather than dropped, so a hidden recipient reads as a key the store does not
+/// list instead of as no recipient at all — the direction that reports a problem
+/// rather than concealing one.
+fn parse_packet_keyids(listing: &str) -> KeyIds {
+    listing
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with(":pubkey enc packet:"))
+        .filter_map(|line| line.rsplit_once("keyid "))
+        .map(|(_, id)| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect()
 }
 
 /// Run `gpg`, returning the ciphertext.
@@ -188,35 +395,13 @@ fn encrypt(bin: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<Ve
     Ok(output.stdout)
 }
 
-/// Write `ciphertext` to `path` via a temporary file in the same directory.
+/// Write `ciphertext` to `path`, replacing it only once the write succeeded.
 ///
-/// Same directory so the rename is on one filesystem, and therefore atomic. The
-/// temporary is created `0600` by `tempfile` on Unix and keeps those bits when
-/// it is persisted — tighter than the umask-derived permissions `pass` leaves,
-/// which is the right direction for a password store.
+/// Delegated to [`crate::atomic`], which is also what a `.gpg-id` and the
+/// settings file go through — an interrupted write that truncates an entry into
+/// something that decrypts nowhere is the failure all three are avoiding.
 fn write_atomically(path: &Path, ciphertext: &[u8]) -> Result<()> {
-    let dir = path.parent().ok_or(Error::Encrypt)?;
-    std::fs::create_dir_all(dir).map_err(|err| Error::io(dir, err))?;
-
-    // The prefix keeps the temporary out of the tree even while it exists: the
-    // store walker matches `*.gpg`, and this is neither that nor hidden-adjacent
-    // enough to be mistaken for one.
-    let mut file = tempfile::Builder::new()
-        .prefix(".pgs-tmp-")
-        .tempfile_in(dir)
-        .map_err(|err| Error::io(dir, err))?;
-
-    file.write_all(ciphertext)
-        .map_err(|err| Error::io(path, err))?;
-    // Durability before the rename: a rename that wins the race to disk against
-    // its own file contents would leave a valid name over an empty entry.
-    file.as_file()
-        .sync_all()
-        .map_err(|err| Error::io(path, err))?;
-
-    file.persist(path)
-        .map_err(|err| Error::io(path, err.error))?;
-    Ok(())
+    crate::atomic::write(path, ciphertext)
 }
 
 #[cfg(test)]
@@ -263,46 +448,155 @@ mod tests {
         );
     }
 
+    /// Captured from `gpg --with-colons --list-keys` (GnuPG 2.4.9). Two primary
+    /// keys, each with one encryption subkey.
+    const KEY_LISTING: &str = "\
+pub:u:255:22:A927E66374D6E7FE:1785695396:::u:::scaESCA:::::ed25519:::0:
+fpr:::::::::5669E864B1BBDD28ACC242F7A927E66374D6E7FE:
+uid:u::::1785695396::08AB80EE7A442010C6165E878ABABF2C61CDBAAF::Test a <a@example.invalid>::::::::::0:
+sub:u:255:18:7298DC4C15400BE4:1785695396::::::e:::::cv25519::
+fpr:::::::::B5C2C23E0A47A9840E49F9027298DC4C15400BE4:
+pub:u:255:22:82C1CC4A844CD7E5:1785695396:::u:::scaESCA:::::ed25519:::0:
+sub:u:255:18:D55B72C81442235B:1785695396::::::e:::::cv25519::
+";
+
+    fn keys(ids: &[&str]) -> KeyIds {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    /// The primary key signs but cannot encrypt, so a ciphertext never names
+    /// it — taking the `pub` line's id would compare against something that is
+    /// never in a recipient packet, and every entry would read as stale.
     #[test]
-    fn an_atomic_write_replaces_the_previous_ciphertext() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gmail.com.gpg");
+    fn only_encryption_subkeys_count_as_recipients() {
+        let info = parse_key_listing(KEY_LISTING, "a@example.invalid");
+        assert_eq!(info.keys, keys(&["7298DC4C15400BE4", "D55B72C81442235B"]));
+    }
 
-        write_atomically(&path, b"first").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    /// The `fpr` after a `sub` belongs to that subkey. Taking the first `fpr`
+    /// seen would be right here only by accident of ordering; taking the one
+    /// that follows `pub` is right by construction.
+    #[test]
+    fn the_label_and_fingerprint_come_from_the_primary_key() {
+        let info = parse_key_listing(KEY_LISTING, "a@example.invalid");
+        assert_eq!(info.id, "a@example.invalid");
+        assert_eq!(info.label.as_deref(), Some("Test a <a@example.invalid>"));
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("5669E864B1BBDD28ACC242F7A927E66374D6E7FE"),
+            "took a subkey's fingerprint instead of the primary key's"
+        );
+    }
 
-        write_atomically(&path, b"second-and-longer").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"second-and-longer");
-
-        // The temporary is gone: nothing but the entry itself is left behind.
-        let left: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(left, vec![std::ffi::OsString::from("gmail.com.gpg")]);
+    /// A key that is not on the keyring still describes itself by the id the
+    /// store spells, so the interface can name it rather than showing a blank.
+    #[test]
+    fn an_unlisted_key_keeps_the_id_it_was_asked_about() {
+        let info = parse_key_listing("", "absent@example.invalid");
+        assert_eq!(info.id, "absent@example.invalid");
+        assert_eq!(info.label, None);
+        assert_eq!(info.fingerprint, None);
+        assert!(info.keys.is_empty());
     }
 
     #[test]
-    fn an_atomic_write_creates_missing_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("Email").join("work").join("corp.gpg");
-
-        write_atomically(&path, b"ciphertext").unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"ciphertext");
+    fn a_colon_in_a_user_id_is_unescaped() {
+        let listing = "\
+pub:u:255:22:A927E66374D6E7FE:1:::u:::scaESCA:::::ed25519:::0:
+uid:u::::1::08AB80EE::Weird\\x3aName <w@example.invalid>::::::::::0:
+";
+        assert_eq!(
+            parse_key_listing(listing, "w").label.as_deref(),
+            Some("Weird:Name <w@example.invalid>")
+        );
     }
 
-    /// The file must not be group- or world-readable, whatever the umask says.
-    #[cfg(unix)]
+    /// The same three exclusions `pass`'s `reencrypt_path` makes, so the two
+    /// agree about which keys a `.gpg-id` line means.
     #[test]
-    fn a_written_entry_is_private_to_its_owner() {
-        use std::os::unix::fs::PermissionsExt;
+    fn revoked_disabled_and_signing_only_subkeys_are_skipped() {
+        let listing = "\
+sub:r:255:18:0000000000000001:1::::::e:::::cv25519::
+sub:d:255:18:0000000000000002:1::::::e:::::cv25519::
+sub:i:255:18:0000000000000003:1::::::e:::::cv25519::
+sub:u:255:22:0000000000000004:1::::::s:::::ed25519::
+sub:u:255:18:0000000000000005:1::::::e:::::cv25519::
+";
+        assert_eq!(parse_subkeys(listing, "sub"), keys(&["0000000000000005"]));
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wifi.gpg");
-        write_atomically(&path, b"ciphertext").unwrap();
+    /// The secret keyring uses `ssb` where the public one uses `sub`. Reading
+    /// the wrong record would report every key as one the user cannot decrypt
+    /// with, and so warn about a lockout on every change.
+    #[test]
+    fn secret_subkeys_are_a_different_record_type() {
+        let listing = "\
+sec:u:255:22:A927E66374D6E7FE:1785695396:::u:::scaESCA:::+::ed25519:::0:
+ssb:u:255:18:7298DC4C15400BE4:1785695396::::::e:::+::cv25519::
+";
+        assert_eq!(parse_subkeys(listing, "ssb"), keys(&["7298DC4C15400BE4"]));
+        assert!(parse_subkeys(listing, "sub").is_empty());
+    }
 
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "mode was {:o}", mode & 0o777);
+    #[test]
+    fn a_listing_with_no_usable_subkey_yields_nothing() {
+        assert!(parse_subkeys("", "sub").is_empty());
+        assert!(
+            parse_subkeys("pub:u:255:22:A927E66374D6E7FE:1::::::scaESCA::\n", "sub").is_empty()
+        );
+    }
+
+    /// Captured from `gpg --list-packets` on a file encrypted to two keys.
+    #[test]
+    fn recipient_key_ids_come_off_the_packet_listing() {
+        let listing = "\
+# off=0 ctb=85 tag=1 hlen=3 plen=118
+:pubkey enc packet: version 3, algo 18, keyid 7298DC4C15400BE4
+\tdata: [263 bits]
+:pubkey enc packet: version 3, algo 18, keyid D55B72C81442235B
+\tdata: [262 bits]
+:encrypted data packet:
+\tlength: 76
+";
+        assert_eq!(
+            parse_packet_keyids(listing),
+            keys(&["7298DC4C15400BE4", "D55B72C81442235B"])
+        );
+    }
+
+    /// `--throw-keyids` hides the recipient behind an all-zero id. Keeping it
+    /// means such an entry reads as encrypted to a key the store does not list,
+    /// which is a reported problem rather than a concealed one.
+    #[test]
+    fn a_hidden_recipient_is_kept_rather_than_dropped() {
+        let listing = ":pubkey enc packet: version 3, algo 18, keyid 0000000000000000\n";
+        assert_eq!(parse_packet_keyids(listing), keys(&["0000000000000000"]));
+    }
+
+    /// Invariant 5, for the three errors the inspection path can raise: none
+    /// says anything about an entry's contents.
+    #[test]
+    fn the_inspection_errors_carry_no_content() {
+        assert_eq!(
+            Error::UnknownKey {
+                id: "me@example.com".to_owned()
+            }
+            .to_string(),
+            "no public key for me@example.com"
+        );
+        assert_eq!(
+            Error::UnusableKey {
+                id: "me@example.com".to_owned()
+            }
+            .to_string(),
+            "me@example.com has no usable encryption key: it may have expired or been revoked"
+        );
+        assert_eq!(
+            Error::UnreadableCiphertext {
+                path: PathBuf::from("/store/wifi.gpg")
+            }
+            .to_string(),
+            "/store/wifi.gpg could not be read as an encrypted entry"
+        );
     }
 }

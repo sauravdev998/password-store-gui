@@ -203,6 +203,14 @@ pub enum Change<'a> {
         from: &'a EntryName,
         to: &'a EntryName,
     },
+    /// A folder's keys changed, and the entries that had to be re-encrypted for
+    /// it (ADR-13).
+    SetRecipients {
+        /// `None` is the store root.
+        folder: Option<&'a EntryName>,
+        ids: &'a [String],
+        reencrypted: &'a [EntryName],
+    },
 }
 
 impl Change<'_> {
@@ -220,6 +228,19 @@ impl Change<'_> {
             Self::Remove(name) => format!("Remove {name} from store."),
             Self::Rename { from, to } => format!("Rename {from} to {to}."),
             Self::Copy { from, to } => format!("Copy {from} to {to}."),
+            // `pass init`'s own wording, including the parenthesized path it
+            // adds for a subfolder. It makes two commits — one for the
+            // `.gpg-id` and one for the re-encryption — where this makes one,
+            // because here the two happen together or not at all (ADR-13), and
+            // a history that showed them apart would describe a state the store
+            // is never in.
+            Self::SetRecipients { folder, ids, .. } => {
+                let listed = ids.join(", ");
+                match folder {
+                    Some(folder) => format!("Set GPG id to {listed} ({folder})."),
+                    None => format!("Set GPG id to {listed}."),
+                }
+            }
         }
     }
 
@@ -234,6 +255,18 @@ impl Change<'_> {
             }
             Self::Rename { from, to } => vec![relative(from), relative(to)],
             Self::Copy { to, .. } => vec![relative(to)],
+            // The `.gpg-id` and every entry rewritten because of it. Staged
+            // per-path as every other change is, so a recipient change does not
+            // sweep up unrelated work sitting in the store.
+            Self::SetRecipients {
+                folder,
+                reencrypted,
+                ..
+            } => {
+                let mut paths = vec![gpg_id_relative(*folder)];
+                paths.extend(reencrypted.iter().map(relative));
+                paths
+            }
         }
     }
 }
@@ -241,6 +274,11 @@ impl Change<'_> {
 /// An entry's ciphertext path, relative to the store root.
 fn relative(name: &EntryName) -> PathBuf {
     name.to_secret_path(Path::new(""))
+}
+
+/// A folder's `.gpg-id` path, relative to the store root.
+fn gpg_id_relative(folder: Option<&EntryName>) -> PathBuf {
+    crate::store::gpg_id::path_in(Path::new(""), folder)
 }
 
 /// The git repository a store lives in.
@@ -705,6 +743,68 @@ mod tests {
 
     fn name(name: &str) -> EntryName {
         EntryName::new(name).unwrap()
+    }
+
+    /// `pass init`'s own wording, so a shared history does not betray which
+    /// client made the change. The comma-joined id list and the parenthesized
+    /// subfolder are both its formatting, not ours.
+    #[test]
+    fn a_recipient_change_reads_as_pass_init_wrote_it() {
+        let ids = ["ada@example.com".to_owned(), "bob@example.com".to_owned()];
+
+        assert_eq!(
+            Change::SetRecipients {
+                folder: None,
+                ids: &ids,
+                reencrypted: &[],
+            }
+            .message(),
+            "Set GPG id to ada@example.com, bob@example.com."
+        );
+
+        let folder = name("Work");
+        assert_eq!(
+            Change::SetRecipients {
+                folder: Some(&folder),
+                ids: &ids,
+                reencrypted: &[],
+            }
+            .message(),
+            "Set GPG id to ada@example.com, bob@example.com (Work)."
+        );
+    }
+
+    /// The `.gpg-id` and every entry rewritten because of it, and nothing else:
+    /// staging per path is what stops a recipient change from sweeping up
+    /// unrelated work sitting in the store.
+    #[test]
+    fn a_recipient_change_stages_the_gpg_id_and_the_entries_it_rewrote() {
+        let folder = name("Work");
+        let reencrypted = [name("Work/vpn"), name("Work/deep/intranet")];
+
+        assert_eq!(
+            Change::SetRecipients {
+                folder: Some(&folder),
+                ids: &["ada@example.com".to_owned()],
+                reencrypted: &reencrypted,
+            }
+            .paths(),
+            vec![
+                PathBuf::from("Work/.gpg-id"),
+                PathBuf::from("Work/vpn.gpg"),
+                PathBuf::from("Work/deep/intranet.gpg"),
+            ]
+        );
+
+        assert_eq!(
+            Change::SetRecipients {
+                folder: None,
+                ids: &["ada@example.com".to_owned()],
+                reencrypted: &[],
+            }
+            .paths(),
+            vec![PathBuf::from(".gpg-id")]
+        );
     }
 
     /// An initialised repository with an author configured, so `signature()`

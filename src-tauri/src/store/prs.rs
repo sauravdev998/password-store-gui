@@ -60,12 +60,14 @@ impl PrsStore {
     }
 }
 
-impl Store for PrsStore {
-    fn root(&self) -> &Path {
-        &self.inner.root
-    }
-
-    fn tree(&self) -> Result<Tree> {
+impl PrsStore {
+    /// Walk the store once, splitting names we accept from names we refuse.
+    ///
+    /// Shared by [`Store::tree`] and [`Store::entries`] so the two cannot come
+    /// to disagree about what is in the store — the second exists because a
+    /// recipient change needs the flat list and rebuilding it from the tree
+    /// would be a second traversal with a second chance to differ.
+    fn walk(&self) -> (Vec<EntryName>, Vec<String>) {
         let root = self.root();
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
@@ -86,11 +88,26 @@ impl Store for PrsStore {
             }
         }
 
+        (names, unsupported)
+    }
+}
+
+impl Store for PrsStore {
+    fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    fn tree(&self) -> Result<Tree> {
+        let (names, mut unsupported) = self.walk();
         unsupported.sort();
         Ok(Tree {
             nodes: tree::build(&names),
             unsupported,
         })
+    }
+
+    fn entries(&self) -> Result<Vec<EntryName>> {
+        Ok(self.walk().0)
     }
 
     fn secret_path(&self, name: &EntryName) -> Result<PathBuf> {
