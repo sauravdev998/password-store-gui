@@ -1130,7 +1130,8 @@ cross-references.
 `PRODUCT.md` lists these as absent; keeping them here stops a phase marker from
 being read as more than it is:
 
-- **No released build, no README, no screenshots, no project page, no logo.**
+- **No released build, no screenshots, no project page, no logo.** (A `README.md`
+  exists as of 2026-08-03; it points here rather than making claims of its own.)
   The bundled icons are Tauri's scaffold mark and `public/favicon.svg` is the
   Vite default — placeholders, not identity.
 - **No benchmarks**, despite speed being the positioning (§1).
