@@ -118,7 +118,11 @@ fn changing_a_folders_keys_re_encrypts_what_they_govern() {
     fixture.add_key(OTHER);
 
     let store = tempfile::tempdir().unwrap();
-    let root = store.path();
+    // Canonicalized, because the store canonicalizes its own root: a path this
+    // test builds has to be the same path an error carries back. On macOS the
+    // temporary directory sits under `/var`, a symlink to `/private/var`, so
+    // the two spell the same file differently until one of them is resolved.
+    let root = &dunce::canonicalize(store.path()).unwrap();
     std::fs::write(root.join(".gpg-id"), format!("{}\n", common::RECIPIENT)).unwrap();
     let core = core_at(root);
 
