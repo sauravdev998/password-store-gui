@@ -142,9 +142,9 @@ design question, not a settled one.
   cross-tool compatibility (`src-tauri/tests/`). CI across Linux/macOS/Windows.
 - **Absent — do not fabricate:** no users, downloads, stars, or testimonials. No
   benchmarks, despite speed being the positioning; "fast" is an engineering
-  intent that has not been measured. No screenshots, README, or project page. No
-  released build. No logo. The GUI has never been click-tested against a real
-  store.
+  intent that has not been measured. No screenshots or project page. No released
+  build. No logo. The GUI has never been click-tested against a real store. (A
+  `README.md` exists as of 2026-08-03, and says all of this.)
 
 ## Product Principles
 
