@@ -468,6 +468,98 @@ Record decisions here as they're made or changed.
     same code path runs under `pnpm dev:mock` — which is the only way this
     frontend has ever been driven.
 
+- **ADR-13 — recipient changes: all or nothing, priced before they are made,
+  and honest about what they cannot undo (2026-08-03).** Phase 6's first item,
+  and the second sentence of Invariant 8 — "on recipient change, re-encrypt the
+  whole affected subtree, matching `pass init`" — which nothing implemented
+  until now. `store/gpg_id.rs` gains a writer and a subtree resolver,
+  `crypto/` gains two non-decrypting queries, and `Core` gains
+  `folder_keys` / `plan_recipients` / `set_recipients`.
+
+  **The subtree is decided by the same rule that reads it.** An entry belongs to
+  a `.gpg-id` when it is inside that folder and nothing between the two claims
+  it first — `gpg_id::governed_by` asks the nearest-wins question in the other
+  direction rather than adding a second rule that would have to be kept in step
+  with `resolve`. A nested `.gpg-id` is a separate decision about a separate
+  audience, so a change at the root does not reach through it. It answers for a
+  file that does not exist yet on purpose: setting keys on a folder that had
+  none is `pass init --path`, and what that does is move that subtree out from
+  under whatever governed it.
+
+  **Staleness is readable without decrypting, and that is what makes the
+  interface honest.** `gpg --list-packets` reports the recipient key ids of a
+  ciphertext, and `gpg --list-keys --with-colons` maps each `.gpg-id` line to
+  its encryption subkeys — neither needs a secret key, so neither costs a
+  pinentry or a key tap. So the count of entries a change would rewrite is a
+  fact shown *before* the user agrees to it, which is §4.1 principle 1 applied
+  to the most expensive operation in the app. It also means an entry already
+  encrypted to exactly the right keys is skipped, as `pass`'s `reencrypt_path`
+  skips it, so adding a key that is already there costs nothing and says so.
+  - *An entry counts as current when **any one** of each listed key's encryption
+    subkeys is named, and no key outside the list is.* Those are ADR-6's F-8 and
+    F-9 asked of a file rather than of a write. Requiring the whole subkey set —
+    which comparing sorted lists amounts to, and which `pass` does — reports a
+    key with two encryption subkeys as permanently out of date and re-encrypts
+    the entire subtree on every change.
+  - *`--list-packets` exit status is deliberately ignored.* It walks into the
+    encrypted data packet after listing the recipients and exits 2 with "No
+    secret key" when it cannot open it — which is the expected outcome for
+    exactly the entries this matters most for, the ones encrypted to somebody
+    else. The recipient packets are already on stdout by then, so what decides
+    success is whether the recipient list could be read. Found by
+    `tests/recipients.rs`, not by reading.
+
+  **The write is all or nothing, which `pass init` is not.** Every affected
+  entry is decrypted and re-encrypted into a staging file beside itself, and
+  only once every one has succeeded is anything renamed into place. A failure in
+  that phase — a cancelled pinentry, an entry whose key this machine no longer
+  holds, a full disk — leaves the store byte-identical, `.gpg-id` included.
+  `pass` converts in place and leaves whatever it managed, which on a tree whose
+  every file is ciphertext is a store its owner can half read. Same reasoning as
+  ADR-10's rollback, and the same standard: restore exactly, then say so.
+
+  **Consequences:**
+  - The order is stage → write `.gpg-id` → rename. The `.gpg-id` goes down after
+    the phase that can fail for interesting reasons, so nothing has to roll it
+    back; it goes down *before* the renames so the store's stated authorization
+    is never behind its files. An interruption in the rename sweep — the only
+    non-atomic step, and the one with nothing left to fail — leaves entries the
+    new keys can already read, which re-running repairs and `plan_recipients`
+    can see.
+  - **A change that would leave the user unable to read their own store is
+    named before it is made.** `KeyInfo::usable_here` says whether this machine
+    holds a secret key for a recipient, and `RecipientPlan::locks_you_out` is
+    true when no proposed key does. `pass init` performs that lockout without
+    comment and it cannot be undone from inside the app; the interface refuses
+    the button and says why. A smartcard's key counts — `gpg` lists a stub for
+    it, and §4.1 principle 1 calls a security key a confirmed operating
+    condition.
+  - **Removing a key does not take away what it could already read, and the
+    interface says so.** The history holds earlier copies encrypted to it, and
+    so does any clone someone already has. `pass` says nothing about this; §4.1
+    principle 5 says we must, so the advice is the true one — treat those
+    passwords as known and change them.
+  - **One commit, where `pass init` makes two.** It uses `pass`'s own message
+    (`Set GPG id to …`, with its parenthesized subfolder) and stages the
+    `.gpg-id` together with every entry rewritten for it. Two commits would
+    describe a state this store is never in, because the two halves happen
+    together or not at all.
+  - `Store::entries` is added beside `tree`, both from one walk, because the
+    subtree question is asked of each name independently and a tree would have
+    to be flattened again to ask it.
+  - `atomic.rs` is extracted: ciphertext (ADR-6), `.gpg-id`, and settings
+    (ADR-11) all wanted the same guarantee for three different reasons, and a
+    third copy of it was the wrong answer. Nothing there is about secrecy —
+    Invariant 1 is about plaintext, and none of the three is plaintext.
+  - Recipient ids are validated before they are written: the file is
+    line-delimited and read back trimmed, so an id holding a newline would come
+    back as *two* recipients — a way to add a key to a store by typing it inside
+    another one's name.
+  - The interface names no `.gpg-id` and no "recipient" (Open Decision 6). It
+    speaks of keys and the folders they apply to — but shows each key id
+    verbatim, because that is the string the user needs to act outside the app,
+    which is that decision's own test.
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -546,7 +638,8 @@ password-store-gui/
 ├── src/                      # React / TS frontend (no long-lived secrets)
 │   ├── main.tsx
 │   ├── App.tsx
-│   ├── components/           # Tree, EntryDetail, SettingsDialog, SyncPanel, ...
+│   ├── components/           # Tree, EntryDetail, SettingsDialog, SyncPanel,
+│   │                         #   KeysDialog (ADR-13), ...
 │   ├── hooks/                # useNow, useAutoLock (Invariant 7, ADR-12)
 │   └── lib/                  # typed wrappers over Tauri commands; settings.ts
 └── src-tauri/
@@ -563,6 +656,8 @@ password-store-gui/
         │                     #   (commit, status, per-entry history, blobs),
         │                     #   remote.rs spawns the user's `git` (ADR-9)
         ├── settings.rs       # user settings; `pass`'s env vars win (ADR-11)
+        ├── atomic.rs         # write-then-rename, shared by ciphertext,
+        │                     #   `.gpg-id` and settings (ADR-13)
         ├── generate.rs       # password generation (CSPRNG, no modulo bias)
         ├── otp.rs            # otpauth:// parsing + TOTP with countdown
         ├── secret.rs         # zeroizing secret newtypes
@@ -946,14 +1041,63 @@ this is not ☑.
     write is exercised only by `settings.rs`'s own round-trip test against a
     temp directory.
 
-### Phase 6 — Optional / later — Status: ☐
-- `rpgp` pure-Rust backend for a fully bundled build.
-- Smartcard / YubiKey **verification** pass. Note the *design* constraint is
+### Phase 6 — Optional / later — Status: ◐
+
+Four unrelated items, and they were never equally startable. Recipient
+management was the only one that closed a §4 invariant rather than adding a
+feature, and the only one blocked on nothing; it is done. The other three are
+untouched, and two of them are blocked on things this repo does not have.
+
+- ☑ **Multi-`.gpg-id` subfolder UX; recipient management + subtree re-encrypt
+  (ADR-13).** Invariant 8's second sentence, which nothing implemented before
+  this. `folder_keys` reads which keys govern a folder and whether they were
+  inherited; `plan_recipients` says what a change would cost **without
+  decrypting anything**; `set_recipients` writes the `.gpg-id` and re-encrypts
+  the subtree all-or-nothing. The interface states the cost, refuses a change
+  that would lock the user out, and says plainly that removing a key does not
+  take away what it could already read.
+- ☐ `rpgp` pure-Rust backend for a fully bundled build. **Blocked on an ADR-3
+  reversal, not on effort:** with no `gpg-agent` behind it, a pure-Rust backend
+  moves passphrase handling into our process, which Invariant 3 forbids and
+  `CLAUDE.md` forbids adding the dependency for. That argument has to be made
+  and recorded before any code, exactly as ADR-7 gates Phase 7.
+- ☐ Smartcard / YubiKey **verification** pass. Note the *design* constraint is
   already binding — §4.1 principle 1 exists because a hardware key is a
-  confirmed operating condition, not a hypothetical. What is deferred is
-  testing against real hardware, not designing for it.
-- Multi-`.gpg-id` subfolder UX; recipient management + subtree re-encrypt UI.
-- Import from other managers.
+  confirmed operating condition, not a hypothetical, and ADR-13's lockout check
+  counts a card's key as one the user holds. What is deferred is testing against
+  real hardware, not designing for it.
+- ☐ Import from other managers. Unblocked, but unscoped: which formats is an
+  open question, and parsing an export means handling a plaintext file the user
+  brings, which is the one place Invariant 1 has to be argued rather than
+  assumed.
+- ☑ **Definition of done for the item that landed:** `tests/recipients.rs`
+  stands up a real store with **two** real keys behind a real `gpg` and drives
+  the command surface, then checks the outcome with `gpg` itself rather than
+  through our receipts — the fixture's own secret key is deleted mid-test, so
+  "the other key can now open this" is a fact about the ciphertext. It asserts
+  the nested `.gpg-id` is not reached through, that an unresolvable key is
+  refused by name before anything is written, that re-running the same change
+  rewrites nothing, that a failed re-encrypt leaves the store byte-identical
+  with no staging file behind, and that no plaintext appears anywhere under the
+  store (Invariant 1). The two-direction staleness rule and the commit wording
+  are unit-tested besides.
+  - *Driven in the webview on 2026-08-03*, through `pnpm dev:mock`: the keys
+    panel at the store root and on an inheriting subfolder, adding a key, the
+    exact re-encrypt list, the lockout refusal, the removal caveat, an
+    unresolvable key, a store listing a key that is not on the keyring
+    (`?strangerKey=1`), and a save. **It found three defects**, all in the same
+    area — what the panel says when it is not yet being used to change anything.
+    - The cost panel was gated on the key list having *changed*, so pinning
+      inherited keys to a folder — a real change that creates a boundary —
+      offered a live Save button with no explanation of what it would do.
+    - A failed plan dropped every key's description, so the moment a user added
+      one bad key, the good ones beside it fell back to bare ids exactly when
+      they needed to tell them apart.
+    - Opening the panel on a store that lists an unimported key greeted the user
+      with a red error, because planning that list fails every time. That store
+      is working as intended and the user had asked only to look; the refusal is
+      now held back until they try to save, and the key's own row carries the
+      calm version of the same fact.
 
 ### Phase 7 — Onboarding: nothing → working store — Status: ☐ (blocked on ADR-7)
 
@@ -1016,6 +1160,14 @@ being read as more than it is:
     edit form. It found two defects — a refusal message rendered below the fold
     of a scrolling form, and a lock screen that left the app behind it on the
     Tab order. Both fixed; see Phase 5's definition of done.
+  - **Phase 6's keys panel was driven the same way on 2026-08-03**: the panel at
+    the store root and on an inheriting subfolder, adding a key and reading the
+    exact list of entries it would rewrite, the lockout refusal, the
+    removal-does-not-forget caveat, an unresolvable key, a store listing a key
+    that is not on the keyring, and a save. It found three defects — a Save
+    button that was live with no cost shown behind it, key labels that vanished
+    exactly when they were needed, and a red error on merely opening the panel
+    for a shared store. All fixed; see Phase 6's definition of done.
   - **Phase 4's screens were driven the same way on 2026-08-02**: the sync panel
     in all four of its states (tracking with ahead/behind, no remote, no
     repository, uncommitted changes), a sync reporting each outcome including
