@@ -259,6 +259,18 @@ export function GearIcon({ className }: IconProps) {
   )
 }
 
+/** A key — who can open a folder's entries. */
+export function KeyIcon({ className }: IconProps) {
+  return (
+    <Svg className={className}>
+      <circle cx="8" cy="15" r="4" />
+      <path d="m10.85 12.15 8.4-8.4" />
+      <path d="M18 4.5 20.5 7" />
+      <path d="m15.5 7 2.5 2.5" />
+    </Svg>
+  )
+}
+
 /** Search. */
 export function SearchIcon({ className }: IconProps) {
   return (

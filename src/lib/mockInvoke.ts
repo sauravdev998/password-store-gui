@@ -102,6 +102,66 @@ const PINNED = new Set((flags.get('env') ?? '').split(',').filter(Boolean))
 const LOCK_AFTER = Number(flags.get('lockAfter') ?? 15 * 60)
 /** `?settingsBroken=1` — the settings file exists and will not parse. */
 const SETTINGS_BROKEN = flags.has('settingsBroken')
+/** `?noKeys=1` — no folder pins any keys, i.e. a store that was never set up. */
+const NO_KEYS = flags.has('noKeys')
+/**
+ * `?strangerKey=1` — the store lists a key that is not on this keyring.
+ *
+ * The ordinary state of a store shared with someone whose public key was never
+ * imported, and the case that separates the two ways a key is described: the
+ * panel must still *show* it (`commands::describe`), while a change that would
+ * encrypt to it is refused (`Core::plan`).
+ */
+const STRANGER_KEY = flags.has('strangerKey')
+
+// --- keys, per store/gpg_id.rs and crypto/gnupg.rs ----------------------
+
+/**
+ * The public keyring this fake `gpg` can see.
+ *
+ * `yours` is whether a secret key is held, which is what decides the lockout
+ * warning. The colleague's is deliberately not — a store shared with someone
+ * whose key you cannot decrypt with is the ordinary case, not an edge one.
+ */
+const KEYRING: Record<string, { label: string; fingerprint: string; yours: boolean }> = {
+  'me@example.invalid': {
+    label: 'Me <me@example.invalid>',
+    fingerprint: '5669E864B1BBDD28ACC242F7A927E66374D6E7FE',
+    yours: true,
+  },
+  'colleague@example.invalid': {
+    label: 'A Colleague <colleague@example.invalid>',
+    fingerprint: '29BC19FC9B00E35FDEE640CA82C1CC4A844CD7E5',
+    yours: false,
+  },
+  'ops@example.invalid': {
+    label: 'Ops Rotation <ops@example.invalid>',
+    fingerprint: 'B4D9C7A1E5F30268BC1149E7D5C8A0B34F62E917',
+    yours: true,
+  },
+}
+
+const ME = 'me@example.invalid'
+const OPS = 'ops@example.invalid'
+
+/**
+ * Which keys each folder pins — one `.gpg-id` per directory, `''` for the root.
+ *
+ * `Servers` has its own so the subtree rule is drivable: a change at the root
+ * must not reach through it.
+ */
+const gpgIds: Record<string, string[]> = NO_KEYS
+  ? {}
+  : { '': STRANGER_KEY ? [ME, 'archivist@example.invalid'] : [ME], Servers: [ME, OPS] }
+
+/**
+ * Which keys each entry is currently encrypted to.
+ *
+ * Stands in for reading the recipient packets out of a ciphertext, which the
+ * core does without decrypting. Every entry starts encrypted to exactly what
+ * governs it, which is the state a store nobody has changed the keys of is in.
+ */
+const encryptedTo: Record<string, string[]> = {}
 
 // --- entry parsing, per store/entry.rs ----------------------------------
 
@@ -620,6 +680,127 @@ const handlers: Record<string, (args: Args) => unknown> = {
     store[to] = body
     return receipt()
   },
+
+  folder_keys: (args) => {
+    const folder = folderArg(args)
+    const source = nearestKeysFolder(folder)
+    if (source === null) {
+      return { folder, keys: [], source: null, inherited: false, entries: 0 }
+    }
+    return {
+      folder,
+      // Described leniently, unlike a plan: a folder listing a key that is not
+      // on the keyring must still show the key rather than refusing to open.
+      keys: gpgIds[source].map(describeKeyLoosely),
+      source: source === '' ? null : source,
+      inherited: source !== (folder ?? ''),
+      entries: governedBy(source === '' ? null : source).length,
+    }
+  },
+
+  plan_recipients: (args) => planRecipients(folderArg(args), idsArg(args)),
+
+  set_recipients: (args) => {
+    const folder = folderArg(args)
+    const ids = idsArg(args)
+    // Refuses an unresolvable key before anything changes, as `Core` does.
+    const plan = planRecipients(folder, ids)
+    gpgIds[folder ?? ''] = [...ids]
+    for (const name of plan.reencrypts) encryptedTo[name] = [...ids]
+    return receipt()
+  },
+}
+
+/** `folder` crosses as `null` for the store root, never as `''`. */
+function folderArg(args: Args): string | null {
+  const folder = args.folder
+  return folder === null || folder === undefined ? null : String(folder)
+}
+
+function idsArg(args: Args): string[] {
+  return (args.ids as string[]) ?? []
+}
+
+/** Mirrors `crypto::gnupg::describe_key`: an unresolvable id is a refusal. */
+function describeKey(id: string) {
+  const known = KEYRING[id]
+  if (!known) throw `no public key for ${id}`
+  return { id, label: known.label, fingerprint: known.fingerprint, usableHere: known.yours }
+}
+
+/** Mirrors `commands::describe`: for display, an unknown key is still shown. */
+function describeKeyLoosely(id: string) {
+  const known = KEYRING[id]
+  return known
+    ? { id, label: known.label, fingerprint: known.fingerprint, usableHere: known.yours }
+    : { id, label: null, fingerprint: null, usableHere: false }
+}
+
+/** Mirrors `gpg_id::nearest_gpg_id_in`. `''` is the root; `null` is nothing set. */
+function nearestKeysFolder(folder: string | null): string | null {
+  const parts = folder ? folder.split('/') : []
+  for (let depth = parts.length; depth >= 0; depth--) {
+    const candidate = parts.slice(0, depth).join('/')
+    if (gpgIds[candidate]) return candidate
+  }
+  return null
+}
+
+/**
+ * Mirrors `gpg_id::governed_by`: entries inside `folder` that nothing nearer
+ * claims first, whether or not `folder` pins keys yet.
+ */
+function governedBy(folder: string | null): string[] {
+  const prefix = folder ?? ''
+  const depth = prefix ? prefix.split('/').length : 0
+
+  return Object.keys(store)
+    .filter((name) => {
+      const dirs = name.split('/').slice(0, -1)
+      const dir = dirs.join('/')
+      if (prefix && dir !== prefix && !dir.startsWith(`${prefix}/`)) return false
+      // Anything between the folder and the entry is nearer, and takes it.
+      for (let i = depth + 1; i <= dirs.length; i++) {
+        if (gpgIds[dirs.slice(0, i).join('/')]) return false
+      }
+      return true
+    })
+    .sort()
+}
+
+/** What an entry is encrypted to now, defaulting to whatever governs it. */
+function keysOn(name: string): string[] {
+  if (!encryptedTo[name]) {
+    const source = nearestKeysFolder(name.split('/').slice(0, -1).join('/'))
+    encryptedTo[name] = source === null ? [] : [...gpgIds[source]]
+  }
+  return encryptedTo[name]
+}
+
+/**
+ * Mirrors `commands::is_current` — Invariant 8 in both directions: everyone
+ * listed can read it, and nobody else can.
+ */
+function isCurrent(name: string, ids: string[]): boolean {
+  const actual = new Set(keysOn(name))
+  return ids.every((id) => actual.has(id)) && [...actual].every((id) => ids.includes(id))
+}
+
+/** Mirrors `Core::plan`. Decrypts nothing, which here means it reads no body. */
+function planRecipients(folder: string | null, ids: string[]) {
+  if (ids.length === 0) throw 'the .gpg-id file lists no recipients'
+  const keys = ids.map(describeKey)
+  const governed = governedBy(folder)
+  const reencrypts = governed.filter((name) => !isCurrent(name, ids))
+
+  return {
+    folder,
+    keys,
+    reencrypts,
+    unchanged: governed.length - reencrypts.length,
+    locksYouOut: !keys.some((key) => key.usableHere),
+    createsBoundary: !gpgIds[folder ?? ''],
+  }
 }
 
 /** The field at `index`, which is a field's identity since keys may repeat. */
