@@ -26,7 +26,7 @@ use prs_lib::crypto::prelude::*;
 use prs_lib::crypto::{Config, Context, Proto};
 use prs_lib::Ciphertext;
 
-use crate::crypto::{gnupg, Gpg};
+use crate::crypto::{gnupg, Gpg, KeyIds, KeyInfo};
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 use crate::store::Recipients;
@@ -90,6 +90,18 @@ impl Gpg for PrsGpg {
     /// path touches the `prs-lib` context.
     fn encrypt_file(&self, path: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<()> {
         gnupg::encrypt_to_file(path, recipients, plaintext)
+    }
+
+    /// Delegated to [`gnupg`] for ADR-6's reason, one step further: both of
+    /// these read the same keyring the encrypt path resolves `--recipient`
+    /// against, so they must be the same binary asking. Neither decrypts.
+    fn describe_key(&self, id: &str) -> Result<KeyInfo> {
+        let bin = gnupg::bin()?;
+        gnupg::describe_key(&bin, id, &gnupg::secret_keys(&bin)?)
+    }
+
+    fn encrypted_to(&self, path: &Path) -> Result<KeyIds> {
+        gnupg::encrypted_to(&gnupg::bin()?, path)
     }
 }
 

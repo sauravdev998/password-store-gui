@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod clipboard;
 pub mod commands;
 pub mod crypto;
@@ -60,6 +61,9 @@ pub fn run() {
             commands::rename_entry,
             commands::copy_entry,
             commands::generate_defaults,
+            commands::folder_keys,
+            commands::plan_recipients,
+            commands::set_recipients,
             commands::get_settings,
             commands::set_settings,
         ])

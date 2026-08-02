@@ -13,7 +13,10 @@
 pub mod gnupg;
 pub mod prs;
 
+use std::collections::BTreeSet;
 use std::path::Path;
+
+use serde::Serialize;
 
 #[cfg(doc)]
 use crate::error::Error;
@@ -22,6 +25,56 @@ use crate::secret::Secret;
 use crate::store::Recipients;
 
 pub use prs::PrsGpg;
+
+/// A set of long (16 hex digit) key ids.
+///
+/// Always *encryption subkey* ids — never a primary key's, which is what a
+/// `.gpg-id` usually spells but never what a ciphertext names. Translating
+/// between the two is what [`Gpg::describe_key`] is for.
+pub type KeyIds = BTreeSet<String>;
+
+/// What is known about one recipient id, without decrypting anything.
+///
+/// None of this is secret: a public key's user id and fingerprint are metadata,
+/// which is why they may cross IPC when a decrypted field may not. The store
+/// already renders the raw ids — they are what the `.gpg-id` says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyInfo {
+    /// The id exactly as the `.gpg-id` spells it, or as the user typed it.
+    ///
+    /// Kept verbatim rather than normalized to a fingerprint: it is the string
+    /// the store holds, and rewriting it would be us editing the user's file to
+    /// suit our display (§4.1 principle 3).
+    pub id: String,
+
+    /// The primary user id `gpg` reports, when the key is on the keyring.
+    ///
+    /// What lets the interface show "Ada <ada@example.com>" beside a
+    /// fingerprint nobody can read. `None` means the key is not present, which
+    /// is the ordinary state for a store shared with someone whose key was
+    /// never imported.
+    pub label: Option<String>,
+
+    /// The primary key's fingerprint, for an id that spells something shorter.
+    pub fingerprint: Option<String>,
+
+    /// Whether this machine holds a secret key able to decrypt for this
+    /// recipient.
+    ///
+    /// The one field here that is about the *user* rather than the key. It is
+    /// what lets the interface refuse to let someone remove the last key they
+    /// own from a store — an irreversible lockout `pass init` performs without
+    /// comment (ADR-13).
+    pub usable_here: bool,
+
+    /// The encryption subkeys a ciphertext for this recipient names.
+    ///
+    /// Not serialized: the webview has no use for a subkey id, and this is the
+    /// internal half of the translation above.
+    #[serde(skip)]
+    pub keys: KeyIds,
+}
 
 /// Decryption of store entries.
 ///
@@ -58,4 +111,27 @@ pub trait Gpg: Send + Sync {
     /// Creating the entry's directory is the implementation's job, so a new
     /// entry in a new folder is one call.
     fn encrypt_file(&self, path: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<()>;
+
+    /// What a recipient id resolves to.
+    ///
+    /// **Must not decrypt.** This and [`Gpg::encrypted_to`] exist to answer
+    /// "who can open this?" without opening it, which is what lets a recipient
+    /// change report its cost before the user commits to paying it (ADR-13,
+    /// §4.1 principle 1). An implementation that decrypted here would turn a
+    /// question into a pinentry prompt per entry.
+    ///
+    /// An unresolvable id is an error, never a [`KeyInfo`] with an empty
+    /// [`KeyInfo::keys`]: silently dropping one is ADR-6's F-8, which encrypts
+    /// an entry to fewer people than the store demands and looks entirely
+    /// normal afterwards.
+    fn describe_key(&self, id: &str) -> Result<KeyInfo>;
+
+    /// The keys the ciphertext at `path` is actually encrypted to.
+    ///
+    /// The other half of the pair above: [`Gpg::describe_key`] says who the
+    /// store *wants* to be able to read an entry, this says who *can*. **Must
+    /// not decrypt** — and must work on an entry this machine holds no secret
+    /// key for, so a store the user has partly lost access to can still be
+    /// described to them rather than failing silently.
+    fn encrypted_to(&self, path: &Path) -> Result<KeyIds>;
 }

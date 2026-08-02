@@ -5,6 +5,7 @@ import { EditEntryDialog } from './components/EditEntryDialog'
 import { EntryDetail } from './components/EntryDetail'
 import { MoveDialog } from './components/MoveDialog'
 import { HistoryDialog } from './components/HistoryDialog'
+import { KeysDialog } from './components/KeysDialog'
 import { NewEntryDialog } from './components/NewEntryDialog'
 import { SettingsDialog } from './components/SettingsDialog'
 import { SyncPanel } from './components/SyncPanel'
@@ -15,6 +16,7 @@ import {
   AlertIcon,
   CheckIcon,
   GearIcon,
+  KeyIcon,
   LockIcon,
   PlusIcon,
   SearchIcon,
@@ -46,6 +48,20 @@ function folderOf(name: string | null): string {
   return cut === -1 ? '' : name.slice(0, cut + 1)
 }
 
+/**
+ * The folder an entry sits in, as the key commands want it: no trailing slash,
+ * and `null` rather than `''` for the store root.
+ *
+ * Kept apart from {@link folderOf}, which produces the prefix the new-entry form
+ * pre-fills a name with — a different shape for a different job, and collapsing
+ * the two would give one of them the wrong one.
+ */
+function enclosingFolder(name: string | null): string | null {
+  if (!name) return null
+  const cut = name.lastIndexOf('/')
+  return cut === -1 ? null : name.slice(0, cut)
+}
+
 /** Which dialog is open. Only one at a time, and none of them is ever hidden. */
 type OpenDialog =
   | { kind: 'new'; folder: string }
@@ -53,6 +69,8 @@ type OpenDialog =
   | { kind: 'move'; mode: 'rename' | 'duplicate'; from: string }
   | { kind: 'delete'; name: string }
   | { kind: 'history'; name: string }
+  /** `folder` is `null` for the store root. */
+  | { kind: 'keys'; folder: string | null }
   | { kind: 'settings' }
 
 /** What just happened, in one line. */
@@ -282,6 +300,18 @@ function App() {
           >
             <PlusIcon className="size-4" />
           </button>
+          {/* Scoped to the selected entry's folder, so "keys for what I am
+              looking at" is one click. The store root is the fallback, which is
+              also the only `.gpg-id` most stores have. */}
+          <button
+            type="button"
+            aria-label="Keys"
+            title="Which keys can open these entries"
+            className="shrink-0 rounded-row p-1 text-ink-faint transition-colors hover:bg-raised hover:text-ink"
+            onClick={() => setDialog({ kind: 'keys', folder: enclosingFolder(selected) })}
+          >
+            <KeyIcon className="size-4" />
+          </button>
           <button
             type="button"
             aria-label="Settings"
@@ -498,6 +528,20 @@ function App() {
           clipped={clipped}
           onCopied={setClipped}
           onClose={() => setDialog(null)}
+        />
+      )}
+
+      {dialog?.kind === 'keys' && (
+        <KeysDialog
+          folder={dialog.folder}
+          // Unknown reads as unversioned, as everywhere else: the caveat about
+          // a removed key still being able to read the history is only worth
+          // showing when there is a history.
+          versioned={versioned === true}
+          onCancel={() => setDialog(null)}
+          // The selection is left alone: the entries are the same entries, and
+          // re-selecting would decrypt one nobody asked to see again.
+          onSaved={(receipt, summary) => settle(summary, receipt)}
         />
       )}
 

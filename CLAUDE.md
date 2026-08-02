@@ -25,7 +25,9 @@ that violates one is a bug even if the feature works. The short version:
    what we put there.
 7. Auto-lock: leaving the window hides revealed values, going idle closes
    everything to a lock screen. Neither touches the clipboard (ADR-12).
-8. Writes encrypt to the recipients from the nearest `.gpg-id`, walking up.
+8. Writes encrypt to the recipients from the nearest `.gpg-id`, walking up. On a
+   recipient change, the whole affected subtree is re-encrypted — all or
+   nothing, and priced before it is agreed to (ADR-13).
 
 When unsure whether something leaks a secret, assume it does.
 
@@ -91,9 +93,10 @@ the awkward states (`?noGit=1`, `?sync=conflicted`, `?env=storeDir`,
 **It establishes nothing about the core.** No GnuPG runs, nothing is decrypted,
 no file is written, and the clipboard is a variable. The stub *mirrors* the
 Rust rules rather than sharing them — the entry parser, name validation, the
-refusals in `Core`, the strings in `error.rs`, and the settings precedence — so
-when you change one of those, change the stub too, or it stops testing the app
-and starts testing a fiction. When they disagree, the Rust side is right.
+refusals in `Core`, the strings in `error.rs`, the settings precedence, and the
+`.gpg-id` walk-up and staleness rules behind the keys panel — so when you change
+one of those, change the stub too, or it stops testing the app and starts
+testing a fiction. When they disagree, the Rust side is right.
 
 ## Settings
 

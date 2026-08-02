@@ -21,7 +21,6 @@
 //! decrypted — so unlike the rest of the core it is ordinary configuration and
 //! is written to disk without qualm (Invariant 1 is about plaintext).
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -483,20 +482,9 @@ fn read(path: &Path) -> std::result::Result<Settings, String> {
 /// the next launch, and the user would experience that as their settings
 /// vanishing.
 fn write(path: &Path, settings: &Settings) -> Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir).map_err(|err| Error::io(dir, err))?;
-
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|err| Error::io(path, std::io::Error::other(err)))?;
-
-    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|err| Error::io(dir, err))?;
-    file.write_all(&json).map_err(|err| Error::io(path, err))?;
-    file.as_file()
-        .sync_all()
-        .map_err(|err| Error::io(path, err))?;
-    file.persist(path)
-        .map_err(|err| Error::io(path, err.error))?;
-    Ok(())
+    crate::atomic::write(path, &json)
 }
 
 #[cfg(test)]
@@ -525,7 +513,13 @@ mod tests {
     fn nothing_set_anywhere_is_the_built_in_defaults() {
         let out = resolve(&Settings::default(), &nothing(), home(), None, None);
 
-        assert_eq!(out.store_dir.value, "/home/u/.password-store");
+        // Compared as a path, not as a string: this is the one effective value
+        // built by joining rather than passed through, so its separator is the
+        // platform's choice and none of this test's business.
+        assert_eq!(
+            Path::new(&out.store_dir.value),
+            home().unwrap().join(".password-store"),
+        );
         assert_eq!(out.store_dir.source, Source::Default);
         assert_eq!(out.clip_time_secs.value, DEFAULT_CLIP_TIME.as_secs());
         assert_eq!(out.clip_time_secs.source, Source::Default);

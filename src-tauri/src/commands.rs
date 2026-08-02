@@ -27,14 +27,14 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::clipboard::Clipboard;
-use crate::crypto::{Gpg, PrsGpg};
+use crate::crypto::{Gpg, KeyIds, KeyInfo, PrsGpg};
 use crate::error::{Error, Result};
 use crate::generate;
 use crate::git::{Change, GitRepo, Revision, SyncOutcome, SyncStatus, Vcs};
 use crate::otp::{Otp, OtpCode};
 use crate::secret::Secret;
 use crate::settings::{Effective, Settings, SettingsFile};
-use crate::store::{Entry, EntryMetadata, EntryName, PrsStore, Store, Tree};
+use crate::store::{gpg_id, Entry, EntryMetadata, EntryName, PrsStore, Recipients, Store, Tree};
 
 /// What every command needs: a store to read, a backend to decrypt with, and a
 /// clipboard to copy into.
@@ -488,6 +488,179 @@ impl Core {
         Ok(self.record(&*store, Change::Copy { from, to }))
     }
 
+    /// The keys currently able to open a folder's entries, and where that was
+    /// decided.
+    ///
+    /// Decrypts nothing: it reads the `.gpg-id` the walk-up lands on and asks
+    /// the keyring about each id. Opening the panel therefore costs no pinentry
+    /// and no key tap, the same property `entry_history` has (§4.1 principle 1).
+    pub fn folder_keys(&self, folder: Option<&EntryName>) -> Result<FolderKeys> {
+        let store = (self.store)()?;
+        let root = store.root();
+
+        let Some(source) = gpg_id::nearest_gpg_id_in(root, folder) else {
+            // A store with no `.gpg-id` anywhere is not broken, it is
+            // uninitialized — the state a directory made by hand is in. Saying
+            // "no keys are set" is the truth; an error would suggest a failure.
+            return Ok(FolderKeys {
+                folder: folder.cloned(),
+                keys: Vec::new(),
+                source: None,
+                inherited: false,
+                entries: 0,
+            });
+        };
+
+        let recipients = gpg_id::read(&source)?;
+        let gpg = (self.gpg)()?;
+        let source_folder = gpg_id::folder_of(root, &source);
+
+        Ok(FolderKeys {
+            folder: folder.cloned(),
+            keys: recipients
+                .ids
+                .iter()
+                .map(|id| describe(&*gpg, id))
+                .collect(),
+            inherited: source_folder.as_ref() != folder,
+            entries: gpg_id::governed_by(root, source_folder.as_ref(), &store.entries()?).len(),
+            source: source_folder,
+        })
+    }
+
+    /// What changing a folder's keys to `ids` would do, before doing any of it.
+    ///
+    /// **Decrypts nothing** (ADR-13). Every proposed id is resolved against the
+    /// keyring, and each governed entry's actual recipients are read out of its
+    /// ciphertext's packet headers — so the count of entries this would rewrite
+    /// is a fact rather than an estimate, and the user is told the price before
+    /// being asked to pay it (§4.1 principle 1).
+    pub fn plan_recipients(
+        &self,
+        folder: Option<&EntryName>,
+        ids: &[String],
+    ) -> Result<RecipientPlan> {
+        let store = (self.store)()?;
+        let gpg = (self.gpg)()?;
+        self.plan(&*store, &*gpg, folder, ids)
+    }
+
+    /// Change the keys a folder's entries are encrypted to, re-encrypting them.
+    ///
+    /// Invariant 8's second sentence, which nothing implemented before this
+    /// (ADR-13). The operation is **all or nothing**: every affected entry is
+    /// decrypted and encrypted again into a staging file first, and only once
+    /// every one of them has succeeded is anything moved into place. A failure
+    /// during the expensive phase — a cancelled pinentry, a key that cannot be
+    /// read, a full disk — leaves the store byte-identical, including the
+    /// `.gpg-id`. `pass init` converts in place and leaves whatever it managed,
+    /// which on a store whose files are all ciphertext is a store half its
+    /// owner can read.
+    pub fn set_recipients(
+        &self,
+        folder: Option<&EntryName>,
+        ids: &[String],
+    ) -> Result<WriteReceipt> {
+        let store = (self.store)()?;
+        let gpg = (self.gpg)()?;
+        let root = store.root();
+
+        // Refuses an id the keyring cannot resolve, before anything is written.
+        // ADR-6's rule: fail loudly and by name, where `find_public_keys` failed
+        // silently and encrypted to fewer people than asked.
+        let plan = self.plan(&*store, &*gpg, folder, ids)?;
+
+        let path = gpg_id::path_in(root, folder);
+        let recipients = Recipients {
+            ids: ids.to_vec(),
+            source: path.clone(),
+        };
+
+        // The expensive, reversible phase. Nothing the store shows has changed
+        // when this returns, whichever way it returns.
+        let staged = stage(&*store, &*gpg, &plan.reencrypts, &recipients)?;
+
+        // Past here only renames and one small write remain. The `.gpg-id` goes
+        // down first so that the store's stated authorization is never *behind*
+        // the files: a crash between these two leaves entries the new keys can
+        // already read, which re-running repairs and `plan_recipients` can see.
+        gpg_id::write(&path, ids)?;
+        commit_staged(staged)?;
+
+        Ok(self.record(
+            &*store,
+            Change::SetRecipients {
+                folder,
+                ids,
+                reencrypted: &plan.reencrypts,
+            },
+        ))
+    }
+
+    /// The shared body of [`Core::plan_recipients`] and [`Core::set_recipients`],
+    /// so the change that is described and the change that is made are computed
+    /// by one piece of code rather than two that must agree.
+    fn plan(
+        &self,
+        store: &dyn Store,
+        gpg: &dyn Gpg,
+        folder: Option<&EntryName>,
+        ids: &[String],
+    ) -> Result<RecipientPlan> {
+        let root = store.root();
+        if ids.is_empty() {
+            return Err(Error::EmptyRecipients {
+                path: gpg_id::path_in(root, folder),
+            });
+        }
+
+        // Resolved rather than described: an id that does not resolve stops the
+        // whole plan here, so a change is never *reported* as possible when
+        // making it would fail partway.
+        let keys: Vec<KeyInfo> = ids
+            .iter()
+            .map(|id| gpg.describe_key(id))
+            .collect::<Result<_>>()?;
+
+        // What a ciphertext must name for the entry to be readable by everyone
+        // the store lists, and by nobody it does not.
+        let wanted: Vec<&KeyIds> = keys.iter().map(|key| &key.keys).collect();
+        let permitted: KeyIds = wanted.iter().flat_map(|set| set.iter()).cloned().collect();
+
+        let path = gpg_id::path_in(root, folder);
+        // The entries this change would reach: those the `.gpg-id` being written
+        // will govern once it exists — which is not the same as those governed
+        // today, because writing one into a folder that had none moves its
+        // subtree out from under whatever governs it now.
+        let mut governed = gpg_id::governed_by(root, folder, &store.entries()?);
+        // The store walk yields whatever order the filesystem does. Sorted here
+        // because this list is shown to the user before they agree to the
+        // change, and an arbitrary order would reshuffle between two readings of
+        // the same pending change. It also fixes the order entries are rewritten
+        // in, which is what makes a partial failure reproducible.
+        governed.sort();
+
+        let mut reencrypts = Vec::new();
+        let mut unchanged = 0;
+        for name in governed {
+            let secret = store.secret_path(&name)?;
+            if is_current(gpg, &secret, &wanted, &permitted)? {
+                unchanged += 1;
+            } else {
+                reencrypts.push(name);
+            }
+        }
+
+        Ok(RecipientPlan {
+            folder: folder.cloned(),
+            locks_you_out: !keys.iter().any(|key| key.usable_here),
+            keys,
+            reencrypts,
+            unchanged,
+            creates_boundary: !path.is_file(),
+        })
+    }
+
     /// Record a completed mutation in the store's history.
     ///
     /// Infallible by design. Everything it could report has already happened on
@@ -609,6 +782,190 @@ pub enum Commit {
     /// explanation — see [`crate::error::Error::Git`] for why git's own
     /// messages are safe to relay when the crypto layer's are not.
     Failed(String),
+}
+
+/// The keys able to open a folder's entries, and where that was decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderKeys {
+    /// The folder asked about. `None` is the store root.
+    pub folder: Option<EntryName>,
+
+    /// The keys in force, in the order the `.gpg-id` lists them.
+    ///
+    /// Empty means no `.gpg-id` governs this folder at all — an uninitialized
+    /// store rather than a broken one.
+    pub keys: Vec<KeyInfo>,
+
+    /// The folder whose `.gpg-id` decided this. `None` is the store root's.
+    pub source: Option<EntryName>,
+
+    /// Whether that decision was made somewhere above this folder.
+    ///
+    /// Carried rather than left for the webview to derive by comparing `folder`
+    /// with `source`: the two are equal for the root in both directions, since
+    /// `None == None`, and a UI that got that wrong would offer to "change" keys
+    /// it was only inheriting.
+    pub inherited: bool,
+
+    /// How many entries that decision governs.
+    pub entries: usize,
+}
+
+/// What changing a folder's keys would do, computed without decrypting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientPlan {
+    /// The folder whose keys would change. `None` is the store root.
+    pub folder: Option<EntryName>,
+
+    /// The proposed keys, each resolved against the keyring.
+    ///
+    /// Every one of them resolved, or there would be no plan — an id the
+    /// keyring cannot place is refused here rather than at encrypt time
+    /// (ADR-6, F-8).
+    pub keys: Vec<KeyInfo>,
+
+    /// The entries that would be decrypted and encrypted again, by name.
+    ///
+    /// Names rather than a count, because this is what the interface has to
+    /// show before asking: the cost of this change is one decrypt each, which
+    /// on a machine with a security key is one tap each (§4.1 principle 1).
+    pub reencrypts: Vec<EntryName>,
+
+    /// Entries already encrypted to exactly these keys, which are left alone.
+    ///
+    /// The same skip `pass`'s `reencrypt_path` makes. Adding a key that is
+    /// already there is then free, and says so.
+    pub unchanged: usize,
+
+    /// Whether no proposed key is one this machine can decrypt with.
+    ///
+    /// The irreversible mistake: `pass init` to a key you do not hold locks you
+    /// out of every entry in the subtree, and says nothing. This is what lets
+    /// the interface say it first (ADR-13).
+    pub locks_you_out: bool,
+
+    /// Whether this would put a `.gpg-id` where there was none, splitting the
+    /// folder off from whatever governs it now.
+    pub creates_boundary: bool,
+}
+
+/// Suffix for a re-encrypted entry waiting to be moved into place.
+///
+/// Deliberately not ending in `.gpg`: the store walker matches that, and a
+/// staging file must not appear in the tree even for the moment it exists.
+const STAGING_SUFFIX: &str = ".pgs-staged";
+
+/// One re-encrypted entry: where it is now, and where it belongs.
+type Staged = Vec<(PathBuf, PathBuf)>;
+
+/// Re-encrypt every entry to `recipients`, writing none of them into place.
+///
+/// The reversible half of a recipient change. Each entry is decrypted and
+/// encrypted again beside itself, so a failure part-way through — the likely
+/// one, since this is the phase that needs a secret key and may raise a
+/// pinentry — leaves every file in the store exactly as it was. What it returns
+/// is the list of moves that would complete the change.
+///
+/// One plaintext is live at a time and dropped before the next is read; the
+/// staging files hold ciphertext only, so Invariant 1 is untouched.
+fn stage(
+    store: &dyn Store,
+    gpg: &dyn Gpg,
+    entries: &[EntryName],
+    recipients: &Recipients,
+) -> Result<Staged> {
+    let mut staged: Staged = Vec::new();
+
+    for name in entries {
+        let result = store.secret_path(name).and_then(|target| {
+            let staging = staging_path(&target);
+            let plaintext = gpg.decrypt_file(&target)?;
+            gpg.encrypt_file(&staging, recipients, &plaintext)?;
+            Ok((staging, target))
+        });
+
+        match result {
+            Ok(pair) => staged.push(pair),
+            Err(err) => {
+                // Nothing has been moved into place yet, so discarding what was
+                // written restores the store byte for byte. A failed
+                // `encrypt_file` leaves nothing of its own: it writes through a
+                // temporary that is removed when the persist does not happen.
+                for (staging, _) in &staged {
+                    let _ = std::fs::remove_file(staging);
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(staged)
+}
+
+/// Move every staged entry into place.
+///
+/// Each rename is atomic on its own and within one directory, so an entry is
+/// never absent or half-written. The sweep as a whole is not atomic — there is
+/// no filesystem operation that would make it so — which is why it runs last,
+/// with nothing left that can fail for an interesting reason. An interruption
+/// here leaves some entries converted and some not, which is a state
+/// [`Core::plan_recipients`] can see and re-running the change repairs.
+fn commit_staged(staged: Staged) -> Result<()> {
+    for (staging, target) in staged {
+        std::fs::rename(&staging, &target).map_err(|err| Error::io(&target, err))?;
+    }
+    Ok(())
+}
+
+/// Where an entry's re-encrypted ciphertext waits.
+///
+/// Beside the entry itself, so the rename that completes the change stays
+/// within one filesystem and is therefore atomic.
+fn staging_path(target: &Path) -> PathBuf {
+    let mut path = target.to_path_buf().into_os_string();
+    path.push(STAGING_SUFFIX);
+    PathBuf::from(path)
+}
+
+/// Whether a ciphertext is already encrypted to exactly the right keys.
+///
+/// Invariant 8 in both directions, which is also what makes it the skip test:
+/// everyone the store lists must be able to read the entry, and nobody else.
+/// Those are ADR-6's F-8 and F-9 respectively, asked of a file that already
+/// exists rather than of a write about to happen.
+///
+/// A recipient counts as able to read when **any one** of their encryption
+/// subkeys is named. `gpg` encrypts to the newest usable subkey rather than to
+/// all of them, so requiring the whole set — as `pass` effectively does by
+/// comparing sorted lists — reports a key with two encryption subkeys as
+/// permanently out of date, and re-encrypts the entry every single time.
+fn is_current(gpg: &dyn Gpg, path: &Path, wanted: &[&KeyIds], permitted: &KeyIds) -> Result<bool> {
+    let actual = gpg.encrypted_to(path)?;
+    let everyone_listed_can_read = wanted.iter().all(|keys| !keys.is_disjoint(&actual));
+    let nobody_else_can = actual.is_subset(permitted);
+    Ok(everyone_listed_can_read && nobody_else_can)
+}
+
+/// Describe a key for display, falling back to the bare id.
+///
+/// Unlike [`Core::plan`], a failure here is not fatal: a `.gpg-id` may list
+/// someone whose public key was never imported — the ordinary state of a store
+/// shared with another person — and refusing to show the folder's keys because
+/// one of them is unknown would hide the very thing the user needs to see. What
+/// is shown is the id the store spells, with no label and `usable_here` false,
+/// which is exactly what is true about it.
+///
+/// A *change* still refuses such an id, because encrypting to it would fail.
+fn describe(gpg: &dyn Gpg, id: &str) -> KeyInfo {
+    gpg.describe_key(id).unwrap_or_else(|_| KeyInfo {
+        id: id.to_owned(),
+        label: None,
+        fingerprint: None,
+        usable_here: false,
+        keys: KeyIds::new(),
+    })
 }
 
 /// The real repository, discovered from the store root.
@@ -828,6 +1185,33 @@ pub fn copy_entry(from: EntryName, to: EntryName, core: State<'_, Core>) -> Resu
 }
 
 /// The generation defaults, so the dialog opens on what `pass` would do.
+/// Which keys can open a folder's entries. Decrypts nothing.
+#[tauri::command]
+pub fn folder_keys(folder: Option<EntryName>, core: State<'_, Core>) -> Result<FolderKeys> {
+    core.folder_keys(folder.as_ref())
+}
+
+/// What changing a folder's keys would cost, before it is changed. Decrypts
+/// nothing — see [`Core::plan_recipients`].
+#[tauri::command]
+pub fn plan_recipients(
+    folder: Option<EntryName>,
+    ids: Vec<String>,
+    core: State<'_, Core>,
+) -> Result<RecipientPlan> {
+    core.plan_recipients(folder.as_ref(), &ids)
+}
+
+/// Change a folder's keys, re-encrypting the entries they govern (Invariant 8).
+#[tauri::command]
+pub fn set_recipients(
+    folder: Option<EntryName>,
+    ids: Vec<String>,
+    core: State<'_, Core>,
+) -> Result<WriteReceipt> {
+    core.set_recipients(folder.as_ref(), &ids)
+}
+
 #[tauri::command]
 pub fn generate_defaults(core: State<'_, Core>) -> generate::Recipe {
     core.generate_defaults()
@@ -855,7 +1239,7 @@ pub fn set_settings(settings: Settings, core: State<'_, Core>) -> Result<Effecti
 // literals, not decrypted content.
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -901,6 +1285,10 @@ mod tests {
             })
         }
 
+        fn entries(&self) -> Result<Vec<EntryName>> {
+            Ok(self.names())
+        }
+
         fn secret_path(&self, name: &EntryName) -> Result<PathBuf> {
             if self.names().contains(name) {
                 Ok(name.to_secret_path(&self.root))
@@ -913,13 +1301,13 @@ mod tests {
         /// that has its own — so a test can drive both sides of the "does this
         /// move cross a recipient boundary" question.
         fn recipients(&self, name: &EntryName) -> Result<Recipients> {
-            let (id, dir) = if name.as_str().starts_with(WALLED) {
-                (WALLED_RECIPIENT, self.root.join(WALLED))
+            let dir = if name.as_str().starts_with(WALLED) {
+                self.root.join(WALLED)
             } else {
-                (RECIPIENT, self.root.clone())
+                self.root.clone()
             };
             Ok(Recipients {
-                ids: vec![id.to_owned()],
+                ids: vec![fake_recipient(name.as_str()).to_owned()],
                 source: dir.join(crate::store::gpg_id::GPG_ID_FILE),
             })
         }
@@ -931,6 +1319,7 @@ mod tests {
         fn remove(&self, name: &EntryName) -> Result<()> {
             let path = self.secret_path(name)?;
             lock(&self.gpg.plaintexts).remove(&path);
+            lock(&self.gpg.encrypted).remove(&path);
             Ok(())
         }
 
@@ -948,7 +1337,14 @@ mod tests {
             let Some(text) = table.get(&source).cloned() else {
                 return Err(Error::EntryNotFound { name: from.clone() });
             };
-            table.insert(to.to_secret_path(&self.root), text);
+            let target = to.to_secret_path(&self.root);
+            table.insert(target.clone(), text);
+            // The ciphertext moves as-is, so who it is encrypted to moves with
+            // it — this path is only taken when both ends share a `.gpg-id`.
+            let keys = lock(&self.gpg.encrypted).get(&source).cloned();
+            if let Some(keys) = keys {
+                lock(&self.gpg.encrypted).insert(target, keys);
+            }
             Ok(())
         }
     }
@@ -961,6 +1357,29 @@ mod tests {
     const WALLED: &str = "Work/";
     const WALLED_RECIPIENT: &str = "work-key";
 
+    /// The recipient id governing `name` in the fake store.
+    ///
+    /// Shared by [`FakeStore::recipients`] and [`FakeGpg::with`] so the store's
+    /// idea of who should be able to read an entry and the backend's idea of who
+    /// can cannot drift apart except when a test makes them.
+    fn fake_recipient(name: &str) -> &'static str {
+        if name.starts_with(WALLED) {
+            WALLED_RECIPIENT
+        } else {
+            RECIPIENT
+        }
+    }
+
+    /// The key a recipient id resolves to in the fake.
+    ///
+    /// Deliberately a *different string* from the id itself, as it is in
+    /// reality — a `.gpg-id` names a user id or a fingerprint, a ciphertext
+    /// names an encryption subkey. Keeping them distinct here is what stops a
+    /// test from passing because the two happened to be equal.
+    fn fake_key(id: &str) -> String {
+        format!("key-of-{id}")
+    }
+
     /// A backend that "decrypts" by looking the path up in a table, and
     /// "encrypts" by writing back into it.
     ///
@@ -972,6 +1391,15 @@ mod tests {
     struct FakeGpg {
         plaintexts: Arc<Mutex<BTreeMap<PathBuf, String>>>,
         written_to: Arc<Mutex<Vec<Write>>>,
+        /// The keys each path is encrypted to, which is what a recipient change
+        /// reads to decide whether an entry needs rewriting at all.
+        encrypted: Arc<Mutex<BTreeMap<PathBuf, KeyIds>>>,
+        /// Ids this backend refuses to resolve, so a test can drive the refusal
+        /// path without needing a keyring that lacks a key.
+        unresolvable: Arc<Mutex<BTreeSet<String>>>,
+        /// Ids this machine holds no secret key for, so a test can drive the
+        /// lockout warning without deleting a key from a keyring.
+        foreign: Arc<Mutex<BTreeSet<String>>>,
     }
 
     /// One encryption: where it went, and to whom.
@@ -979,13 +1407,27 @@ mod tests {
 
     impl FakeGpg {
         fn with(entries: &[(&str, &str)], root: &Path) -> Self {
-            let plaintexts = entries
+            let plaintexts: BTreeMap<_, _> = entries
                 .iter()
                 .map(|(name, text)| (name_of(name).to_secret_path(root), (*text).to_owned()))
+                .collect();
+            // Seeded entries start encrypted to exactly what governs them, which
+            // is the ordinary state of a store nobody has changed the keys of.
+            let encrypted = entries
+                .iter()
+                .map(|(name, _)| {
+                    (
+                        name_of(name).to_secret_path(root),
+                        std::iter::once(fake_key(fake_recipient(name))).collect(),
+                    )
+                })
                 .collect();
             Self {
                 plaintexts: Arc::new(Mutex::new(plaintexts)),
                 written_to: Arc::new(Mutex::new(Vec::new())),
+                encrypted: Arc::new(Mutex::new(encrypted)),
+                unresolvable: Arc::new(Mutex::new(BTreeSet::new())),
+                foreign: Arc::new(Mutex::new(BTreeSet::new())),
             }
         }
 
@@ -1020,7 +1462,35 @@ mod tests {
             let text = plaintext.expose_str()?.to_owned();
             lock(&self.plaintexts).insert(path.to_path_buf(), text);
             lock(&self.written_to).push((path.to_path_buf(), recipients.ids.clone()));
+            lock(&self.encrypted).insert(
+                path.to_path_buf(),
+                recipients.ids.iter().map(|id| fake_key(id)).collect(),
+            );
             Ok(())
+        }
+
+        fn describe_key(&self, id: &str) -> Result<KeyInfo> {
+            if lock(&self.unresolvable).contains(id) {
+                return Err(Error::UnknownKey { id: id.to_owned() });
+            }
+            Ok(KeyInfo {
+                id: id.to_owned(),
+                label: Some(format!("Fake {id}")),
+                fingerprint: None,
+                // Every key is one the fake user can decrypt with unless a test
+                // says otherwise, which is the ordinary state of a store.
+                usable_here: !lock(&self.foreign).contains(id),
+                keys: std::iter::once(fake_key(id)).collect(),
+            })
+        }
+
+        fn encrypted_to(&self, path: &Path) -> Result<KeyIds> {
+            lock(&self.encrypted)
+                .get(path)
+                .cloned()
+                .ok_or_else(|| Error::UnreadableCiphertext {
+                    path: path.to_path_buf(),
+                })
         }
     }
 
@@ -1543,6 +2013,58 @@ mod tests {
             Err(other) => panic!("expected EntryNotFound, got {other:?}"),
             Ok(_) => panic!("edit must not create an entry"),
         }
+    }
+
+    /// The staleness test a recipient change skips entries on, in both of the
+    /// directions Invariant 8 has. Driving it directly rather than through
+    /// `plan_recipients` is deliberate: this is the rule that decides whether an
+    /// entry is decrypted at all, and a test of it should not be able to pass
+    /// because the plan around it filtered the entry out for another reason.
+    #[test]
+    fn an_entry_is_current_only_when_exactly_the_listed_keys_can_read_it() {
+        let gpg = FakeGpg::default();
+        let path = PathBuf::from("/store/wifi.gpg");
+
+        let ada = keys(&["ADA1"]);
+        let bob = keys(&["BOB1"]);
+        let wanted = vec![&ada, &bob];
+        let permitted = keys(&["ADA1", "BOB1"]);
+
+        let encrypted_to = |ids: &[&str]| {
+            lock(&gpg.encrypted).insert(path.clone(), keys(ids));
+            is_current(&gpg, &path, &wanted, &permitted).unwrap()
+        };
+
+        assert!(encrypted_to(&["ADA1", "BOB1"]), "exactly the listed keys");
+
+        assert!(
+            !encrypted_to(&["ADA1"]),
+            "F-8: Bob is listed in the .gpg-id but cannot read the entry"
+        );
+        assert!(
+            !encrypted_to(&["ADA1", "BOB1", "EVE1"]),
+            "F-9: Eve can read the entry and is listed nowhere"
+        );
+    }
+
+    /// `gpg` encrypts to a key's newest usable encryption subkey rather than to
+    /// all of them. Requiring the whole set — which is what comparing sorted
+    /// lists amounts to, and what `pass` does — would report a key with two
+    /// encryption subkeys as permanently out of date and re-encrypt every entry
+    /// under it on every change, each one a decrypt the user did not ask for.
+    #[test]
+    fn one_of_a_keys_encryption_subkeys_is_enough() {
+        let gpg = FakeGpg::default();
+        let path = PathBuf::from("/store/wifi.gpg");
+        let ada = keys(&["ADA_RETIRED", "ADA_CURRENT"]);
+
+        lock(&gpg.encrypted).insert(path.clone(), keys(&["ADA_CURRENT"]));
+
+        assert!(is_current(&gpg, &path, &[&ada], &ada).unwrap());
+    }
+
+    fn keys(ids: &[&str]) -> KeyIds {
+        ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
     /// Invariant 8: a write is encrypted to the recipients of the name being

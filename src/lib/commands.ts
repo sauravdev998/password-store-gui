@@ -412,6 +412,106 @@ export function generateDefaults(): Promise<Recipe> {
   return invoke<Recipe>('generate_defaults')
 }
 
+/**
+ * One key that can open a folder's entries.
+ *
+ * Nothing here is secret: a public key's user id and fingerprint are metadata,
+ * which is why they may cross this boundary when a decrypted field may not.
+ */
+export type KeyInfo = {
+  /**
+   * The id exactly as the store spells it — an email, a key id, a fingerprint.
+   *
+   * Kept verbatim rather than normalized, because it is the string the store
+   * holds and the one the user needs if they go looking outside the app.
+   */
+  id: string
+  /** A readable name for the key, or `null` when it is not on this keyring. */
+  label: string | null
+  /** The key's fingerprint, for an id that spells something shorter. */
+  fingerprint: string | null
+  /**
+   * Whether this machine can decrypt with it — that is, whether it is *yours*.
+   *
+   * What makes removing the last one of these a warning rather than a click.
+   */
+  usableHere: boolean
+}
+
+/** Which keys can open a folder's entries, and where that was decided. */
+export type FolderKeys = {
+  /** The folder asked about. `null` is the store root. */
+  folder: string | null
+  /** The keys in force. Empty means no keys are set for this store at all. */
+  keys: KeyInfo[]
+  /** The folder whose setting decided this. `null` is the store root's. */
+  source: string | null
+  /** Whether that decision was made in a folder above this one. */
+  inherited: boolean
+  /** How many entries that decision covers. */
+  entries: number
+}
+
+/**
+ * What changing a folder's keys would do, worked out before it is done.
+ *
+ * Costs nothing to ask: no entry is decrypted to answer it, so this can be
+ * shown while the user is still deciding.
+ */
+export type RecipientPlan = {
+  folder: string | null
+  /** The proposed keys, each resolved. */
+  keys: KeyInfo[]
+  /**
+   * Entries that would have to be decrypted and encrypted again, by name.
+   *
+   * The real cost of the change, and what the interface must show before
+   * asking: each one is a decrypt, which on a machine with a security key is a
+   * touch.
+   */
+  reencrypts: string[]
+  /** Entries already readable by exactly these keys, which are left alone. */
+  unchanged: number
+  /**
+   * Whether none of the proposed keys is one this machine can decrypt with.
+   *
+   * The irreversible mistake: it would leave the user unable to open their own
+   * entries, with no way back.
+   */
+  locksYouOut: boolean
+  /** Whether this would split the folder off from the keys it inherits now. */
+  createsBoundary: boolean
+}
+
+/**
+ * Which keys can open a folder's entries. Decrypts nothing, so it is free to
+ * call while browsing.
+ */
+export function folderKeys(folder: string | null): Promise<FolderKeys> {
+  return invoke<FolderKeys>('folder_keys', { folder })
+}
+
+/**
+ * What changing a folder's keys would cost, without changing anything.
+ *
+ * Decrypts nothing — it reads which keys each entry is *already* encrypted to
+ * out of the file's headers, which needs no key of any kind.
+ */
+export function planRecipients(folder: string | null, ids: string[]): Promise<RecipientPlan> {
+  return invoke<RecipientPlan>('plan_recipients', { folder, ids })
+}
+
+/**
+ * Change which keys can open a folder's entries, re-encrypting them.
+ *
+ * All or nothing: if any entry cannot be re-encrypted, nothing is changed and
+ * the store is left exactly as it was. A key that cannot be found is refused
+ * before anything is written.
+ */
+export function setRecipients(folder: string | null, ids: string[]): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('set_recipients', { folder, ids })
+}
+
 /** Every setting as it stands, with what decided each one. */
 export function getSettings(): Promise<EffectiveSettings> {
   return invoke<EffectiveSettings>('get_settings')
