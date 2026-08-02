@@ -513,7 +513,13 @@ mod tests {
     fn nothing_set_anywhere_is_the_built_in_defaults() {
         let out = resolve(&Settings::default(), &nothing(), home(), None, None);
 
-        assert_eq!(out.store_dir.value, "/home/u/.password-store");
+        // Compared as a path, not as a string: this is the one effective value
+        // built by joining rather than passed through, so its separator is the
+        // platform's choice and none of this test's business.
+        assert_eq!(
+            Path::new(&out.store_dir.value),
+            home().unwrap().join(".password-store"),
+        );
         assert_eq!(out.store_dir.source, Source::Default);
         assert_eq!(out.clip_time_secs.value, DEFAULT_CLIP_TIME.as_secs());
         assert_eq!(out.clip_time_secs.source, Source::Default);
