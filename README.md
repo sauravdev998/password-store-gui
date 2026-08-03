@@ -26,6 +26,11 @@ Two limits worth knowing before you point this at a store you care about:
   against a stub — but the two have not been exercised together by hand.
 - **Sync has never run against a real remote.** The git tests drive two real
   repositories end to end, but every remote in them is a local path.
+- **The bundled GnuPG has never been installed and launched on a clean
+  Windows machine.** CI runs the whole Rust suite against exactly the tree that
+  gets bundled, and a test drives that tree with `PATH` scrubbed — but a
+  packaged build on a machine that has never had GnuPG is a different claim, and
+  nobody has made it yet.
 
 "Fast" in the description below is engineering intent. Nothing has been
 benchmarked.
@@ -54,15 +59,35 @@ benchmarked.
 
 ## Requirements
 
-**A working `gpg` on `PATH` is a hard prerequisite on every platform.** This app
-drives your GPG rather than reimplementing OpenPGP, and it never handles your
-passphrase — `gpg-agent` and pinentry do.
+**On Windows, nothing — GnuPG ships inside the app.** It still drives GPG rather
+than reimplementing OpenPGP, and it still never handles your passphrase —
+`gpg-agent` and pinentry do, exactly as before.
 
 | | |
 |---|---|
-| Windows | [Gpg4win](https://www.gpg4win.org/) (`gpg.exe` + a pinentry) |
-| macOS | GnuPG and `pinentry-mac` |
-| Linux | GnuPG and `pinentry-gtk` or `pinentry-qt` |
+| Windows | Nothing. GnuPG is bundled |
+| macOS | GnuPG and `pinentry-mac` — **bundling is designed but not yet built**, see below |
+| Linux | The `gnupg` package, and `pinentry-gtk` or `pinentry-qt` — the deb and rpm depend on it |
+
+**If you already have GnuPG, that is the one it uses.** The bundled copy is a
+fallback, not a replacement: your keyring, your agent, your pinentry and your
+smartcard keep working as they do for `pass` itself, and a second `gpg-agent`
+never starts. The app looks on your `PATH` first, then in the usual install
+locations — Gpg4win, GPG Suite, both Homebrew prefixes, MacPorts — and only then
+at its own copy.
+
+**Linux is not bundled for on purpose.** A bundled agent meeting a
+distro-managed `~/.gnupg` is a worse problem than installing a package.
+
+**macOS is not bundled for yet.** GnuPG on Unix compiles its paths in, so a
+relocated copy does not find its own helpers the way the Windows one does;
+making it work means building GnuPG and its libraries from source for both
+architectures. Until that lands, macOS needs a GnuPG installed the ordinary way
+— which is what every platform needed before.
+
+The bundled GnuPG is unmodified upstream, under the GPL like this app;
+`gnupg/SOURCE` inside a built bundle names the exact version and where its
+source lives.
 
 Reading and writing a store — including its local history — needs no system
 `git`; libgit2 is linked in. **Syncing with a remote does**, so a shared store
@@ -85,9 +110,16 @@ Then:
 
 ```sh
 pnpm install
-pnpm tauri dev      # run it
-pnpm tauri build    # release bundle for the current OS
+pnpm tauri dev              # run it
+./scripts/fetch-gnupg.sh    # stage the bundled GnuPG (Windows only)
+pnpm tauri build            # release bundle for the current OS
 ```
+
+`fetch-gnupg.sh` downloads a pinned, checksummed GnuPG into `src-tauri/gnupg/`,
+which is where `bundle.resources` picks it up. It is a no-op on Linux, and on
+macOS it fails with a message rather than producing a bundle that quietly has no
+GnuPG in it. Skipping it builds without the fallback: the app then needs a
+system GnuPG, which is what it needed before.
 
 The bundle is unsigned and unnotarized.
 
@@ -111,7 +143,8 @@ and runs the Rust tests on Linux, macOS, and Windows.
 `pnpm dev:mock` serves the app with `@tauri-apps/api/core` aliased to
 `src/lib/mockInvoke.ts`, so every component runs through the real IPC wrappers
 with no Rust behind it. URL flags drive the awkward states (`?noGit=1`,
-`?sync=conflicted`, `?lockAfter=5`, …). It establishes nothing about the core —
+`?sync=conflicted`, `?lockAfter=5`, `?setup=noGpg`, …). It establishes nothing
+about the core —
 no GnuPG runs, nothing is decrypted, and the clipboard is a variable — but it is
 how each phase has been click-tested, and it has found a defect every time.
 
@@ -155,7 +188,7 @@ src/                 React + TypeScript frontend (Tailwind v4)
 src-tauri/src/
   commands.rs        the command surface
   store/             tree, entry parsing, names, .gpg-id resolution
-  crypto/            gpg invocation and decryption
+  crypto/gnupg.rs    the whole GPG backend, and the one place a gpg is chosen
   git/               history and sync
   clipboard.rs       copy with a self-clearing timer
   settings.rs        settings and environment precedence
@@ -172,4 +205,6 @@ src-tauri/src/
 ## License
 
 `GPL-3.0-or-later`, a consequence of statically linking the LGPL `prs-lib`
-(see [`PLAN.md`](PLAN.md) ADR-4).
+(see [`PLAN.md`](PLAN.md) ADR-4). The GnuPG bundled on Windows is separately
+licensed under the same GPL and is unmodified upstream; a built bundle carries
+its `COPYING` and a pointer to the corresponding source.

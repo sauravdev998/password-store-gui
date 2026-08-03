@@ -61,7 +61,7 @@ Phase 7).
 | Shell | **Tauri 2.x** | Rust core + native webview; small binary; locked-down IPC. |
 | Core | **Rust (stable)** | All sensitive logic lives here. |
 | Frontend | **React 19 + TypeScript + Tailwind (v4) + Vite**, pnpm | Familiar stack; UI only, holds no long-lived secrets. |
-| Crypto | **Shell out to the `gpg` binary** (default) | Uses the user's keyring, `gpg-agent`, pinentry, smartcards for free. |
+| Crypto | **Shell out to the `gpg` binary** (default), bundled on Windows/macOS | Uses the user's keyring, `gpg-agent`, pinentry, smartcards for free. The system's binary wins where there is one; ours is the fallback (ADR-14). |
 | Git | **`git2`** (vendored libgit2) for local ops, the user's **`git`** spawned for the network | No system git needed to read or write a store; syncing needs it (ADR-9). |
 
 ### Rust crates (initial)
@@ -99,6 +99,10 @@ Record decisions here as they're made or changed.
   painful on Windows (Gpg4win + `i686-pc-windows-gnu` target only). Shelling to
   `gpg` keeps agent/pinentry/smartcard support and avoids that build hell.
   GPGME and a pure-Rust `rpgp` backend are optional later backends behind a trait.
+  **Amended by ADR-14:** still the `gpg` binary, but no longer necessarily the
+  user's — we bundle one on Windows and macOS and fall back to it. Which binary
+  runs is a packaging question; that it is `gpg` with an agent behind it, and so
+  that Invariant 3 holds, is what this ADR decided and ADR-14 preserves.
 - **ADR-5 — Locked-down webview by default (Phase 0).** A strict CSP is set in
   `tauri.conf.json` (`default-src 'self'`, no `frame-src`/`object-src`, no
   `form-action`); the webview can reach nothing but our own IPC. `unsafe_code` is
@@ -262,7 +266,48 @@ Record decisions here as they're made or changed.
   - `prs-lib` is now used for decryption, the store walk, and nothing else. If
     a later phase finds a reason to own decryption too, dropping the dependency
     becomes a live option — but that is an ADR-4 reversal and needs its own
-    entry, not a drive-by.
+    entry, not a drive-by. **That reason arrived: see ADR-4b.**
+
+- **ADR-4b — we own decryption too; `prs-lib` keeps the store walk
+  (2026-08-03).** The entry ADR-6 asked for. The reason is ADR-14: bundling
+  GnuPG means the binary we drive may not be on `PATH`, and `prs-lib` cannot be
+  told where it is. Its `find_gpg_bin`
+  (`crypto/backend/gnupg_bin/context.rs:100`) is a bare `which::which(BIN_NAME)`,
+  the function is private, `Context::from` is private, and the backend reads no
+  environment variable. A bundled `gpg` is therefore unreachable through its
+  public API.
+
+  **The workaround was considered and rejected.** Appending the bundle directory
+  to `PATH` with `std::env::set_var` would reach both resolvers at once and cost
+  nothing — but it is process-global mutation that races everything else in the
+  binary, and edition 2024 makes it `unsafe`, which `unsafe_code = "forbid"`
+  cannot locally allow. `commands.rs` already refused it once for the same
+  reasons, and that argument does not weaken because this call site is more
+  convenient.
+
+  **Why this is the cheap half, not the expensive one.** `crypto/prs.rs` was
+  already 5-of-7 delegated: only `decrypt` and `decrypt_file` still went through
+  `prs-lib`, while `encrypt_file`, `describe_key`, `encrypted_to`, `usable_keys`
+  and `generate_key` each called `gnupg::bin()` themselves. And ADR-6's own
+  argument says decryption is the safe thing to own: it has no
+  flag-compatibility surface, because `gpg --decrypt` reads what the file says
+  it is.
+
+  **Consequences:**
+  - `crypto/prs.rs` is gone and `gnupg.rs` holds the whole `Gpg` impl, so
+    `gnupg::bin()` is now the *single* place a `gpg` path is chosen. That
+    retires an invariant that used to be maintained by hand — "the binary that
+    encrypts an entry is the one that will decrypt it" — by making it
+    structurally impossible to break.
+  - The three `prs-lib` behaviours that module existed to route around
+    (F-2 `gpg_tty` forcing loopback pinentry, F-3 `verbose` printing raw gpg
+    stdout that can hold plaintext, F-5 `can_decrypt` inspecting a decrypted
+    secret as a `&str` without zeroizing) are no longer reachable at all rather
+    than merely avoided.
+  - We lose `prs-lib`'s `test_gpg_compat` version gate. `bin()` replaces it with
+    its own `--version` probe, which ADR-14 needs anyway.
+  - `prs-lib` remains a dependency for the store walk (`store/prs.rs`). ADR-4's
+    seam is untouched there, and its LGPL relinking consequence still stands.
 
 - **ADR-8 — the edit form reveals the whole entry (2026-08-01).** Phase 3's edit
   flow rests on `reveal_entry`, which returns an entire decrypted body across
@@ -667,7 +712,65 @@ Record decisions here as they're made or changed.
   - A machine with no `gpg` gets a screen and no wizard, because there is
     nothing the app can do for it. It names the platform's own package —
     Gpg4win, `pinentry-mac`, `pinentry-gtk`/`-qt` — which is §4.1 principle 5's
-    sharpest test: "install Gpg4win" beats "gpg not found".
+    sharpest test: "install Gpg4win" beats "gpg not found". **ADR-14 narrows
+    this to Linux**: where GnuPG is bundled the screen is a bundle-integrity
+    failure, not an instruction, but it stays for the case where it is true.
+
+- **ADR-14 — bundle GnuPG on Windows and macOS; prefer the system one
+  (2026-08-03).** ADR-3 chose the `gpg` binary over an in-process
+  implementation and left "which `gpg`" as the user's problem: §11 called a
+  working binary on `PATH` a hard prerequisite on every platform. That is a wall
+  in front of exactly the user this app is for — someone who wants a GUI because
+  they do not want to hand-assemble GnuPG. So we ship it.
+
+  **Invariant 3 is untouched, and that is the whole reason this is allowed.** A
+  bundled GnuPG is still GnuPG: it runs its own `gpg-agent`, raises its own
+  pinentry, and we never see a passphrase. Contrast the Phase 6 `rpgp` item,
+  which stays blocked precisely because removing the binary removes the agent
+  behind it. Bundling adds a copy of the thing we already drive; it does not
+  move anything into our process. Nothing in §4 changes, and no dependency rule
+  in `CLAUDE.md` is engaged.
+
+  **Decisions:**
+  - **Windows and macOS bundle; Linux does not.** On Linux the deb and rpm
+    declare a `gnupg` dependency and the package manager settles it. Bundling
+    there would stand a second `gpg-agent` version up against a distro-managed
+    `~/.gnupg`, which is the mixed-version hazard GnuPG itself warns about, in
+    the one environment where the prerequisite was never hard to satisfy.
+  - **System first, bundled as fallback.** Resolution is: `PATH`, then the
+    platform's known install locations, then ours. A user with a working GnuPG
+    keeps their agent, pinentry, keyring and smartcard exactly as they had them,
+    and our copy only runs when nothing else answered — which is also what keeps
+    the mixed-agent hazard off by default rather than merely documented.
+  - **Every candidate is probed, not just found.** `bin()` accepts a path only
+    if it runs and reports `gpg (GnuPG) ` 2.0.0 or newer. That restores the
+    version gate ADR-4b costs us, and it is the same mechanism that skips a
+    binary which resolves but does not work — Git for Windows' MSYS2 `gpg.exe`,
+    which reads `GNUPGHOME` as an MSYS path, being the case CI already
+    documents.
+  - **`GNUPGHOME` is never set.** The bundled binary uses the user's real
+    `~/.gnupg`. A private keyring would make the app's store unreadable by
+    `pass`, which is the one thing this project cannot do.
+  - Resolution stays **per call**, as it is today, so installing GnuPG
+    mid-session still takes effect on the next click. Only the bundle
+    *directory* is resolved once, at startup, because it is a fixed property of
+    the installation rather than a setting.
+
+  **Consequences:**
+  - The blocker is ADR-4b, not packaging: see it for why `prs-lib` had to give
+    up decryption before any of this could work.
+  - Licensing is clean. GnuPG is GPL-3.0-or-later and so is this app, so
+    shipping it is aggregation of compatible works; we include GnuPG's `COPYING`
+    and a pinned upstream source URL for the exact version bundled.
+  - **We now own GnuPG updates on two platforms.** A bundled copy does not
+    receive the user's OS security updates, so the pinned version needs a
+    refresh policy rather than being set once and forgotten.
+  - Windows is nearly free: `ci.yml` already downloads a checksummed
+    `gnupg-w32` from gnupg.org and extracts a relocatable `bin/` + `share/` tree
+    without running the installer, and the full Rust suite — key generation
+    included — already passes against it. macOS is the real work, because GnuPG
+    on Unix compiles its paths in and a relocated tree is not automatically
+    self-locating.
 
 ---
 
@@ -759,8 +862,9 @@ password-store-gui/
         ├── lib.rs
         ├── store/            # our types + Store trait; name/gpg_id/tree/entry are
         │                     #   ours outright (F-1, F-6); prs.rs holds the impl
-        ├── crypto/           # our Gpg trait; prs.rs wraps prs-lib for *decrypt*,
-        │                     #   gnupg.rs spawns gpg for *encrypt* (ADR-6)
+        ├── crypto/           # our Gpg trait; gnupg.rs is the whole backend and
+        │                     #   the one place a gpg is chosen (ADR-6, ADR-4b,
+        │                     #   ADR-14)
         ├── git/              # our Vcs trait; mod.rs is git2-backed and local
         │                     #   (commit, status, per-entry history, blobs),
         │                     #   remote.rs spawns the user's `git` (ADR-9)
@@ -1121,10 +1225,18 @@ this is not ☑.
     alphabet. That is §4.1 principle 1's central case, not an edge of it. If it
     is ever wanted it has to be an explicit, one-shot, opt-in action with its
     cost stated, not a filter box.
-- ☐ Per-OS packaging + code signing (see Cross-Platform Notes). Untouched.
-  Blocked in practice on things this repo does not have: an Apple Developer ID,
-  a Windows signing certificate, and any visual identity at all — the bundled
-  icons are still Tauri's scaffold mark.
+- ◐ Per-OS packaging + code signing (see Cross-Platform Notes). **Code signing
+  is untouched** and blocked in practice on things this repo does not have: an
+  Apple Developer ID, a Windows signing certificate, and any visual identity at
+  all — the bundled icons are still Tauri's scaffold mark.
+  - **Bundling GnuPG landed on 2026-08-03 (ADR-14)**, which was packaging work
+    with a Rust blocker in front of it rather than the other way round: see
+    ADR-4b. Windows stages the official relocatable tree through
+    `scripts/fetch-gnupg.sh`; the deb and rpm gained a `gnupg` dependency.
+  - ☐ **macOS is the remainder.** The fetch script fails loudly there rather
+    than shipping a bundle with no GnuPG in it, so a macOS build still needs a
+    system GnuPG — the state every platform was in before. Cross-Platform Notes
+    says what making it work involves.
 - ☑ **Definition of done, so far:** the precedence rule is a unit test rather
   than something to be checked by reading (`settings.rs` — environment beats
   configured beats default, a pinned value keeps the configured one behind it,
@@ -1466,20 +1578,33 @@ being read as more than it is:
 
 ## 11. Cross-platform notes
 
-- **Windows:** requires **Gpg4win** for `gpg.exe` + a pinentry; locate the binary via
-  `which`/known install paths. Watch path separators and CRLF line endings.
-- **macOS:** `pinentry-mac` for the passphrase prompt; notarization + hardened runtime for distribution.
-- **Linux:** `pinentry-gtk`/`-qt`; package as AppImage/Flatpak/deb as desired.
+- **Windows:** GnuPG is bundled (ADR-14) — `scripts/fetch-gnupg.sh` stages the
+  official relocatable `gnupg-w32` tree, checksum pinned. Gpg4win is still used
+  when it is installed, since resolution prefers the system's. Watch path
+  separators and CRLF line endings.
+- **macOS:** GnuPG is bundled by ADR-14 but **the fetch is not implemented**, so
+  builds today fall back to a system GnuPG (GPG Suite, Homebrew, MacPorts — all
+  three are in the search path). GnuPG on Unix compiles its paths in, so making
+  a relocated tree self-locating means building it and its five libraries from
+  source for two architectures and rewriting the dylib references. Notarization
+  + hardened runtime for distribution, and a bundled GnuPG has to be signed
+  along with everything else.
+- **Linux:** not bundled for, deliberately — a bundled `gpg-agent` meeting a
+  distro-managed `~/.gnupg` is the mixed-version hazard GnuPG warns about, in
+  the one place the prerequisite was never hard. The deb and rpm depend on
+  `gnupg`; `pinentry-gtk`/`-qt` for the prompt. AppImage/Flatpak users install
+  it themselves.
 - `git2` links libgit2 vendored, so reading and writing a store — and its local
   history — need no system git. **Syncing does** (ADR-9): `fetch`/`merge`/`push`
   spawn the user's own `git`, which is what makes their credential helper,
   `ssh-agent` and platform keychain work untouched. On Windows that means Git
-  for Windows alongside Gpg4win, but only for a store shared with a remote.
+  for Windows, but only for a store shared with a remote.
 
-**A working `gpg` binary is a hard prerequisite on every platform** — Gpg4win on
-Windows, `pinentry-mac` on macOS, `pinentry-gtk`/`-qt` on Linux. Its absence is a
-first-class, explainable failure state (§4.1 principle 5), not a crash, and
-detecting it is part of Phase 7.
+**A working `gpg` binary is required on every platform, and on Windows and macOS
+we supply it** (ADR-14). Its absence is still a first-class, explainable failure
+state (§4.1 principle 5) rather than a crash — but where GnuPG is bundled that
+state means our copy is damaged, not that the user forgot to install something,
+and the onboarding screen says so. Only on Linux is it still an instruction.
 
 ### Identity & packaging metadata
 
@@ -1491,7 +1616,7 @@ Fixed by `PRODUCT.md`; packaging (Phase 5) must not drift from it.
 | Window title | `Password Store` |
 | Package | `password-store-gui` |
 | Bundle identifier | `dev.passwordstoregui.app` |
-| License | `GPL-3.0-or-later` (ADR-4 — a consequence of statically linking LGPL `prs-lib`) |
+| License | `GPL-3.0-or-later` (ADR-4 — a consequence of statically linking LGPL `prs-lib`; ADR-14's bundled GnuPG is compatible with it) |
 
 No visual identity exists. The bundled icons and `public/favicon.svg` are
 scaffold defaults — **not a reference for anything**, and not to be extended

@@ -67,8 +67,10 @@ Confirmed conditions the interface actually meets:
 - **Passphrase prompts are not ours.** `gpg-agent` and the platform pinentry own
   them and appear as separate OS-level windows outside our control — including
   during onboarding.
-- **Platform prerequisites.** A working `gpg` binary is required: Gpg4win on
-  Windows, `pinentry-mac` on macOS, `pinentry-gtk`/`-qt` on Linux.
+- **Platform prerequisites.** A working `gpg` binary is required, and on Windows
+  and macOS it ships with the app (ADR-14) — an existing GnuPG is preferred when
+  there is one, so nobody's keyring, agent or smartcard changes. Linux installs
+  the `gnupg` package, which the deb and rpm depend on.
 
 ## Capabilities and Constraints
 

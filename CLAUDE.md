@@ -22,7 +22,8 @@ that violates one is a bug even if the feature works. The short version:
    This includes **creating** a key (ADR-7): `--batch` is what lets the agent
    prompt, not what stops it, so `--passphrase`, `--pinentry-mode` and
    `%no-protection` stay out of the shipped path — and out of the fixtures used
-   to test it.
+   to test it. Bundling GnuPG (ADR-14) does not touch this: a bundled GnuPG runs
+   its own agent, so the passphrase is still never ours.
 4. Secret buffers are wrapped in `secrecy`/`zeroize`, never `Debug`/`Display`.
 5. Nothing secret reaches logs, errors, traces, or panics.
 6. Clipboard auto-clears — on its timer and on exit — and only if it still holds
@@ -38,13 +39,14 @@ When unsure whether something leaks a secret, assume it does.
 ## Commands
 
 ```sh
-pnpm install            # once
-pnpm tauri dev          # run the app (starts Vite + cargo)
-pnpm tauri build        # release bundle for the current OS
-pnpm dev                # frontend only, no Rust core
-pnpm dev:mock           # frontend against a stubbed core (see below)
-pnpm build              # typecheck + bundle the frontend
-pnpm lint               # oxlint
+pnpm install                # once
+pnpm tauri dev              # run the app (starts Vite + cargo)
+./scripts/fetch-gnupg.sh    # stage the bundled GnuPG before a build (ADR-14)
+pnpm tauri build            # release bundle for the current OS
+pnpm dev                    # frontend only, no Rust core
+pnpm dev:mock               # frontend against a stubbed core (see below)
+pnpm build                  # typecheck + bundle the frontend
+pnpm lint                   # oxlint
 
 cd src-tauri
 cargo test
@@ -98,10 +100,11 @@ the awkward states (`?noGit=1`, `?sync=conflicted`, `?env=storeDir`,
 no file is written, and the clipboard is a variable. The stub *mirrors* the
 Rust rules rather than sharing them — the entry parser, name validation, the
 refusals in `Core`, the strings in `error.rs`, the settings precedence, the
-`.gpg-id` walk-up and staleness rules behind the keys panel, and `store_state`
-behind the onboarding wizard — so when you change one of those, change the stub
-too, or it stops testing the app and starts testing a fiction. When they
-disagree, the Rust side is right.
+`.gpg-id` walk-up and staleness rules behind the keys panel, `store_state`
+behind the onboarding wizard, and the three shapes `crypto::gnupg::bin` fails in
+(`?setup=noGpg`, `?setup=noGpgUnbundled`, `?setup=staleGpg`) — so when you change
+one of those, change the stub too, or it stops testing the app and starts testing
+a fiction. When they disagree, the Rust side is right.
 
 ## Settings
 
@@ -114,21 +117,36 @@ the panel can say what is in charge rather than offering a control that does
 nothing.
 
 Read settings at the point of use, not at startup — like the store and the
-`gpg` backend, so a change takes effect on the next click.
+`gpg` backend, so a change takes effect on the next click. Which `gpg` runs is
+resolved per call for exactly this reason: installing GnuPG while the app is
+open works.
+
+The **one** thing resolved at startup is where the bundled GnuPG was installed
+(`crypto::gnupg::set_bundled_root`, called from the `setup` hook in `lib.rs`).
+It earns the exception by not being a condition of the machine: it is a fixed
+property of the installation and cannot change while the process runs. Do not
+grow that list without the same argument.
 
 ## Dependencies
 
 `prs-lib` is **wrapped, not exposed** (ADR-4): its types live only in
-`store/prs.rs` and `crypto/prs.rs` behind our own traits, and must never appear
-in `commands.rs`, in a serialized payload, or in a public signature outside
-those modules.
+`store/prs.rs` behind our own traits, and must never appear in `commands.rs`, in
+a serialized payload, or in a public signature outside that module.
 
-What it actually backs is narrower than ADR-4 first assumed, and the seam is
-why that was cheap to change: **decryption and the store walk, and nothing
-else.** Encryption is our own `gpg` invocation in `crypto/gnupg.rs` (ADR-6),
-recipient walk-up and name validation are ours in `store/` (ADR-4a F-1, F-6),
-and git is `git2` plus the user's own binary (ADR-9) — `prs-lib`'s git is not
-used at all.
+What it actually backs kept shrinking, and the seam is why that was cheap each
+time: **the store walk, and nothing else.** Encryption was already our own `gpg`
+invocation (ADR-6), and decryption became one in ADR-4b — `crypto/prs.rs` is
+gone, and `crypto/gnupg.rs` is the whole backend. Recipient walk-up and name
+validation are ours in `store/` (ADR-4a F-1, F-6), and git is `git2` plus the
+user's own binary (ADR-9) — `prs-lib`'s git is not used at all.
+
+`crypto::gnupg::bin` is the **only** place that decides which `gpg` runs, and
+that is load-bearing rather than tidy: ADR-14 bundles GnuPG (Windows today,
+macOS designed but not built), preferring the system's when there is one, and a
+second resolver would mean the binary that encrypts an entry need not be the one
+that decrypts it. Do not add another, and do not reach for `std::env::set_var`
+on `PATH` to get around one — ADR-4b records why that door is closed, and the
+edition-2024 half of that argument applies to any `set_var` in the lib.
 
 Two dependency rules, both with an ADR behind them:
 
