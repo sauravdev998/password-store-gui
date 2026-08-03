@@ -62,8 +62,27 @@ jobs:
           staged="$(pwd)/src-tauri/gnupg/bin"
           # Proves the extracted tree is usable, not merely present.
           "${staged}/gpg.exe" --version
-          # GITHUB_PATH prepends, so this wins over Git for Windows' gpg.
-          echo "${staged}" >>"$GITHUB_PATH"
+          # GITHUB_PATH prepends, so this wins over Git for Windows' gpg — but
+          # only if Windows can read the entry. `pwd` in this shell is an MSYS
+          # path (`/d/a/...`), which native PATH lookup ignores *in silence*,
+          # putting the MSYS gpg.exe back in front. `cygpath -w` is what makes
+          # the entry a path the test binaries will actually search.
+          cygpath -w "${staged}" >>"$GITHUB_PATH"
+
+      # GITHUB_PATH only takes effect in later steps, so this is the earliest
+      # place the ordering can be checked — and it is worth a step of its own,
+      # because getting it wrong fails nowhere near here: the MSYS gpg then
+      # wins and dies mid-suite on a keyring path it built by joining
+      # GNUPGHOME onto its cwd.
+      - name: Check which gpg the tests will find
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $gpg = (Get-Command gpg.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "gpg.exe -> $gpg"
+          if ($gpg -notlike '*\src-tauri\gnupg\bin\gpg.exe') {
+            throw "expected the staged GnuPG first on PATH, found '$gpg'"
+          }
 
       - uses: dtolnay/rust-toolchain@stable
         with:
