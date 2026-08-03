@@ -14,7 +14,7 @@ mod common;
 
 use std::fs;
 
-use password_store_gui_lib::crypto::{Gpg, PrsGpg};
+use password_store_gui_lib::crypto::{Gnupg, Gpg};
 use password_store_gui_lib::error::Error;
 
 /// Plaintext with the shape a real entry has: password first, then fields.
@@ -31,7 +31,7 @@ fn decrypts_a_secret_written_by_the_real_gpg() {
     let secret_path = store.path().join("gmail.com.gpg");
     fixture.encrypt(PLAINTEXT, &secret_path);
 
-    let gpg = match PrsGpg::new() {
+    let gpg = match Gnupg::new() {
         Ok(gpg) => gpg,
         Err(err) => panic!("building a crypto context failed: {err}"),
     };

@@ -21,7 +21,7 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use password_store_gui_lib::crypto::{Gpg, PrsGpg};
+use password_store_gui_lib::crypto::{Gnupg, Gpg};
 use password_store_gui_lib::error::Error;
 use password_store_gui_lib::secret::Secret;
 use password_store_gui_lib::store::{gpg_id, EntryName, PrsStore, Recipients, Store};
@@ -44,7 +44,7 @@ fn writes_a_secret_the_real_gpg_can_read() {
     .unwrap();
 
     let store = PrsStore::open(store_dir.path()).unwrap();
-    let gpg = match PrsGpg::new() {
+    let gpg = match Gnupg::new() {
         Ok(gpg) => gpg,
         Err(err) => panic!("building a crypto context failed: {err}"),
     };

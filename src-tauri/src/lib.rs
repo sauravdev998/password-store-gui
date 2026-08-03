@@ -28,6 +28,24 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Where the bundled GnuPG was installed (ADR-14). The one thing
+            // resolved at startup rather than per call, and it earns the
+            // exception by not being a condition of the machine: it is a fixed
+            // property of *this installation* and cannot change while the
+            // process runs. Which `gpg` actually gets used is still decided per
+            // call in `crypto::gnupg::bin`, so installing GnuPG mid-session
+            // still takes effect on the next click.
+            //
+            // A failure here is not one worth reporting: on Linux there is no
+            // bundle by design, and everywhere else an unresolvable resource
+            // directory simply leaves the fallback out of the search. The user
+            // sees the same "no usable GnuPG" screen either way, and it is
+            // already the right screen.
+            if let Ok(resources) = app.path().resource_dir() {
+                crypto::gnupg::set_bundled_root(resources);
+            }
+
             Ok(())
         })
         // The store and the crypto backend are opened per command rather than

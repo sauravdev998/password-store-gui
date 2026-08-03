@@ -1,17 +1,18 @@
-//! Decryption: our [`Gpg`] trait and the backend behind it.
+//! Crypto: our [`Gpg`] trait and the backend behind it.
 //!
-//! Per ADR-4 the `prs-lib` implementation lives in [`prs`] and nothing from
-//! that crate may appear in a signature here, in `commands.rs`, or in a
-//! serialized payload. In particular `prs_lib::Plaintext` stops at that
-//! module's boundary; everything outside it sees [`Secret`].
+//! There is one backend, [`gnupg`], and it spawns `gpg` for everything. That is
+//! newer than it looks. ADR-6 split the trait's implementation in two —
+//! encryption ours, decryption wrapped from `prs-lib` — and ADR-4b closed the
+//! split when ADR-14 decided to bundle GnuPG: a bundled binary need not be on
+//! `PATH`, and `prs-lib` cannot be told where one is, so leaving decryption
+//! there would have left it driving a different `gpg` than everything else.
 //!
-//! The two halves are backed differently, which ADR-6 explains: decryption is
-//! wrapped from `prs-lib` in [`prs`], encryption is our own `gpg` invocation in
-//! [`gnupg`]. Reading a file has no flag-compatibility surface; writing one has
-//! nothing but, since the argument list decides who can read the result.
+//! `prs-lib` still backs the store walk in `store/prs.rs`, and ADR-4's rule
+//! holds there unchanged: none of its types may appear in a signature here, in
+//! `commands.rs`, or in a serialized payload. Everything outside that module
+//! sees [`Secret`].
 
 pub mod gnupg;
-pub mod prs;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -24,7 +25,7 @@ use crate::error::Result;
 use crate::secret::Secret;
 use crate::store::Recipients;
 
-pub use prs::PrsGpg;
+pub use gnupg::Gnupg;
 
 /// A set of long (16 hex digit) key ids.
 ///

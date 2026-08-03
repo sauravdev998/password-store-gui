@@ -115,12 +115,22 @@ const NO_KEYS = flags.has('noKeys')
 const STRANGER_KEY = flags.has('strangerKey')
 
 /**
- * `?setup=missing|empty|noGpg|fresh` — what onboarding finds (ADR-7).
+ * `?setup=missing|empty|noGpg|noGpgUnbundled|staleGpg|fresh` — what onboarding
+ * finds (ADR-7).
  *
  * Mirrors `commands::store_state` and `Core::setup_status`, not the wizard:
  * `missing` is a path with nothing at it, `empty` a directory holding neither
- * entries nor keys, `fresh` the machine Phase 7 is really about — no store *and*
- * no key on the keyring — and `noGpg` the one state the app cannot fix.
+ * entries nor keys, and `fresh` the machine Phase 7 is really about — no store
+ * *and* no key on the keyring.
+ *
+ * `noGpg`, `noGpgUnbundled` and `staleGpg` are the ways `crypto::gnupg::bin`
+ * fails since ADR-14: nothing found with a bundle present, nothing found with
+ * no bundle to search (Linux), and something found that the version probe
+ * rejected. All three reach the same screen, and the small print is the only
+ * thing telling them apart — which is exactly why it is there. None is a state
+ * the app can fix, and on Windows and macOS they mean the bundled copy is
+ * damaged rather than absent.
+ *
  * Anything else is a store to open, which is the default.
  */
 const SETUP = flags.get('setup') ?? 'ready'
@@ -599,10 +609,21 @@ const handlers: Record<string, (args: Args) => unknown> = {
   setup_status: () => ({
     storePath: '/home/you/.password-store',
     store: setupState,
+    // The three shapes `crypto::gnupg::bin` produces. `noGpg` and
+    // `noGpgUnbundled` are the search finding nothing, and differ in whether
+    // there was a bundle to search — the core only claims to have looked inside
+    // the app when a binary was actually staged there, which on Linux it never
+    // is. `staleGpg` is the search finding something that will not run or is
+    // too old: the case the version probe exists for, and the one a user with a
+    // broken Gpg4win or an ancient GnuPG actually hits.
     gpgProblem:
       SETUP === 'noGpg'
-        ? 'no usable GnuPG installation: cannot find binary path: gpg'
-        : null,
+        ? 'no usable GnuPG installation: no gpg on PATH, in the usual install locations, or bundled with this app'
+        : SETUP === 'noGpgUnbundled'
+          ? 'no usable GnuPG installation: no gpg on PATH or in the usual install locations'
+        : SETUP === 'staleGpg'
+          ? 'no usable GnuPG installation: found 2 gpg binaries, but none of them run and report GnuPG 2.0 or newer'
+          : null,
     // A machine with no key at all is what `?setup=fresh` is for; every other
     // state has the fixture's own keys on the ring.
     keys: SETUP === 'fresh' ? madeKeys : [...ownKeys(), ...madeKeys],

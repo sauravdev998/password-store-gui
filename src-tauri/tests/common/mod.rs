@@ -65,14 +65,16 @@ impl GpgFixture {
 
         let home = tempfile::tempdir().unwrap();
         harden(home.path());
-        // The one piece of process-global mutation in the suite, kept in a
-        // single place. Safe because a binary using this holds one test.
+        // Process-global mutation, kept in a single place. Safe because a
+        // binary using this holds one test.
         //
-        // It cannot be replaced by a per-command `.env()`, which is why this is
-        // the only `set_var` left: decryption goes through `prs-lib`, which
-        // builds its own `Command` for `gpg` and offers no hook to add an
-        // environment variable to it. The child inherits ours or it finds the
-        // developer's real keyring.
+        // The reason this could not be a per-command `.env()` was `prs-lib`,
+        // which built its own `Command` for `gpg` and offered no hook to add a
+        // variable to it. ADR-4b removed that constraint — every spawn is ours
+        // now — but the variable stays process-global on purpose: `gpg` spawns
+        // `gpg-agent`, which outlives the command and must find the same home,
+        // and threading an environment through every call site would buy
+        // nothing a test binary holding one test needs.
         //
         // Note for whoever bumps the crate to edition 2024: this call becomes
         // `unsafe` there, and `unsafe_code = "forbid"` in `Cargo.toml` covers

@@ -1,11 +1,15 @@
-//! Encryption: our own `gpg` invocation.
+//! The whole `Gpg` backend: our own `gpg` invocation, for every operation.
 //!
-//! Decryption is wrapped from `prs-lib` (see [`super::prs`]); encryption is not,
-//! and the asymmetry is deliberate. Decrypting has no flag-compatibility
-//! surface — `gpg --decrypt` reads what the file says it is. Encrypting is the
-//! opposite: the argument list *is* the access-control decision, so who ends up
-//! able to read the entry is decided by the flags below. Three `prs-lib`
-//! behaviours make its encrypt path unusable for us (`PLAN.md` ADR-6, F-8/9/10):
+//! Encryption and decryption arrived here by different routes, and both are
+//! worth keeping straight because they explain why the flag lists below look
+//! the way they do.
+//!
+//! **Encryption was never `prs-lib`'s** (ADR-6). Decrypting has no
+//! flag-compatibility surface — `gpg --decrypt` reads what the file says it is.
+//! Encrypting is the opposite: the argument list *is* the access-control
+//! decision, so who ends up able to read the entry is decided by the flags
+//! below. Three `prs-lib` behaviours make its encrypt path unusable for us
+//! (`PLAN.md` ADR-6, F-8/9/10):
 //!
 //! - `Recipients::from` + `find_public_keys` resolve `.gpg-id` ids by
 //!   normalized-fingerprint substring, need 8 characters, and **silently skip**
@@ -26,32 +30,398 @@
 //!
 //! No passphrase is involved: encrypting to a public key never needs one, so
 //! Invariant 3 is untouched and `--pinentry-mode` is never set here either.
+//!
+//! **Decryption stopped being `prs-lib`'s** in ADR-4b, for an unrelated reason:
+//! ADR-14 bundles a GnuPG, and `prs-lib` cannot be told which binary to run.
+//! Its `find_gpg_bin` is a private `which::which("gpg")` with no environment
+//! override, so a bundled `gpg` off `PATH` is unreachable through it — and the
+//! one workaround, mutating `PATH` with `std::env::set_var`, is process-global
+//! and `unsafe` under edition 2024, which this crate forbids. Owning decryption
+//! makes [`bin`] the single place a `gpg` path is chosen, which is what
+//! `resolve` needs to be true. The three `prs-lib` behaviours the old
+//! `crypto/prs.rs` existed to route around — `gpg_tty` forcing loopback
+//! pinentry (F-2), `verbose` printing raw `gpg` stdout that can hold plaintext
+//! (F-3), and `can_decrypt` inspecting a decrypted secret as a `&str` without
+//! zeroizing it (F-5) — are now unreachable rather than merely avoided.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
-use crate::crypto::{KeyIds, KeyInfo};
+use crate::crypto::{Gpg, KeyIds, KeyInfo};
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 use crate::store::Recipients;
 
-/// The binary we look for, matching what `prs-lib`'s context resolves.
+/// The binary we look for.
 #[cfg(not(windows))]
 const BIN_NAME: &str = "gpg";
 #[cfg(windows)]
 const BIN_NAME: &str = "gpg.exe";
 
-/// Locate the user's `gpg`.
+/// The oldest GnuPG we will drive, as `(major, minor)`.
 ///
-/// Resolved with `which` against the same name `prs-lib`'s `find_gpg_bin` uses,
-/// so the binary that encrypts an entry is the one that will decrypt it — on a
-/// machine with more than one GnuPG this is the difference between a store that
-/// round-trips and one that does not.
+/// Inherited from `prs-lib`'s `test_gpg_compat`, which ADR-4b removed along with
+/// the rest of its context handling. 2.0 is where `gpg-agent` became mandatory
+/// rather than optional, which is to say where Invariant 3 became something the
+/// binary can actually honour.
+const MINIMUM_VERSION: (u32, u32) = (2, 0);
+
+/// Where a bundled GnuPG lives, once the app has told us (ADR-14).
+///
+/// A `OnceLock` rather than a setting because it is neither: the bundle
+/// directory is a fixed property of the installation and cannot change while the
+/// process runs, so resolving it once at startup is not the thing `CLAUDE.md`
+/// warns against. Everything that *can* change — whether a system `gpg` exists,
+/// and which one — is still resolved per call in [`bin`].
+///
+/// Left unset under `cargo test` and in `pnpm tauri dev`, where there is no
+/// bundle; resolution then falls through to `PATH` exactly as it did before.
+static BUNDLED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record where the bundled GnuPG tree was installed.
+///
+/// Called once from the Tauri `setup` hook. A second call is ignored rather than
+/// panicking: there is only one right answer and the first caller had it.
+pub fn set_bundled_root(root: PathBuf) {
+    let _ = BUNDLED_ROOT.set(root);
+}
+
+/// Locate a usable `gpg` (ADR-14).
+///
+/// **This is the only place in the crate that decides which binary to run.**
+/// Before ADR-4b it was not: `prs-lib` resolved its own for the decrypt path,
+/// and the two agreeing was a property maintained by hand — on a machine with
+/// more than one GnuPG, the difference between a store that round-trips and one
+/// that does not. Now the encrypt path, the decrypt path and every key query
+/// come through here.
+///
+/// The order is the system's first and ours last, which is ADR-14's central
+/// choice: a user with a working GnuPG keeps their agent, pinentry, keyring and
+/// smartcard exactly as they had them, and the bundled copy only runs when
+/// nothing else answered. That is also what keeps two `gpg-agent` versions from
+/// meeting over one `~/.gnupg`.
+///
+/// Every candidate is *probed*, not merely found. That restores the version gate
+/// ADR-4b cost us, and it is the same mechanism that steps over a binary which
+/// resolves but does not work — Git for Windows' MSYS2 `gpg.exe`, which reads
+/// `GNUPGHOME` as an MSYS path, being the case CI already documents.
+///
+/// Resolved per call, deliberately: installing GnuPG while the app is open takes
+/// effect on the next click rather than the next launch.
 pub fn bin() -> Result<PathBuf> {
-    which::which(BIN_NAME).map_err(|err| Error::GpgUnavailable {
-        reason: err.to_string(),
+    let bundled = bundled_bin();
+    let mut rejected = 0usize;
+
+    for candidate in candidates_with(bundled.clone()) {
+        match probe(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(()) => rejected += 1,
+        }
+    }
+
+    // Both halves of this are `gpg` paths and version numbers, which are not
+    // store data — Invariant 5 is untouched. It says which of the two failures
+    // happened, because the fixes are opposite: one is "install GnuPG", the
+    // other is "the GnuPG you have is too old or does not run".
+    Err(Error::GpgUnavailable {
+        reason: if rejected == 0 {
+            // Only claims the bundle was searched when there was one to search.
+            // On Linux there never is (ADR-14), and telling a user we looked
+            // inside the app for something that was never put there sends them
+            // to inspect the wrong thing.
+            format!(
+                "no {BIN_NAME} on PATH{}",
+                if bundled.is_some() {
+                    ", in the usual install locations, or bundled with this app"
+                } else {
+                    " or in the usual install locations"
+                }
+            )
+        } else {
+            format!(
+                "found {rejected} {BIN_NAME} {}, but {} run and report GnuPG \
+                 {}.{} or newer",
+                if rejected == 1 { "binary" } else { "binaries" },
+                if rejected == 1 {
+                    "it does not"
+                } else {
+                    "none of them"
+                },
+                MINIMUM_VERSION.0,
+                MINIMUM_VERSION.1,
+            )
+        },
     })
+}
+
+/// The bundled `gpg`, if this installation actually carries one.
+///
+/// `None` covers three cases that are all the same to a caller: Linux, which is
+/// not bundled for; a development build, where nothing was staged; and a damaged
+/// bundle whose binary is missing. Checking for the file rather than trusting
+/// [`BUNDLED_ROOT`] is what keeps [`bin`]'s error from claiming we searched a
+/// bundle that was never there — the resource directory resolves on every
+/// platform, bundle or no bundle.
+///
+/// `bin/` beside `share/` is the layout GnuPG's own Windows distribution unpacks
+/// to and the one `scripts/fetch-gnupg.sh` reproduces; GnuPG locates its helpers
+/// relative to the running executable, so the structure is load-bearing rather
+/// than cosmetic.
+fn bundled_bin() -> Option<PathBuf> {
+    let candidate = BUNDLED_ROOT.get()?.join("gnupg").join("bin").join(BIN_NAME);
+    candidate.is_file().then_some(candidate)
+}
+
+/// The candidate list, with the bundled binary passed in rather than read.
+///
+/// A parameter so the ordering — the whole of ADR-14's "system first" — can be
+/// asserted in a test. Reading the `OnceLock` here instead would make that test
+/// set a process-global that every other test in the binary would then see.
+///
+/// Ordinary duplicates are expected: the `PATH` hit is usually one of the known
+/// locations too. They cost nothing but a repeated `--version`, and only when
+/// the first candidate was already rejected.
+fn candidates_with(bundled: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+
+    // The user's own `PATH`, first and unconditionally.
+    if let Ok(path) = which::which(BIN_NAME) {
+        found.push(path);
+    }
+
+    found.extend(install_locations());
+
+    // Ours, last.
+    found.extend(bundled);
+
+    found
+}
+
+/// Where each platform's GnuPG installers actually put the binary.
+///
+/// A `PATH` lookup misses these more often than not: Gpg4win does not add itself
+/// to `PATH` for GUI processes, and a macOS app launched from Finder inherits a
+/// `PATH` with neither Homebrew prefix on it.
+fn install_locations() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        // Gpg4win installs 32-bit by default, so the x86 tree is the likelier
+        // of the two even on a 64-bit machine.
+        ["ProgramFiles(x86)", "ProgramFiles"]
+            .iter()
+            .filter_map(|var| std::env::var_os(var))
+            .map(|prefix| {
+                PathBuf::from(prefix)
+                    .join("GnuPG")
+                    .join("bin")
+                    .join(BIN_NAME)
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        [
+            // GPG Suite, which is what gpgtools.org installs.
+            "/usr/local/MacGPG2/bin/gpg",
+            // Homebrew on Apple silicon, then on Intel, then MacPorts.
+            "/opt/homebrew/bin/gpg",
+            "/usr/local/bin/gpg",
+            "/opt/local/bin/gpg",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        ["/usr/bin/gpg", "/usr/local/bin/gpg"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+/// Check that `candidate` runs and is a GnuPG new enough to drive.
+///
+/// The failure carries nothing: [`bin`] only counts these, and the one thing
+/// worth saying — that a binary was found and rejected — is a count. Running
+/// `--version` is also the cheapest way to find out that a path exists and is
+/// not usable, which no amount of inspecting the filesystem establishes.
+fn probe(candidate: &Path) -> std::result::Result<(), ()> {
+    if VERIFIED.lock().is_ok_and(|seen| seen.contains(candidate)) {
+        return Ok(());
+    }
+
+    let output = Command::new(candidate)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| ())?;
+
+    if !output.status.success() {
+        return Err(());
+    }
+
+    // Lossy is right here: this is `gpg`'s own banner, never store content, and
+    // a non-UTF-8 byte in it should not stop us reading the version out of it.
+    let banner = String::from_utf8_lossy(&output.stdout);
+    match banner.lines().next().and_then(parse_version) {
+        Some(version) if version >= MINIMUM_VERSION => {
+            if let Ok(mut seen) = VERIFIED.lock() {
+                seen.insert(candidate.to_path_buf());
+            }
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// Paths already known to be a usable GnuPG.
+///
+/// [`bin`] runs on every command and every key query — `plan_recipients` calls
+/// it once per entry in a subtree — and without this each of those would spawn
+/// `gpg --version` first. `prs-lib` cached the equivalent check in a
+/// thread-local context; losing that with ADR-4b should not cost a subprocess
+/// per operation.
+///
+/// **Successes only**, which is what makes it safe against the property ADR-14
+/// keeps: a path that failed is re-probed every time, so installing GnuPG — or
+/// repairing one — while the app is open still takes effect on the next click.
+/// The narrow thing this gets wrong is a working `gpg` replaced mid-session by a
+/// broken one at the same path, which is not a state worth a subprocess per
+/// call to detect.
+///
+/// It holds `gpg` paths, which are not store data.
+static VERIFIED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Pull `(major, minor)` out of `gpg --version`'s first line.
+///
+/// Deliberately looser than `prs-lib`'s `test_gpg_compat`, which stripped the
+/// literal prefix `"gpg (GnuPG) "` and so rejected GPG Suite outright — it
+/// announces itself as `gpg (GnuPG/MacGPG2) 2.2.41`. ADR-14 puts GPG Suite in
+/// the list of installations we look for, which would be pointless if the probe
+/// then turned it away.
+fn parse_version(line: &str) -> Option<(u32, u32)> {
+    let line = line.trim();
+    if !line.starts_with("gpg ") {
+        return None;
+    }
+
+    // The version is the last field on the line in every spelling of the banner
+    // seen so far; the parenthesized part in the middle is what varies.
+    let mut parts = line.rsplit(' ').next()?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor))
+}
+
+/// The argument list for a decryption, pinned so a test can read it.
+///
+/// Short, because decryption has no access-control surface to get wrong — the
+/// ciphertext names its own recipients and algorithms. What matters is what is
+/// *absent*: no `--pinentry-mode`, no `--passphrase` in any spelling. The
+/// passphrase is `gpg-agent`'s (Invariant 3), and
+/// [`tests::the_decrypt_arguments_never_handle_a_passphrase`] keeps it that way.
+///
+/// `--batch` is here for ADR-7's reason, which applies to every spawn in a
+/// windowed process and not just to key generation: it governs `gpg`'s own
+/// prompts, which have no terminal to appear on, and it does **not** suppress
+/// the agent's pinentry — which decryption needs. `pass` passes it too.
+/// `prs-lib` did not, which is a difference in our favour: without it `gpg` can
+/// try to ask a question no GUI can answer.
+///
+/// Unlike the encrypt path there is no `--utf8-strings`: that governs how `gpg`
+/// reads string *arguments*, and this invocation has none. The plaintext comes
+/// back over a pipe as bytes and is never decoded here.
+const DECRYPT_ARGV: [&str; 3] = ["--batch", "--quiet", "--decrypt"];
+
+/// Decrypt `ciphertext` in memory.
+///
+/// Nothing is written to disk on the way: the ciphertext goes in over a pipe and
+/// the plaintext comes back over one (Invariant 1), landing directly in a
+/// [`Secret`] so it is zeroized when dropped.
+pub fn decrypt(bin: &Path, ciphertext: &[u8]) -> Result<Secret> {
+    let mut child = Command::new(bin)
+        .args(DECRYPT_ARGV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Dropped rather than captured, and this is the sharper case of the two:
+        // a *partial* decrypt failure can leave plaintext in what `gpg` prints
+        // (ADR-4a F-3, which is exactly the bug `prs-lib`'s `verbose` flag has).
+        // There is nothing here worth the risk of holding it.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| Error::io(bin, err))?;
+
+    let Some(mut stdin) = child.stdin.take() else {
+        // Only reachable if the pipe above was not set up; killing the child
+        // rather than leaking it, since it would otherwise wait on stdin.
+        let _ = child.kill();
+        return Err(Error::DecryptBlob);
+    };
+
+    // The same shape as `encrypt`, with the roles reversed, and for the same
+    // reason (F-10): feeding stdin to completion before reading stdout deadlocks
+    // once the unread output fills the pipe buffer. Here it is the *plaintext*
+    // that fills it, so the deadlock is a hang with a secret in a kernel buffer.
+    let (fed, output) = std::thread::scope(|scope| {
+        let feeder = scope.spawn(move || {
+            let result = stdin.write_all(ciphertext);
+            // Explicit, though the drop at the end of this closure would do it:
+            // `gpg` waits for EOF on stdin before it finishes.
+            drop(stdin);
+            result
+        });
+        let output = child.wait_with_output();
+        // A panic in the feeder becomes an error rather than propagating, as in
+        // `encrypt`: unwinding past a secret buffer is what `panic = "abort"`
+        // exists to prevent, and an `Err` says the same thing.
+        let fed = feeder
+            .join()
+            .unwrap_or(Err(std::io::ErrorKind::Other.into()));
+        (fed, output)
+    });
+
+    let output = output.map_err(|err| Error::io(bin, err))?;
+
+    // Wrapped **before** anything is checked. On a failed decrypt `gpg` can
+    // still have written part of the plaintext to stdout, so the buffer is put
+    // in a zeroizing container on every path rather than only the happy one.
+    let plaintext = Secret::new(output.stdout);
+
+    fed.map_err(|_| Error::DecryptBlob)?;
+    if !output.status.success() {
+        // The exit status is dropped on purpose, as ADR-4a decided for this
+        // path: it is the one place where plaintext exists in the process, so
+        // the error leaving it is secret-free by construction rather than by
+        // audit. What the user needs to know — a bad passphrase, a cancelled
+        // pinentry, a missing secret key — `gpg` has already told them through
+        // its own prompt.
+        return Err(Error::DecryptBlob);
+    }
+
+    Ok(plaintext)
+}
+
+/// Decrypt the file at `path`.
+///
+/// The ciphertext is read here rather than handed to `gpg` as an argument so
+/// that a read failure can name the file. `prs-lib`'s `decrypt_file` swallowed
+/// the path, which is why this indirection existed before ADR-4b too.
+pub fn decrypt_file(bin: &Path, path: &Path) -> Result<Secret> {
+    let ciphertext = fs::read(path).map_err(|source| Error::io(path, source))?;
+    // The pathless failure becomes one that names the file. Nothing else is
+    // carried across — the discarded error held only an exit status, and this is
+    // the path where plaintext exists in the process.
+    decrypt(bin, &ciphertext).map_err(|_| Error::Decrypt { path: path.into() })
 }
 
 /// Encrypt `plaintext` to `recipients` and write the ciphertext to `path`.
@@ -678,6 +1048,63 @@ fn parse_secret_keys(listing: &str) -> Vec<KeyInfo> {
         .collect()
 }
 
+/// The [`Gpg`] backend: GnuPG, driven as a subprocess.
+///
+/// One implementation for every operation as of ADR-4b. It was two — `PrsGpg`
+/// held decryption and delegated the rest here — and the split is gone because
+/// bundling needs a single answer to "which binary?", which two resolvers
+/// cannot give.
+pub struct Gnupg {
+    /// Zero-sized; the existence of a value is the proof that [`Gnupg::new`]
+    /// found a usable GnuPG.
+    _validated: (),
+}
+
+impl Gnupg {
+    /// Check that a usable `gpg` is installed.
+    ///
+    /// Called when the backend is built, so a missing or too-old GnuPG is one
+    /// clear error at that point rather than a surprise on the first reveal.
+    /// Every method resolves again for itself, which is not a redundancy: this
+    /// is a gate, and those are the per-call resolution ADR-14 keeps so that
+    /// installing GnuPG mid-session works.
+    pub fn new() -> Result<Self> {
+        bin()?;
+        Ok(Self { _validated: () })
+    }
+}
+
+impl Gpg for Gnupg {
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Secret> {
+        decrypt(&bin()?, ciphertext)
+    }
+
+    fn decrypt_file(&self, path: &Path) -> Result<Secret> {
+        decrypt_file(&bin()?, path)
+    }
+
+    fn encrypt_file(&self, path: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<()> {
+        encrypt_to_file(path, recipients, plaintext)
+    }
+
+    fn describe_key(&self, id: &str) -> Result<KeyInfo> {
+        let bin = bin()?;
+        describe_key(&bin, id, &secret_keys(&bin)?)
+    }
+
+    fn encrypted_to(&self, path: &Path) -> Result<KeyIds> {
+        encrypted_to(&bin()?, path)
+    }
+
+    fn usable_keys(&self) -> Result<Vec<KeyInfo>> {
+        usable_keys(&bin()?)
+    }
+
+    fn generate_key(&self, name: &str, email: &str) -> Result<KeyInfo> {
+        generate_key(&bin()?, name, email)
+    }
+}
+
 #[cfg(test)]
 // Test code handles fixtures, never real secrets. The round trip against a real
 // `gpg` lives in `tests/gpg_roundtrip.rs`, which needs an isolated `GNUPGHOME`.
@@ -878,6 +1305,126 @@ ssb:u:255:18:7298DC4C15400BE4:1785695396::::::e:::+::cv25519::
              /dev/tty before gpg-agent is ever reached, so the pinentry never \
              appears at all"
         );
+    }
+
+    /// The same guard as the generation one, on the path ADR-4b took over from
+    /// `prs-lib`. It matters more here, not less: `prs-lib`'s `gpg_tty` config
+    /// set `--pinentry-mode loopback` on *this* invocation (F-2), so the flag
+    /// this asserts absent is one the code we replaced could actually reach.
+    #[test]
+    fn the_decrypt_arguments_never_handle_a_passphrase() {
+        let argv = DECRYPT_ARGV;
+
+        for forbidden in ["--passphrase", "--passphrase-fd", "--passphrase-file"] {
+            assert!(
+                !argv.iter().any(|arg| arg.starts_with(forbidden)),
+                "{forbidden} would put the entry's passphrase in our process \
+                 (Invariant 3)"
+            );
+        }
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("--pinentry-mode")),
+            "--pinentry-mode loopback routes the prompt through us (Invariant 3, F-2)"
+        );
+        assert!(
+            argv.contains(&"--batch"),
+            "--batch keeps gpg's own prompts off a terminal this process does \
+             not have; it does not suppress the agent's pinentry, which \
+             decryption needs (ADR-7)"
+        );
+    }
+
+    /// ADR-14's central choice, and the one worth a test rather than a comment:
+    /// a machine that already has GnuPG keeps using it, and ours is the last
+    /// resort. Getting this backwards would stand a second `gpg-agent` version
+    /// up against the user's own `~/.gnupg`.
+    #[test]
+    fn the_bundled_gpg_is_the_last_candidate_tried() {
+        let bundled = PathBuf::from("/opt/example-app/resources/gnupg/bin").join(BIN_NAME);
+        let candidates = candidates_with(Some(bundled.clone()));
+
+        assert_eq!(
+            candidates.last(),
+            Some(&bundled),
+            "the bundled gpg must sort last, after PATH and every known install \
+             location (ADR-14)"
+        );
+        assert_eq!(
+            candidates.iter().filter(|c| **c == bundled).count(),
+            1,
+            "the bundled tree should contribute exactly one candidate"
+        );
+    }
+
+    /// The other half: with no bundle — `cargo test`, `pnpm tauri dev`, and
+    /// Linux, which ADR-14 does not bundle for — resolution is what it always
+    /// was, and nothing points at a directory that does not exist.
+    #[test]
+    fn without_a_bundle_only_the_system_is_searched() {
+        let candidates = candidates_with(None);
+
+        assert!(
+            !candidates.is_empty(),
+            "the known install locations are unconditional, so the list is \
+             never empty even where gpg is absent"
+        );
+    }
+
+    /// Looser than `prs-lib`'s `test_gpg_compat`, on purpose: it stripped the
+    /// literal `"gpg (GnuPG) "` and so turned GPG Suite away, which ADR-14
+    /// explicitly goes looking for.
+    #[test]
+    fn the_version_probe_reads_every_spelling_of_the_banner() {
+        assert_eq!(parse_version("gpg (GnuPG) 2.4.5"), Some((2, 4)));
+        assert_eq!(
+            parse_version("gpg (GnuPG/MacGPG2) 2.2.41"),
+            Some((2, 2)),
+            "GPG Suite announces itself this way, and prs-lib rejected it"
+        );
+        assert_eq!(parse_version("  gpg (GnuPG) 2.5.21  "), Some((2, 5)));
+
+        assert_eq!(parse_version("gpg (GnuPG) 1.4.23"), Some((1, 4)));
+        assert!(
+            (1, 4) < MINIMUM_VERSION,
+            "GnuPG 1.x parses, and is then rejected by the floor rather than by \
+             the parser — it predates a mandatory gpg-agent, which is what \
+             Invariant 3 rests on"
+        );
+    }
+
+    /// A probe that accepted anything runnable would defeat the point: the
+    /// binary this steps over is a real one (Git for Windows' MSYS2 `gpg.exe`),
+    /// not a hypothetical.
+    #[test]
+    fn the_version_probe_rejects_what_is_not_a_gnupg_banner() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("bash: gpg: command not found"), None);
+        assert_eq!(
+            parse_version("gpgconf (GnuPG) 2.4.5"),
+            None,
+            "another GnuPG tool is not the one we drive"
+        );
+        assert_eq!(parse_version("gpg (GnuPG) unknown"), None);
+    }
+
+    /// A missing file must fail before `gpg` is ever spawned, so the error is
+    /// ours and names the path. Carried over from `crypto/prs.rs`, which ADR-4b
+    /// deleted: `prs-lib`'s own `decrypt_file` swallowed the path, and this is
+    /// the test that kept us from inheriting that.
+    #[test]
+    fn a_missing_ciphertext_file_is_an_io_error_with_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.gpg");
+
+        // The read happens before the binary is touched, so this test needs no
+        // `gpg` on the machine and the path below is never executed.
+        match decrypt_file(Path::new("/nonexistent/gpg"), &missing) {
+            Err(Error::Io { path, .. }) => assert_eq!(path, missing),
+            // Matched arm by arm rather than debug-printing the `Result`:
+            // `Secret` has no `Debug`, which is the point of it having none.
+            Err(other) => panic!("expected an Io error, got {other:?}"),
+            Ok(_) => panic!("expected an Io error for a missing file"),
+        }
     }
 
     /// ADR-7: an expired key still decrypts but can no longer be encrypted to,

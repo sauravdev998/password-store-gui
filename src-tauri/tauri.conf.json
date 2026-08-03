@@ -35,6 +35,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "gnupg/": "gnupg/"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["gnupg"]
+      },
+      "rpm": {
+        "depends": ["gnupg2"]
+      }
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }
