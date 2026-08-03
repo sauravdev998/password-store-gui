@@ -103,6 +103,17 @@ impl Gpg for PrsGpg {
     fn encrypted_to(&self, path: &Path) -> Result<KeyIds> {
         gnupg::encrypted_to(&gnupg::bin()?, path)
     }
+
+    /// Also [`gnupg`], and for onboarding's sake it must be the *same* binary:
+    /// the key offered here is the one about to be written into a `.gpg-id` and
+    /// resolved again by the encrypt path (ADR-7).
+    fn usable_keys(&self) -> Result<Vec<KeyInfo>> {
+        gnupg::usable_keys(&gnupg::bin()?)
+    }
+
+    fn generate_key(&self, name: &str, email: &str) -> Result<KeyInfo> {
+        gnupg::generate_key(&gnupg::bin()?, name, email)
+    }
 }
 
 /// Crypto configuration for every call we make.

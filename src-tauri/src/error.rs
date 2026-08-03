@@ -189,6 +189,48 @@ pub enum Error {
     #[error("{id} has no usable encryption key: it may have expired or been revoked")]
     UnusableKey { id: String },
 
+    /// The name typed for a new key could not go into a user id.
+    ///
+    /// Neither this nor [`Error::InvalidKeyEmail`] echoes what was typed, unlike
+    /// [`Error::InvalidRecipientId`]: the text is still in the box in front of
+    /// the user, and what they need is which of the two fields is wrong and
+    /// why — which `gpg`'s own bare `Invalid user ID` does not say.
+    #[error(
+        "that name cannot go on a key: it must not be empty, start with a dash, or contain < > ( )"
+    )]
+    InvalidKeyName,
+
+    #[error("that does not look like an email address")]
+    InvalidKeyEmail,
+
+    /// The pinentry asking for the new key's passphrase was dismissed.
+    ///
+    /// A choice rather than a fault, and `gpg` leaves nothing behind when it
+    /// happens (ADR-7), so the wizard can simply offer the button again. Told
+    /// apart from [`Error::KeyGeneration`] by a numeric status code rather than
+    /// by matching a message that changes with the locale.
+    #[error("no key was created: the passphrase prompt was dismissed")]
+    KeyGenerationCancelled,
+
+    /// Key generation failed for any other reason.
+    ///
+    /// Carries none of `gpg`'s output. There is no plaintext of the store in
+    /// this process at the time, but the operation's whole subject is a
+    /// passphrase being chosen, so the error leaving it is secret-free by
+    /// construction rather than by audit — the same standard [`Error::Encrypt`]
+    /// is held to.
+    #[error("GnuPG could not create the key")]
+    KeyGeneration,
+
+    /// Onboarding was asked to create a store where one already exists.
+    ///
+    /// Not reachable from the wizard, which only appears when there is no store
+    /// (ADR-7) — but the command is callable regardless, and refusing here is
+    /// what stops a second `.gpg-id` write from re-pointing a populated store at
+    /// one key without the re-encryption `set_recipients` would have done.
+    #[error("there is already a password store at {path}")]
+    StoreExists { path: PathBuf },
+
     /// A file under the store could not be read as OpenPGP ciphertext.
     ///
     /// Deliberately not [`Error::Decrypt`]: nothing was decrypted and no key was

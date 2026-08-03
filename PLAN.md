@@ -44,7 +44,7 @@ Phase 7).
 - Ship a single small binary per platform.
 - Never compromise on secret hygiene (see Security Invariants).
 - Take a user from **nothing — no key, no store — to a working store without a
-  terminal** (Phase 7, blocked on ADR-7).
+  terminal** (Phase 7 — designed by ADR-7, not yet built).
 
 ### Non-goals (for v1)
 - Cloud sync beyond git.
@@ -560,6 +560,115 @@ Record decisions here as they're made or changed.
     verbatim, because that is the string the user needs to act outside the app,
     which is that decision's own test.
 
+- **ADR-7 — onboarding: `--batch` is what raises the pinentry, not what
+  suppresses it (2026-08-03).** Resolves Open Decision 5 and unblocks Phase 7.
+  Onboarding is three states the app can find a machine in, and they are not one
+  flow: **no usable `gpg`**, **no key**, **no store**. Each gets its own screen
+  and its own remedy, and only the middle one turns on a decision that could
+  violate §4.
+
+  **The finding that decides the invocation, probed rather than recalled
+  (GnuPG 2.4.9, 2026-08-03).** The intuitive reading — *avoid `--batch` so the
+  user gets prompted* — is exactly backwards. Both halves were checked by
+  running a real `gpg` against a fake pinentry in a throwaway `GNUPGHOME`:
+
+  - `gpg --batch --quick-generate-key "<uid>" default default never` **raises
+    the pinentry.** `--batch` governs `gpg`'s own prompts; the new key's
+    passphrase is `gpg-agent`'s business and the agent asks regardless.
+    Cancelling it exits 2 with `agent_genkey failed: Operation cancelled` and
+    **leaves no key behind**, so a refused prompt is a clean no-op rather than
+    a half-made key somebody has to repair.
+  - Without `--batch` the same command dies with `cannot open '/dev/tty'`
+    *before the agent is ever reached*: `gpg` wants to print its "About to
+    create a key … Continue? (y/N)" confirmation, and a process spawned from a
+    GUI has no terminal to print it on.
+
+  So `--batch` is **mandatory** here, and Invariant 3 is satisfied by it rather
+  than despite it. `--passphrase`, `--pinentry-mode loopback` and
+  `%no-protection` stay forbidden, no form in the app has a passphrase field,
+  and a pinentry window appearing over the wizard is the design working rather
+  than a rough edge to smooth.
+
+  **The rest of the invocation:**
+  - *`default` algorithm and usage.* Agreeing with the user's own `gpg` rather
+    than pinning a choice that ages. On 2.4.9 that is an ed25519 primary plus a
+    cv25519 encryption subkey — the `sub …:e:` record `parse_subkeys` looks for
+    and the only kind a ciphertext ever names. Verified by encrypting to the
+    generated key with the exact flag set `crypto/gnupg.rs` uses, then reading
+    the recipient back off `--list-packets`.
+  - *`never` expiry, deliberately against `gpg`'s own habit.* An expired key
+    still **decrypts**; what it stops is being **encrypted to**. An expiry date
+    therefore hands this user a store they can read and cannot write, and the
+    fix — `gpg --edit-key … expire` — is a terminal session, which is the one
+    thing the primary user does not have. §4.1 principle 5 says name the fix;
+    better here is not to build the trap.
+  - The user id is `Name <email>`, both free text, and `gpg` owns validating
+    them — the same division ADR-6 draws for recipient ids.
+
+  **An existing key is offered before a new one is made.** `secret_keys` already
+  reads exactly the right thing, and a machine that has a usable secret key
+  needs no generation at all. Making a second key for someone who already has
+  one is how a store ends up encrypted to a key they never backed up and use
+  nowhere else.
+
+  **`pass init` equivalence is `gpg_id::write`, and nothing more.** Creating the
+  store is an atomic write of `.gpg-id` at the root, which makes the directory
+  on the way (`atomic::write` already does `create_dir_all`). No `.gpg-id.sig`:
+  `pass` writes one only under `PASSWORD_STORE_SIGNING_KEY`, and a signature the
+  CLI is not configured to check is a file every other client ignores.
+  - *The trigger boundary.* Onboarding is for a store root that **does not
+    exist**, or that exists holding **no entries and no `.gpg-id`**. A directory
+    with entries but no `.gpg-id` is not an uninitialized store, it is a store
+    whose keys are unset — `folder_keys` already reports it that way and the
+    keys panel already fixes it (ADR-13). Two screens for one state would be two
+    answers.
+
+  **Git is offered, and defaulted by whether git knows who the user is.**
+  `Error::GitNoIdentity` exists because a machine that has never used git is the
+  ordinary first-run state, and a repository created for such a user turns
+  **every** later save into the failed-commit warning `App` deliberately does
+  not let fade. So the checkbox is on when `user.name` and `user.email` resolve
+  and off when they do not, saying which case it is either way — rather than a
+  default that is right for the developer and wrong for the audience. `git2`
+  does the init and the first commit; both are local, so ADR-9's line stays
+  where it is.
+
+  **Deliberately not here: key backup.** A user who generates a key inside this
+  app and then loses the machine loses every password in the store, and no
+  amount of git history helps — the history is ciphertext for the key that went
+  with it. The wizard says so, in those words, at the moment the key is made.
+  Offering to *export* the secret key is a different thing: it writes key
+  material to disk from our process, which Invariant 1 does not forbid (an
+  exported key is passphrase-protected, not plaintext) but which is a new class
+  of file this app writes, and it needs its own decision rather than a checkbox
+  on a wizard.
+
+  **Consequences:**
+  - Three commands, and **none of them goes through `(self.store)()`**. That
+    factory fails when the store directory does not exist, which is precisely
+    the state this phase is about; they read `settings.store_root()` directly.
+  - `Gpg` gains `generate_key` and `usable_keys`, beside the two non-decrypting
+    queries ADR-13 added. Key generation belongs on the trait for ADR-3's
+    reason: it is a backend capability, and a later `rpgp` backend would have to
+    answer for it too — at which point Invariant 3 is the whole question again.
+  - **CI cannot test the generation path, and nothing here pretends otherwise.**
+    A real generation raises a pinentry no unattended runner can answer, and the
+    only two ways around that are the flags this ADR forbids. So the invocation
+    is pinned by a unit test over the **argument list** — the one place
+    `--passphrase`, `--pinentry-mode` and `%no-protection` are asserted absent —
+    plus an `#[ignore]`d test that generates against a real agent and is run by
+    hand. Same shape, and the same admitted gap, as the clipboard's `#[ignore]`d
+    round trip in Phase 2.
+  - The store-creation half has none of that problem and is tested normally,
+    against the existing fixture key.
+  - The wizard is full-window rather than a dialog, unlike every other screen in
+    the app. A dialog is modal *over* something, and here there is nothing
+    behind it: no tree, no entry, no store.
+  - A machine with no `gpg` gets a screen and no wizard, because there is
+    nothing the app can do for it. It names the platform's own package —
+    Gpg4win, `pinentry-mac`, `pinentry-gtk`/`-qt` — which is §4.1 principle 5's
+    sharpest test: "install Gpg4win" beats "gpg not found".
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -639,7 +748,7 @@ password-store-gui/
 │   ├── main.tsx
 │   ├── App.tsx
 │   ├── components/           # Tree, EntryDetail, SettingsDialog, SyncPanel,
-│   │                         #   KeysDialog (ADR-13), ...
+│   │                         #   KeysDialog (ADR-13), Onboarding (ADR-7), ...
 │   ├── hooks/                # useNow, useAutoLock (Invariant 7, ADR-12)
 │   └── lib/                  # typed wrappers over Tauri commands; settings.ts
 └── src-tauri/
@@ -1060,7 +1169,10 @@ untouched, and two of them are blocked on things this repo does not have.
   reversal, not on effort:** with no `gpg-agent` behind it, a pure-Rust backend
   moves passphrase handling into our process, which Invariant 3 forbids and
   `CLAUDE.md` forbids adding the dependency for. That argument has to be made
-  and recorded before any code, exactly as ADR-7 gates Phase 7.
+  and recorded before any code, exactly as ADR-7 had to be written before
+  Phase 7 — and ADR-7 makes the bar concrete rather than abstract, since it
+  ends with key *generation* on the `Gpg` trait, which a pure-Rust backend
+  would have to answer for with no agent behind it.
 - ☐ Smartcard / YubiKey **verification** pass. Note the *design* constraint is
   already binding — §4.1 principle 1 exists because a hardware key is a
   confirmed operating condition, not a hypothetical, and ADR-13's lockout check
@@ -1099,29 +1211,62 @@ untouched, and two of them are blocked on things this repo does not have.
       now held back until they try to save, and the key's own row carries the
       calm version of the same fact.
 
-### Phase 7 — Onboarding: nothing → working store — Status: ☐ (blocked on ADR-7)
+### Phase 7 — Onboarding: nothing → working store — Status: ☑
 
-**Committed by `PRODUCT.md`, unscoped, and deliberately unsequenced.** Its
-number is not its priority: it serves the *primary* user (§1), so it plausibly
-outranks Phases 4–6. It is last in this list only because nothing about it is
-decided yet, and the numbering above is load-bearing in code comments and
-cross-references.
+**Committed by `PRODUCT.md`, and deliberately unsequenced.** Its number is not
+its priority: it serves the *primary* user (§1), so it plausibly outranks
+Phases 4–6. It is last in this list because the numbering above is load-bearing
+in code comments and cross-references, not because it matters least.
 
-- A user with **no GPG key and no store** reaches a working store without a
+- ☑ A user with **no GPG key and no store** reaches a working store without a
   terminal: key generation, then the equivalent of `pass init`.
-- **The Invariant 3 constraint is the whole design problem.** This does not
-  conflict with "we never handle passphrases" *only so long as* key generation
-  is driven through `gpg` with the platform pinentry prompting for the new key's
-  passphrase — **never `--passphrase`, never `--pinentry-mode loopback`**, no
-  exceptions for "just onboarding". A pinentry appearing as a separate OS-level
-  window mid-wizard is expected behaviour, not a bug to design around.
-- Detecting and explaining a missing/broken `gpg` is part of this, and is the
-  sharpest test of §4.1 principle 5: "install Gpg4win" beats "gpg not found".
-- **Needs ADR-7 before any code.** Open questions at minimum: which `gpg`
-  invocations (`--full-generate-key` batch vs. `--quick-generate-key`), what we
-  do on a machine with an existing key we did not create, whether `pass init`
-  equivalence means writing `.gpg-id` ourselves (it does — `store/gpg_id.rs`
-  already owns that format) and whether onboarding may create a git repo.
+- ☑ **The Invariant 3 constraint is the whole design problem, and ADR-7's probe
+  is what resolved it.** Key generation is
+  `gpg --batch --quick-generate-key "<uid>" default default never`
+  (`crypto/gnupg.rs`): `--batch` silences `gpg`'s own TTY confirmation while
+  leaving the new key's passphrase to `gpg-agent` and the platform pinentry, and
+  a cancelled prompt leaves no key behind. **Never `--passphrase`, never
+  `--pinentry-mode loopback`, never `%no-protection`** — a unit test over the
+  argument list is what keeps it that way. A pinentry appearing as a separate
+  OS-level window mid-wizard is expected behaviour, and the wizard says so
+  before the button is pressed.
+- ☑ An existing usable secret key is offered before generation is:
+  `Gpg::usable_keys` reads the secret keyring and drops anything that could not
+  actually back a store — a signing-only key, an expired one — rather than
+  offering a choice that fails at the first save.
+- ☑ `pass init` equivalence: `Core::init_store` writes the root `.gpg-id`
+  through `gpg_id::write`, which creates the directory on the way. No
+  `.gpg-id.sig`. A key that does not resolve is refused before anything is
+  written, so a refused setup leaves no directory behind.
+- ☑ A git repository is offered, defaulted on only where git has an identity —
+  otherwise every later save would report a failed commit
+  (`Error::GitNoIdentity`). The first commit uses `pass git init`'s own wording.
+- ☑ Detecting and explaining a missing/broken `gpg`: its own screen, naming the
+  platform's package (Gpg4win, GPG Suite, the `gnupg` package) and keeping
+  GnuPG's own message in small print, since that is the only thing separating
+  "not installed" from "installed and broken".
+- ☑ **Definition of done:** `tests/onboarding.rs` drives the command surface
+  against a real `gpg` and a root that **does not exist**, then hands the result
+  to the `pass` binary — directory created, `.gpg-id` byte-identical to
+  `printf '%s\n'`, nothing else written, an entry inserted straight afterwards
+  encrypted to exactly that key and printed back by `pass show`, no plaintext
+  anywhere under the store, and the store refused for setup a second time. The
+  git half asserts both branches, since which one runs depends on the machine.
+  - **CI cannot answer a pinentry, so the generation path is not covered there
+    and this phase does not claim it is.** What CI has is
+    `the_generate_arguments_never_handle_a_passphrase`, which fails the build if
+    anyone reaches for `--passphrase`, `--pinentry-mode` or `%no-protection` to
+    make the path testable, plus the status-parsing tests over captured `gpg`
+    output. The behaviour itself is `tests/gpg_generate.rs`, `#[ignore]`d and
+    run by hand — the same shape and the same admitted gap as the clipboard's
+    ignored round trip in Phase 2.
+  - *Run once on 2026-08-03*, both branches, by temporarily pointing the
+    fixture's agent at a scripted pinentry — **a throwaway, deliberately not
+    committed**, since a fixture that supplies passphrases is the thing
+    Invariant 3 exists to keep out of this repository. Answering it produced a
+    key with a usable encryption subkey that `usable_keys` then offered;
+    refusing it produced `KeyGenerationCancelled` with the keyring unchanged.
+    The committed test still needs a human.
 
 ---
 
@@ -1161,6 +1306,18 @@ being read as more than it is:
     edit form. It found two defects — a refusal message rendered below the fold
     of a scrolling form, and a lock screen that left the app behind it on the
     Tab order. Both fixed; see Phase 5's definition of done.
+  - **Phase 7's wizard was driven the same way on 2026-08-03**: a machine with
+    no store and no key (`?setup=fresh`), one with keys and an empty directory
+    (`?setup=empty`), a missing GnuPG (`?setup=noGpg`), git without an identity
+    (`?noGitIdentity=1`), a refused name, and a dismissed passphrase prompt
+    (`?keyCancelled=1`) — then the whole flow through to the store view. **It
+    found one defect, and it was Phase 5's returning in a worse form**: the
+    refusal from *Create key*, in step 1, rendered at the foot of the page
+    beside *Create my store*, so a dismissed prompt read as though the store had
+    failed — and on a short window it was below the fold. There are two refusal
+    slots now, each beside the button that fills it. Two stub fidelities were
+    fixed with it: a store the wizard had just created was reporting an
+    unreadable file and a remote it could not have.
   - **Phase 6's keys panel was driven the same way on 2026-08-03**: the panel at
     the store root and on an inheriting subfolder, adding a key and reading the
     exact list of entries it would rewrite, the lockout refusal, the
@@ -1256,9 +1413,14 @@ being read as more than it is:
    set pulls in the `image` crate for clipboard images we never touch) plus
    `wayland-data-control`, so a native Wayland session does not have to go
    through XWayland.
-5. **Onboarding scope (ADR-7).** Committed by `PRODUCT.md`, unscoped, blocking
-   Phase 7. The hard edge is Invariant 3: pinentry-driven key generation only.
-   See Phase 7 for the open questions.
+5. ~~**Onboarding scope (ADR-7).**~~ **Resolved 2026-08-03 (ADR-7).** Three
+   states rather than one flow — no `gpg`, no key, no store — with key
+   generation driven through `gpg --batch --quick-generate-key` and the
+   passphrase left entirely to the agent's pinentry. The hard edge held: what
+   changed is which flag gets us there, and it is the opposite of the obvious
+   one. `--batch` suppresses `gpg`'s TTY prompts and leaves the agent's pinentry
+   alone; omitting it fails on `/dev/tty` before the agent is reached. Probed
+   against a real `gpg`, not reasoned about.
 6. ~~**How much `pass` vocabulary to expose.**~~ **Resolved with the Phase 3
    mutation UI (2026-08-01): translate by default; keep the format's own word
    only where the user needs that exact string to act, and gloss it there.**

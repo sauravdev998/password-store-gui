@@ -114,6 +114,27 @@ const NO_KEYS = flags.has('noKeys')
  */
 const STRANGER_KEY = flags.has('strangerKey')
 
+/**
+ * `?setup=missing|empty|noGpg|fresh` — what onboarding finds (ADR-7).
+ *
+ * Mirrors `commands::store_state` and `Core::setup_status`, not the wizard:
+ * `missing` is a path with nothing at it, `empty` a directory holding neither
+ * entries nor keys, `fresh` the machine Phase 7 is really about — no store *and*
+ * no key on the keyring — and `noGpg` the one state the app cannot fix.
+ * Anything else is a store to open, which is the default.
+ */
+const SETUP = flags.get('setup') ?? 'ready'
+/** `?noGitIdentity=1` — git has no name and email, so the history box defaults off. */
+const NO_GIT_IDENTITY = flags.has('noGitIdentity')
+/**
+ * `?keyCancelled=1` — the passphrase window is dismissed instead of answered.
+ *
+ * The important half of ADR-7's probe: it creates nothing and is a choice
+ * rather than a fault, so the wizard must be able to simply offer the button
+ * again.
+ */
+const KEY_CANCELLED = flags.has('keyCancelled')
+
 // --- keys, per store/gpg_id.rs and crypto/gnupg.rs ----------------------
 
 /**
@@ -162,6 +183,53 @@ const gpgIds: Record<string, string[]> = NO_KEYS
  * governs it, which is the state a store nobody has changed the keys of is in.
  */
 const encryptedTo: Record<string, string[]> = {}
+
+/**
+ * `gpg` resolves a key by any of its spellings, so a fingerprint looks up the
+ * same key an email does. It matters here because onboarding offers keys *by
+ * fingerprint* — the string that is about to become a `.gpg-id` line — while
+ * the fixture's own `.gpg-id`s spell emails.
+ */
+for (const key of Object.values({ ...KEYRING })) KEYRING[key.fingerprint] = key
+
+// --- onboarding state, per commands::store_state (ADR-7) ----------------
+
+/** Whether the app starts before there is a store at all. */
+const STARTS_UNSET = SETUP === 'missing' || SETUP === 'empty' || SETUP === 'fresh'
+
+/**
+ * How far along the store is. Mutable, because creating one is the operation
+ * the wizard exists for and the app re-asks immediately afterwards.
+ */
+let setupState: 'missing' | 'empty' | 'ready' =
+  SETUP === 'missing' || SETUP === 'fresh' ? 'missing' : SETUP === 'empty' ? 'empty' : 'ready'
+
+// A machine with no store has nothing to list and no keys pinned either.
+if (STARTS_UNSET) {
+  for (const name of Object.keys(store)) delete store[name]
+  for (const folder of Object.keys(gpgIds)) delete gpgIds[folder]
+}
+
+type OfferedKey = { id: string; label: string; fingerprint: string; usableHere: boolean }
+
+/** Keys made through the wizard in this session. */
+const madeKeys: OfferedKey[] = []
+
+/**
+ * Keys already on this machine's secret keyring, as `usable_keys` reports
+ * them: identified by fingerprint, and only the ones a secret key is held for.
+ */
+function ownKeys(): OfferedKey[] {
+  return Object.values(KEYRING)
+    .filter((key) => key.yours)
+    .filter((key, index, all) => all.findIndex((other) => other.fingerprint === key.fingerprint) === index)
+    .map((key) => ({
+      id: key.fingerprint,
+      label: key.label,
+      fingerprint: key.fingerprint,
+      usableHere: true,
+    }))
+}
 
 // --- entry parsing, per store/entry.rs ----------------------------------
 
@@ -526,16 +594,80 @@ function effective() {
 const handlers: Record<string, (args: Args) => unknown> = {
   core_version: () => '0.1.0-mock',
 
-  list_tree: () => ({ nodes: buildTree(), unsupported: UNSUPPORTED }),
+  // --- onboarding, per ADR-7 --------------------------------------------
+
+  setup_status: () => ({
+    storePath: '/home/you/.password-store',
+    store: setupState,
+    gpgProblem:
+      SETUP === 'noGpg'
+        ? 'no usable GnuPG installation: cannot find binary path: gpg'
+        : null,
+    // A machine with no key at all is what `?setup=fresh` is for; every other
+    // state has the fixture's own keys on the ring.
+    keys: SETUP === 'fresh' ? madeKeys : [...ownKeys(), ...madeKeys],
+    gitIdentity: !NO_GIT_IDENTITY,
+  }),
+
+  create_key: (args) => {
+    const name = str(args, 'name').trim()
+    const email = str(args, 'email').trim()
+    // The two refusals `crypto::gnupg::build_uid` makes, in its words.
+    if (!name || name.startsWith('-') || /[<>()]/.test(name)) {
+      throw 'that name cannot go on a key: it must not be empty, start with a dash, or contain < > ( )'
+    }
+    const [local, domain, ...rest] = email.split('@')
+    if (!local || !domain || rest.length > 0 || /[\s<>()]/.test(email)) {
+      throw 'that does not look like an email address'
+    }
+    if (KEY_CANCELLED) throw 'no key was created: the passphrase prompt was dismissed'
+
+    // A real one is identified by fingerprint, because that string is about to
+    // become a `.gpg-id` line — so the stub invents one rather than reusing the
+    // email, which would hide the difference.
+    const fingerprint = `9${'ABCDEF0123456789'.repeat(3)}${madeKeys.length}`.slice(0, 40)
+    const key = {
+      id: fingerprint,
+      label: `${name} <${email}>`,
+      fingerprint,
+      usableHere: true,
+    }
+    madeKeys.push(key)
+    KEYRING[fingerprint] = { label: key.label, fingerprint, yours: true }
+    return key
+  },
+
+  init_store: (args) => {
+    const ids = idsArg(args)
+    if (setupState === 'ready') throw 'there is already a password store at /home/you/.password-store'
+    if (ids.length === 0) throw 'the .gpg-id file at /home/you/.password-store/.gpg-id lists no recipients'
+    for (const id of ids) {
+      if (!KEYRING[id]) throw `no public key for ${id}`
+    }
+
+    gpgIds[''] = ids
+    setupState = 'ready'
+    // `versioned` decides whether there is a history at all, which is what the
+    // receipt reports — the same shape every other mutation returns.
+    return args.versioned ? receipt() : { commit: null, clipboard: null }
+  },
+
+  // A store this session created cannot already hold a file with a name the
+  // app refuses: `UNSUPPORTED` describes the fixture store, not a new one.
+  list_tree: () => ({ nodes: buildTree(), unsupported: STARTS_UNSET ? [] : UNSUPPORTED }),
 
   store_has_history: () => !NO_GIT,
 
   sync_status: () => {
-    if (NO_GIT) return null
+    if (NO_GIT || (STARTS_UNSET && setupState !== 'ready')) return null
     return {
       branch: 'main',
-      tracking: NO_REMOTE ? null : { upstream: 'origin/main', ahead: 1, behind: 2 },
-      uncommitted: UNCOMMITTED,
+      // A store created here was `git init`ed locally and never pushed, so it
+      // tracks nothing — the ordinary state `SyncStatus.tracking` calls `None`.
+      // Claiming a remote for it would put the sync panel in a state the core
+      // could not produce.
+      tracking: NO_REMOTE || STARTS_UNSET ? null : { upstream: 'origin/main', ahead: 1, behind: 2 },
+      uncommitted: STARTS_UNSET ? 0 : UNCOMMITTED,
     }
   },
 

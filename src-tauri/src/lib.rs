@@ -66,6 +66,9 @@ pub fn run() {
             commands::set_recipients,
             commands::get_settings,
             commands::set_settings,
+            commands::setup_status,
+            commands::create_key,
+            commands::init_store,
         ])
         .build(tauri::generate_context!())
         // Startup failure only; the message carries no store data.

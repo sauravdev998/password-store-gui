@@ -60,6 +60,7 @@ use crate::store::{gpg_id, Entry, EntryMetadata, EntryName, PrsStore, Recipients
 /// Holds no decrypted state, so it is `Send + Sync` without a lock.
 pub struct Core {
     store: StoreFactory,
+    root: RootFactory,
     gpg: GpgFactory,
     git: VcsFactory,
     clipboard: Clipboard,
@@ -67,6 +68,15 @@ pub struct Core {
 }
 
 type StoreFactory = Box<dyn Fn() -> Result<Box<dyn Store>> + Send + Sync>;
+
+/// Where the store is, for the commands that cannot open one.
+///
+/// Everything else reaches the root through [`Store::root`], which is only
+/// answerable once the directory exists. Onboarding's whole subject is the case
+/// where it does not (ADR-7), so it needs the path on its own — and it must be
+/// **the same path** the store factory would open, or a test pointed at a
+/// fixture would create a store in the developer's home instead.
+type RootFactory = Box<dyn Fn() -> Result<PathBuf> + Send + Sync>;
 type GpgFactory = Box<dyn Fn() -> Result<Box<dyn Gpg>> + Send + Sync>;
 
 /// Opens the store's repository, if it has one.
@@ -96,12 +106,14 @@ impl Core {
     pub fn with_clipboard(clipboard: Clipboard) -> Self {
         let settings = Arc::new(SettingsFile::user());
         let for_store = Arc::clone(&settings);
+        let for_root = Arc::clone(&settings);
         Self::from_parts(
             // The root is asked for per command rather than captured, so
             // pointing the app at another store in Settings takes effect on the
             // next click — the same property opening the store per command
             // already buys for a store that did not exist yet.
             Box::new(move || Ok(Box::new(PrsStore::open(&for_store.store_root()?)?))),
+            Box::new(move || for_root.store_root()),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
             Box::new(real_git),
             clipboard,
@@ -127,8 +139,14 @@ impl Core {
     /// store.
     pub fn with_store_root(root: impl Into<PathBuf>, clipboard: Clipboard) -> Self {
         let root = root.into();
+        let for_root = root.clone();
         Self::from_parts(
             Box::new(move || Ok(Box::new(PrsStore::open(&root)?))),
+            // The same path, deliberately: onboarding creates the store rather
+            // than opening it, so it reads this instead of `Store::root` — and
+            // if the two could disagree, a test pointed at a fixture would
+            // create a store in the developer's own home.
+            Box::new(move || Ok(for_root.clone())),
             Box::new(|| Ok(Box::new(PrsGpg::new()?))),
             Box::new(real_git),
             clipboard,
@@ -140,6 +158,7 @@ impl Core {
     /// clipboard, any settings.
     fn from_parts(
         store: StoreFactory,
+        root: RootFactory,
         gpg: GpgFactory,
         git: VcsFactory,
         clipboard: Clipboard,
@@ -147,6 +166,7 @@ impl Core {
     ) -> Self {
         Self {
             store,
+            root,
             gpg,
             git,
             clipboard,
@@ -661,6 +681,119 @@ impl Core {
         })
     }
 
+    /// What onboarding needs to know about this machine (ADR-7).
+    ///
+    /// **Deliberately not routed through `(self.store)()`.** That factory fails
+    /// when the store directory does not exist, which is precisely the state
+    /// this answers about — so the store root comes from the settings directly
+    /// and the directory is inspected rather than opened.
+    ///
+    /// Nothing here decrypts, and nothing raises a prompt: reading the secret
+    /// keyring is a public-metadata question (§4.1 principle 1), and the whole
+    /// point of asking it is to know what to offer before the user has agreed
+    /// to anything.
+    pub fn setup_status(&self) -> Result<SetupStatus> {
+        let store_path = (self.root)()?;
+
+        // Asked apart from the store, because the two failures are independent
+        // and have different remedies: a machine can have a perfectly good
+        // store and no GnuPG, and telling someone to install Gpg4win when what
+        // they need is a store would be §4.1 principle 5 backwards.
+        let (gpg_problem, keys) = match (self.gpg)() {
+            // A listing that fails yields no keys rather than an error: the
+            // only way it can fail is one that would already have failed above,
+            // and the safe direction is offering to make a key rather than
+            // refusing to show the ones that are there.
+            Ok(gpg) => (None, gpg.usable_keys().unwrap_or_default()),
+            Err(err) => (Some(err.to_string()), Vec::new()),
+        };
+
+        Ok(SetupStatus {
+            store: store_state(&store_path),
+            store_path,
+            gpg_problem,
+            keys,
+            git_identity: crate::git::has_identity(),
+        })
+    }
+
+    /// Make a new key pair, with the passphrase prompt left to the agent.
+    ///
+    /// A thin pass-through on purpose: everything that makes this safe is in
+    /// [`Gpg::generate_key`] and its argument list, where a test can see it.
+    pub fn create_key(&self, name: &str, email: &str) -> Result<KeyInfo> {
+        (self.gpg)()?.generate_key(name, email)
+    }
+
+    /// Create the store: the directory, and the `.gpg-id` naming its keys.
+    ///
+    /// `pass init` on a machine that has none, and no more than that (ADR-7).
+    /// Like [`Core::setup_status`] it does not open the store first, since the
+    /// store is what it is about to make.
+    pub fn init_store(&self, ids: &[String], versioned: bool) -> Result<WriteReceipt> {
+        let root = (self.root)()?;
+
+        // The wizard only appears when there is no store, so this is not
+        // reachable from it — but the command is callable regardless, and
+        // refusing here is what stops a second `.gpg-id` from re-pointing a
+        // populated store at one key without the re-encryption
+        // [`Core::set_recipients`] would have done for it (Invariant 8).
+        if matches!(store_state(&root), StoreState::Ready) {
+            return Err(Error::StoreExists { path: root });
+        }
+
+        let gpg = (self.gpg)()?;
+        // Refused by name before anything is written — ADR-6's rule, and it
+        // matters more here than anywhere: a store created around a key that
+        // does not resolve is one whose every future write fails, with nothing
+        // on screen to say why.
+        for id in ids {
+            gpg.describe_key(id)?;
+        }
+
+        // `atomic::write` makes the directory on the way, so this one call is
+        // both halves of `pass init` on a machine with no store. No
+        // `.gpg-id.sig`: `pass` writes one only under
+        // `PASSWORD_STORE_SIGNING_KEY`, and a signature the CLI is not
+        // configured to check is a file every other client ignores.
+        gpg_id::write(&gpg_id::path_in(&root, None), ids)?;
+
+        Ok(WriteReceipt {
+            // A history that could not be started is news about the history,
+            // not about the store — which exists and is usable either way. Same
+            // shape, and the same reason, as a mutation's failed commit.
+            commit: versioned.then(|| self.initial_commit(&root)),
+            clipboard: None,
+        })
+    }
+
+    /// Put a brand-new store under version control, and record its contents.
+    fn initial_commit(&self, root: &Path) -> Commit {
+        let change = Change::InitStore;
+        let committed = self
+            .repository(root)
+            .and_then(|repo| repo.commit(&change.message(), &change.paths()));
+
+        match committed {
+            Ok(()) => Commit::Committed,
+            Err(err) => Commit::Failed(err.to_string()),
+        }
+    }
+
+    /// The repository for a store being created, making one if there is none.
+    ///
+    /// A store created *inside* something already versioned — a dotfiles
+    /// checkout — is versioned by that repository, which is what the factory
+    /// finds and what every later write will use. Initializing a second one
+    /// nested inside it would give the store a history no other client looks
+    /// at.
+    fn repository(&self, root: &Path) -> Result<Box<dyn Vcs>> {
+        match (self.git)(root) {
+            Some(repo) => Ok(repo),
+            None => Ok(Box::new(GitRepo::init(root)?)),
+        }
+    }
+
     /// Record a completed mutation in the store's history.
     ///
     /// Infallible by design. Everything it could report has already happened on
@@ -782,6 +915,91 @@ pub enum Commit {
     /// explanation — see [`crate::error::Error::Git`] for why git's own
     /// messages are safe to relay when the crypto layer's are not.
     Failed(String),
+}
+
+/// What onboarding found on this machine (ADR-7).
+///
+/// Three independent facts rather than one verdict, because the three states
+/// Phase 7 covers — no usable `gpg`, no key, no store — are independent and
+/// have different remedies. Deciding which screen to show is the interface's
+/// job; saying what is true is this one's.
+///
+/// Nothing here is secret. A public key's user id and fingerprint are metadata
+/// (see [`KeyInfo`]), and the rest is a path and two booleans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStatus {
+    /// Where the store is, or would be — after `PASSWORD_STORE_DIR` and the
+    /// configured path have had their say (ADR-11). Shown, because a user
+    /// about to have a directory created for them should see which one.
+    pub store_path: PathBuf,
+
+    pub store: StoreState,
+
+    /// Why GnuPG is unusable, or `None` when it is fine.
+    ///
+    /// A string rather than a flag: it carries
+    /// [`crate::error::Error::GpgUnavailable`]'s reason, which is safe here for
+    /// the same narrow cause it is safe there — it is raised while *building* a
+    /// context, before any ciphertext has been read.
+    pub gpg_problem: Option<String>,
+
+    /// Keys already on this machine that could back a store.
+    ///
+    /// Offered before generation is (ADR-7). Empty is the ordinary state of a
+    /// machine that has never used GnuPG, and the only state that needs a key
+    /// made for it.
+    pub keys: Vec<KeyInfo>,
+
+    /// Whether git could make a commit if it were asked to.
+    ///
+    /// What defaults the offer to version the new store. A repository created
+    /// for a machine with no identity turns every later save into the
+    /// failed-commit warning, so the checkbox follows this rather than a
+    /// default that suits a developer's own machine.
+    pub git_identity: bool,
+}
+
+/// How far along the store at a given path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StoreState {
+    /// Nothing at that path.
+    Missing,
+    /// A directory holding no entries and no `.gpg-id` — including one the user
+    /// made by hand before opening this app.
+    Empty,
+    /// A store to open rather than to create.
+    Ready,
+}
+
+/// Which of the three states the store at `root` is in.
+///
+/// The boundary is ADR-7's, and the interesting edge is the one that looks like
+/// an omission: a directory holding **entries but no `.gpg-id`** counts as
+/// `Ready`. It is not an uninitialized store, it is a store whose keys are
+/// unset — `folder_keys` already reports it that way and the keys panel already
+/// fixes it (ADR-13). Two screens for one state would be two answers to it.
+fn store_state(root: &Path) -> StoreState {
+    if !root.is_dir() {
+        return StoreState::Missing;
+    }
+    if gpg_id::nearest_gpg_id_in(root, None).is_some() {
+        return StoreState::Ready;
+    }
+
+    match PrsStore::open(root).and_then(|store| store.tree()) {
+        // Unsupported names count as contents: they are files this app cannot
+        // read but `pass` may well be able to, and treating the directory as
+        // empty because of them would offer to set up a store over somebody
+        // else's (§4.1 principle 3).
+        Ok(tree) if tree.nodes.is_empty() && tree.unsupported.is_empty() => StoreState::Empty,
+        Ok(_) => StoreState::Ready,
+        // A directory we could not look inside is not an empty one. Guessing
+        // `Empty` here is the single mistake in this function that could put a
+        // `.gpg-id` into a store that already had contents.
+        Err(_) => StoreState::Ready,
+    }
 }
 
 /// The keys able to open a folder's entries, and where that was decided.
@@ -1212,6 +1430,28 @@ pub fn set_recipients(
     core.set_recipients(folder.as_ref(), &ids)
 }
 
+/// What onboarding found on this machine (ADR-7). Decrypts nothing.
+#[tauri::command]
+pub fn setup_status(core: State<'_, Core>) -> Result<SetupStatus> {
+    core.setup_status()
+}
+
+/// Make a new key pair. The passphrase prompt is the agent's, never ours.
+#[tauri::command]
+pub fn create_key(name: String, email: String, core: State<'_, Core>) -> Result<KeyInfo> {
+    core.create_key(&name, &email)
+}
+
+/// Create the store directory and its `.gpg-id`, optionally under git.
+#[tauri::command]
+pub fn init_store(
+    ids: Vec<String>,
+    versioned: bool,
+    core: State<'_, Core>,
+) -> Result<WriteReceipt> {
+    core.init_store(&ids, versioned)
+}
+
 #[tauri::command]
 pub fn generate_defaults(core: State<'_, Core>) -> generate::Recipe {
     core.generate_defaults()
@@ -1400,6 +1640,13 @@ mod tests {
         /// Ids this machine holds no secret key for, so a test can drive the
         /// lockout warning without deleting a key from a keyring.
         foreign: Arc<Mutex<BTreeSet<String>>>,
+        /// Ids this machine holds a *secret* key for, which is what onboarding
+        /// offers before it offers to make one. Empty by default: a machine
+        /// that has never used GnuPG is the state Phase 7 is about.
+        on_keyring: Arc<Mutex<BTreeSet<String>>>,
+        /// User ids `generate_key` was asked for, so a test can tell a key that
+        /// was made from one that was already there.
+        generated: Arc<Mutex<Vec<String>>>,
     }
 
     /// One encryption: where it went, and to whom.
@@ -1428,6 +1675,8 @@ mod tests {
                 encrypted: Arc::new(Mutex::new(encrypted)),
                 unresolvable: Arc::new(Mutex::new(BTreeSet::new())),
                 foreign: Arc::new(Mutex::new(BTreeSet::new())),
+                on_keyring: Arc::new(Mutex::new(BTreeSet::new())),
+                generated: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1491,6 +1740,25 @@ mod tests {
                 .ok_or_else(|| Error::UnreadableCiphertext {
                     path: path.to_path_buf(),
                 })
+        }
+
+        /// Whatever a test put on the fake keyring — empty by default, which is
+        /// the machine onboarding exists for.
+        fn usable_keys(&self) -> Result<Vec<KeyInfo>> {
+            lock(&self.on_keyring)
+                .iter()
+                .map(|id| self.describe_key(id))
+                .collect()
+        }
+
+        /// Records the request and puts the key on the fake keyring. No
+        /// passphrase is involved here for the same reason none is involved in
+        /// the real one: the agent owns it, and this fake has no agent.
+        fn generate_key(&self, name: &str, email: &str) -> Result<KeyInfo> {
+            let id = format!("{name} <{email}>");
+            lock(&self.generated).push(id.clone());
+            lock(&self.on_keyring).insert(id.clone());
+            self.describe_key(&id)
         }
     }
 
@@ -1637,6 +1905,9 @@ mod tests {
                     gpg: store_gpg.clone(),
                 }))
             }),
+            // The same root the fake store reports, so the setup commands and
+            // the store cannot disagree about which directory is the store.
+            Box::new(|| Ok(PathBuf::from(ROOT))),
             Box::new(move || Ok(Box::new(command_gpg.clone()))),
             git,
             Clipboard::new(Box::new(backend.clone()), Box::new(scheduler.clone())),
@@ -1714,6 +1985,7 @@ mod tests {
                     gpg: listed.clone(),
                 }))
             }),
+            Box::new(|| Ok(PathBuf::from(ROOT))),
             Box::new(|| {
                 Err(Error::GpgUnavailable {
                     reason: "listing must not decrypt".into(),
@@ -2475,6 +2747,7 @@ mod tests {
                     gpg: FakeGpg::default(),
                 }))
             }),
+            Box::new(|| Ok(PathBuf::from(ROOT))),
             Box::new(|| {
                 Err(Error::GpgUnavailable {
                     reason: "listing a history must not decrypt".into(),
@@ -2559,5 +2832,308 @@ mod tests {
             serde_json::to_string(&err).unwrap(),
             r#""entry Email/gmail.com has no field at index 9""#
         );
+    }
+
+    // ---- Onboarding (Phase 7, ADR-7) ------------------------------------
+    //
+    // These are the only tests here whose root is a real directory, because
+    // they are the only commands that *make* one — `store_state` asks the
+    // filesystem and `init_store` writes to it. Everything else stays a fake:
+    // no `gpg` runs, and the generation path's own safety is pinned in
+    // `crypto/gnupg.rs`, where the argument list can be read without a
+    // pinentry to answer.
+
+    /// A core rooted at a real path, with a fake backend and history.
+    fn core_rooted_at(root: &Path, git: Option<FakeVcs>) -> (Core, FakeGpg) {
+        let gpg = FakeGpg::default();
+        let command_gpg = gpg.clone();
+        let store_gpg = gpg.clone();
+        let store_root = root.to_path_buf();
+        let root_again = root.to_path_buf();
+
+        let core = Core::from_parts(
+            Box::new(move || {
+                Ok(Box::new(FakeStore {
+                    root: store_root.clone(),
+                    gpg: store_gpg.clone(),
+                }))
+            }),
+            Box::new(move || Ok(root_again.clone())),
+            Box::new(move || Ok(Box::new(command_gpg.clone()))),
+            match git {
+                Some(git) => Box::new(move |_| Some(Box::new(git.clone()))),
+                // No repository, and none to be made: `GitRepo::init` would
+                // reach the real git2, which these tests have no business
+                // doing.
+                None => Box::new(|_| None),
+            },
+            unused_clipboard(),
+            Arc::new(SettingsFile::ephemeral()),
+        );
+        (core, gpg)
+    }
+
+    /// The root `.gpg-id` of a store at `root`, as written.
+    fn gpg_id_of(root: &Path) -> String {
+        std::fs::read_to_string(root.join(".gpg-id")).unwrap()
+    }
+
+    #[test]
+    fn a_path_with_nothing_at_it_is_a_store_to_create() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(store_state(&dir.path().join("nope")), StoreState::Missing);
+    }
+
+    #[test]
+    fn an_empty_directory_is_a_store_to_create() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(store_state(dir.path()), StoreState::Empty);
+    }
+
+    /// ADR-7's trigger boundary, and the edge that looks like an omission: a
+    /// directory holding entries but no `.gpg-id` is **not** offered to
+    /// onboarding. It is a store whose keys are unset, which the keys panel
+    /// already fixes (ADR-13) — and creating one over it would write a
+    /// `.gpg-id` its existing entries are not encrypted to, without the
+    /// re-encryption `set_recipients` would have done.
+    #[test]
+    fn a_directory_holding_entries_is_a_store_to_open_not_one_to_create() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wifi.gpg"), b"ciphertext").unwrap();
+
+        assert_eq!(store_state(dir.path()), StoreState::Ready);
+    }
+
+    #[test]
+    fn a_directory_with_a_gpg_id_is_already_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gpg-id"), b"key\n").unwrap();
+
+        assert_eq!(store_state(dir.path()), StoreState::Ready);
+    }
+
+    /// A file this app cannot name is still somebody's entry (§4.1
+    /// principle 3). Reading the directory as empty because of it would offer
+    /// to set up a store over a store.
+    ///
+    /// `$` rather than a control character: both are `Tree::unsupported`, but
+    /// only one of them is a file name Windows will let the test create.
+    #[test]
+    fn a_directory_holding_only_unusable_names_is_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("wi$fi.gpg"), b"ciphertext").unwrap();
+
+        assert_ne!(store_state(dir.path()), StoreState::Empty);
+    }
+
+    /// The whole of `pass init` on a machine with no store: the directory and
+    /// the `.gpg-id`, byte for byte what `printf '%s\n'` would have written,
+    /// and nothing else at all — no `.gpg-id.sig`, no file of ours.
+    #[test]
+    fn init_creates_the_directory_and_writes_the_gpg_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("password-store");
+        let (core, _) = core_rooted_at(&root, None);
+
+        let receipt = core
+            .init_store(&["ada@example.invalid".to_owned()], false)
+            .unwrap();
+
+        assert_eq!(gpg_id_of(&root), "ada@example.invalid\n");
+        assert_eq!(receipt.commit, None, "nothing was asked to be versioned");
+
+        let left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(".gpg-id")]);
+    }
+
+    #[test]
+    fn init_writes_every_key_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = core_rooted_at(dir.path(), None);
+
+        core.init_store(&["ada".to_owned(), "bob".to_owned()], false)
+            .unwrap();
+
+        assert_eq!(gpg_id_of(dir.path()), "ada\nbob\n");
+    }
+
+    /// ADR-6's rule, and it matters more here than anywhere else: a store
+    /// created around a key that does not resolve is one whose every future
+    /// write fails. Refused by name, and **nothing is left behind** — not even
+    /// the directory, since the refusal happens before the write that would
+    /// have created it.
+    #[test]
+    fn init_refuses_a_key_that_does_not_resolve_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("password-store");
+        let (core, gpg) = core_rooted_at(&root, None);
+        lock(&gpg.unresolvable).insert("ghost".to_owned());
+
+        match core.init_store(&["ghost".to_owned()], false) {
+            Err(Error::UnknownKey { id }) => assert_eq!(id, "ghost"),
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+        assert!(!root.exists(), "a refused setup left a directory behind");
+    }
+
+    #[test]
+    fn init_refuses_a_store_that_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gpg-id"), b"someone-else\n").unwrap();
+        let (core, _) = core_rooted_at(dir.path(), None);
+
+        match core.init_store(&["ada".to_owned()], false) {
+            Err(Error::StoreExists { path }) => assert_eq!(path, dir.path()),
+            other => panic!("expected StoreExists, got {other:?}"),
+        }
+        assert_eq!(
+            gpg_id_of(dir.path()),
+            "someone-else\n",
+            "a refused setup rewrote the store's keys"
+        );
+    }
+
+    #[test]
+    fn init_refuses_to_create_a_store_with_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, _) = core_rooted_at(dir.path(), None);
+
+        assert!(matches!(
+            core.init_store(&[], false),
+            Err(Error::EmptyRecipients { .. })
+        ));
+    }
+
+    /// `pass git init`'s own wording, and the `.gpg-id` staged by name — a
+    /// store's history is shared with the CLI, so `git log` should not betray
+    /// which client wrote it.
+    #[test]
+    fn a_versioned_setup_commits_in_pass_s_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeVcs::default();
+        let (core, _) = core_rooted_at(dir.path(), Some(git.clone()));
+
+        let receipt = core.init_store(&["ada".to_owned()], true).unwrap();
+
+        assert_eq!(receipt.commit, Some(Commit::Committed));
+        let commits = lock(&git.commits);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].0, "Add current contents of password store.");
+        assert_eq!(commits[0].1, vec![PathBuf::from(".gpg-id")]);
+    }
+
+    /// The store exists either way, so a history that could not be started is
+    /// news about the history — the same shape as a mutation's failed commit,
+    /// and for the same reason.
+    #[test]
+    fn a_history_that_cannot_be_started_does_not_fail_the_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = FakeVcs {
+            refuses: Some("git does not know who you are"),
+            ..FakeVcs::default()
+        };
+        let (core, _) = core_rooted_at(dir.path(), Some(git));
+
+        let receipt = core.init_store(&["ada".to_owned()], true).unwrap();
+
+        assert!(matches!(receipt.commit, Some(Commit::Failed(_))));
+        assert_eq!(
+            gpg_id_of(dir.path()),
+            "ada\n",
+            "the store must exist even when its history does not"
+        );
+    }
+
+    /// A machine that has never used GnuPG: the state Phase 7 is about, and
+    /// one the status has to report as a fact rather than as a failure.
+    #[test]
+    fn setup_status_reports_a_machine_with_nothing_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("password-store");
+        let (core, _) = core_rooted_at(&root, None);
+
+        let status = core.setup_status().unwrap();
+
+        assert_eq!(status.store, StoreState::Missing);
+        assert_eq!(status.store_path, root);
+        assert_eq!(status.gpg_problem, None);
+        assert!(status.keys.is_empty(), "nothing should be offered yet");
+    }
+
+    /// A key already on the keyring is offered, which is what stops onboarding
+    /// making a second one for somebody who has one (ADR-7).
+    #[test]
+    fn setup_status_offers_a_key_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, gpg) = core_rooted_at(dir.path(), None);
+        lock(&gpg.on_keyring).insert("ada@example.invalid".to_owned());
+
+        let status = core.setup_status().unwrap();
+
+        assert_eq!(status.store, StoreState::Empty);
+        assert_eq!(status.keys.len(), 1);
+        assert_eq!(status.keys[0].id, "ada@example.invalid");
+        assert!(status.keys[0].usable_here);
+    }
+
+    /// Missing GnuPG is reported *beside* the store rather than instead of it:
+    /// the two failures are independent and have different remedies, and a
+    /// user told to install Gpg4win when what they need is a store has been
+    /// sent to fix the wrong thing (§4.1 principle 5).
+    #[test]
+    fn setup_status_reports_a_missing_gpg_without_losing_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let core = Core::from_parts(
+            Box::new(|| {
+                Err(Error::GpgUnavailable {
+                    reason: "cannot find binary path".into(),
+                })
+            }),
+            Box::new(move || Ok(root.clone())),
+            Box::new(|| {
+                Err(Error::GpgUnavailable {
+                    reason: "cannot find binary path".into(),
+                })
+            }),
+            Box::new(|_| None),
+            unused_clipboard(),
+            Arc::new(SettingsFile::ephemeral()),
+        );
+
+        let status = core.setup_status().unwrap();
+
+        assert_eq!(
+            status.gpg_problem.as_deref(),
+            Some("no usable GnuPG installation: cannot find binary path")
+        );
+        assert!(status.keys.is_empty());
+        assert_eq!(
+            status.store,
+            StoreState::Empty,
+            "the store is still knowable"
+        );
+    }
+
+    /// The key made is the key offered next: onboarding writes what
+    /// `create_key` reports straight into the `.gpg-id`, so a key that did not
+    /// come back describable would produce a store nothing can write to.
+    #[test]
+    fn a_created_key_is_one_the_store_can_be_built_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (core, gpg) = core_rooted_at(dir.path(), None);
+
+        let key = core
+            .create_key("Ada Lovelace", "ada@example.invalid")
+            .unwrap();
+        assert!(key.usable_here);
+        assert_eq!(lock(&gpg.generated).len(), 1);
+
+        core.init_store(std::slice::from_ref(&key.id), false)
+            .unwrap();
+        assert_eq!(gpg_id_of(dir.path()), format!("{}\n", key.id));
     }
 }

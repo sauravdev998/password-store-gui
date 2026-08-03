@@ -203,6 +203,8 @@ pub enum Change<'a> {
         from: &'a EntryName,
         to: &'a EntryName,
     },
+    /// A store was created, and a repository made to hold it (ADR-7).
+    InitStore,
     /// A folder's keys changed, and the entries that had to be re-encrypted for
     /// it (ADR-13).
     SetRecipients {
@@ -228,6 +230,12 @@ impl Change<'_> {
             Self::Remove(name) => format!("Remove {name} from store."),
             Self::Rename { from, to } => format!("Rename {from} to {to}."),
             Self::Copy { from, to } => format!("Copy {from} to {to}."),
+            // `pass git init`'s own wording, which is exactly what this is: the
+            // store and its `.gpg-id` already exist by the time the repository
+            // is made, so what the first commit records is the store's current
+            // contents. `pass` reaches the same two-step from
+            // `pass init` && `pass git init`, and writes this for the second.
+            Self::InitStore => "Add current contents of password store.".to_owned(),
             // `pass init`'s own wording, including the parenthesized path it
             // adds for a subfolder. It makes two commits — one for the
             // `.gpg-id` and one for the re-encryption — where this makes one,
@@ -255,6 +263,11 @@ impl Change<'_> {
             }
             Self::Rename { from, to } => vec![relative(from), relative(to)],
             Self::Copy { to, .. } => vec![relative(to)],
+            // A store this app just created holds exactly one file, so staging
+            // the root `.gpg-id` by name is the whole of "current contents" —
+            // and it keeps the per-path discipline every other change here
+            // follows, rather than sweeping in whatever else is on disk.
+            Self::InitStore => vec![gpg_id_relative(None)],
             // The `.gpg-id` and every entry rewritten because of it. Staged
             // per-path as every other change is, so a recipient change does not
             // sweep up unrelated work sitting in the store.
@@ -269,6 +282,37 @@ impl Change<'_> {
             }
         }
     }
+}
+
+/// Whether git knows who the user is.
+///
+/// Read straight off the default configuration rather than by attempting a
+/// commit, because it is asked *before* there is a repository to commit to
+/// (ADR-7): onboarding offers to version a new store, and a repository created
+/// for a machine with no identity turns every later save into the failed-commit
+/// warning the interface deliberately does not let fade
+/// ([`Error::GitNoIdentity`]). So the offer is defaulted by this rather than by
+/// what suits a developer's own machine.
+///
+/// `false` when the configuration cannot be read at all, which is the same
+/// answer for the same reason: a commit would not work either.
+///
+/// Read off a **snapshot**. libgit2 refuses `get_string` on a live
+/// configuration — *"get_string called on a live config object"* — because the
+/// value could change while the borrowed string is held, so asking the open
+/// handle reports every key as missing and so every machine as having no
+/// identity. Found by `tests/onboarding.rs` on a machine that plainly had one,
+/// which is the whole reason that test asserts both branches rather than
+/// skipping the one it is not in.
+pub fn has_identity() -> bool {
+    let Ok(config) = git2::Config::open_default().and_then(|mut config| config.snapshot()) else {
+        return false;
+    };
+    ["user.name", "user.email"].iter().all(|key| {
+        config
+            .get_str(key)
+            .is_ok_and(|value| !value.trim().is_empty())
+    })
 }
 
 /// An entry's ciphertext path, relative to the store root.
@@ -312,6 +356,27 @@ impl GitRepo {
             .ok()?
             .to_path_buf();
         Some(Self { repo, prefix })
+    }
+
+    /// Create a repository *at* the store root, for a store being set up.
+    ///
+    /// Unlike [`GitRepo::discover`] this does not search upward, and must not:
+    /// a store made inside a directory that is already a repository — a
+    /// dotfiles checkout — should be versioned by that one, which `discover`
+    /// then finds. Initializing here is only ever asked for once, when
+    /// onboarding creates a store somewhere nothing versions it (ADR-7).
+    ///
+    /// Local to the last bit, so ADR-9's line is untouched: no remote is
+    /// configured and nothing reaches the network.
+    pub fn init(root: &Path) -> Result<Self> {
+        git2::Repository::init(root).map_err(as_error)?;
+        // Re-opened through `discover` rather than wrapped directly, so the
+        // prefix is computed by the one piece of code that knows how — and so
+        // that a failure to find what was just created is caught here rather
+        // than at the first commit.
+        Self::discover(root).ok_or_else(|| Error::Git {
+            reason: "the new repository could not be opened".to_owned(),
+        })
     }
 
     /// Where `path` — store-relative — sits inside the repository.
