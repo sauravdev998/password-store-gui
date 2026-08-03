@@ -82,8 +82,16 @@ Confirmed conditions the interface actually meets:
   the seed.
 - Mutations: insert, edit, generate, rm, mv, cp — each re-encrypting to the
   recipients of the name being written.
-- Planned, not built: auto-commit and git sync (Phase 4); auto-lock, global
-  search, and settings (Phase 5).
+- Auto-commit and git sync; per-entry history and reading a past version.
+- Auto-lock, global search, and settings.
+- Recipient management: which keys govern a folder, what a change would cost
+  before it is made, and an all-or-nothing subtree re-encrypt.
+- **Onboarding from nothing** (`PLAN.md` ADR-7): a machine with no GPG key and
+  no store reaches a working store without a terminal. Key generation is driven
+  through `gpg` with the platform pinentry prompting — never `--passphrase`,
+  never loopback, never an unprotected key — so the "no passphrases" invariant
+  holds through it.
+- Planned, not built: per-OS packaging and code signing (Phase 5).
 
 **Hard constraints:**
 
@@ -112,16 +120,6 @@ design question, not a settled one.
 
 **Undecided / open:**
 
-- **In-app onboarding is committed but unscoped.** The product intent is that a
-  user can go from nothing — no GPG key, no store — to a working store without a
-  terminal, including key generation and the equivalent of `pass init`. No phase
-  in `PLAN.md` covers this yet, and it does not conflict with the
-  "no passphrases" invariant only so long as key generation is driven through
-  `gpg` with the platform pinentry prompting (never `--passphrase`, never
-  loopback). It needs its own ADR before it is built.
-- Git network auth: shell out to the user's `git` vs. `git2` credential
-  callbacks (`PLAN.md` §10.2).
-- Auto-hide on blur and re-hide after N seconds (`PLAN.md` §10.3).
 - No product-specific accessibility standard has been committed. Sensible
   defaults apply; nothing here is a stated obligation.
 

@@ -19,6 +19,10 @@ that violates one is a bug even if the feature works. The short version:
 2. Plaintext stays in Rust; it crosses IPC only on an explicit user reveal.
    Clipboard copy happens in the core, never in JS.
 3. We never handle passphrases — `gpg-agent` + pinentry do. No loopback pinentry.
+   This includes **creating** a key (ADR-7): `--batch` is what lets the agent
+   prompt, not what stops it, so `--passphrase`, `--pinentry-mode` and
+   `%no-protection` stay out of the shipped path — and out of the fixtures used
+   to test it.
 4. Secret buffers are wrapped in `secrecy`/`zeroize`, never `Debug`/`Display`.
 5. Nothing secret reaches logs, errors, traces, or panics.
 6. Clipboard auto-clears — on its timer and on exit — and only if it still holds
@@ -88,15 +92,16 @@ cargo clippy --all-targets -- -D warnings
 `commands.ts` wrappers with no Rust behind them. It is how each phase since 3
 has been click-tested, and it has found a defect every time. URL flags drive
 the awkward states (`?noGit=1`, `?sync=conflicted`, `?env=storeDir`,
-`?lockAfter=5`, …) — see the file.
+`?lockAfter=5`, `?setup=fresh`, …) — see the file.
 
 **It establishes nothing about the core.** No GnuPG runs, nothing is decrypted,
 no file is written, and the clipboard is a variable. The stub *mirrors* the
 Rust rules rather than sharing them — the entry parser, name validation, the
-refusals in `Core`, the strings in `error.rs`, the settings precedence, and the
-`.gpg-id` walk-up and staleness rules behind the keys panel — so when you change
-one of those, change the stub too, or it stops testing the app and starts
-testing a fiction. When they disagree, the Rust side is right.
+refusals in `Core`, the strings in `error.rs`, the settings precedence, the
+`.gpg-id` walk-up and staleness rules behind the keys panel, and `store_state`
+behind the onboarding wizard — so when you change one of those, change the stub
+too, or it stops testing the app and starts testing a fiction. When they
+disagree, the Rust side is right.
 
 ## Settings
 
