@@ -126,6 +126,29 @@ pub trait Gpg: Send + Sync {
     /// normal afterwards.
     fn describe_key(&self, id: &str) -> Result<KeyInfo>;
 
+    /// Every key on this machine that could back a store.
+    ///
+    /// **Must not decrypt**, like the two queries above: onboarding asks this
+    /// before the user has committed to anything, and a pinentry raised by a
+    /// question is §4.1 principle 1's central defect.
+    ///
+    /// An empty list is the ordinary state of a machine that has never used
+    /// GnuPG — the state Phase 7 exists for — and not a failure to report.
+    fn usable_keys(&self) -> Result<Vec<KeyInfo>>;
+
+    /// Create a key pair for `name` and `email`, and describe what was made.
+    ///
+    /// **The passphrase is the agent's business and never ours** (Invariant 3).
+    /// An implementation must let `gpg-agent` and the platform pinentry prompt
+    /// for it — never `--passphrase`, never `--pinentry-mode loopback`, never
+    /// an unprotected key — and ADR-7 records the probe that shows `--batch` is
+    /// what *allows* that rather than what prevents it.
+    ///
+    /// This is on the trait for ADR-3's reason: it is a backend capability, and
+    /// a later pure-Rust backend would have to answer for it with no agent
+    /// behind it — at which point Invariant 3 is the whole question again.
+    fn generate_key(&self, name: &str, email: &str) -> Result<KeyInfo>;
+
     /// The keys the ciphertext at `path` is actually encrypted to.
     ///
     /// The other half of the pair above: [`Gpg::describe_key`] says who the
