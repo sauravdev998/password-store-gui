@@ -2915,10 +2915,13 @@ mod tests {
     /// A file this app cannot name is still somebody's entry (§4.1
     /// principle 3). Reading the directory as empty because of it would offer
     /// to set up a store over a store.
+    ///
+    /// `$` rather than a control character: both are `Tree::unsupported`, but
+    /// only one of them is a file name Windows will let the test create.
     #[test]
     fn a_directory_holding_only_unusable_names_is_not_empty() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("wi fi\u{7}.gpg"), b"ciphertext").unwrap();
+        std::fs::write(dir.path().join("wi$fi.gpg"), b"ciphertext").unwrap();
 
         assert_ne!(store_state(dir.path()), StoreState::Empty);
     }
