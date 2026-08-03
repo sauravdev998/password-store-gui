@@ -38,20 +38,22 @@ type Props = {
   onCreated: (receipt: WriteReceipt) => void
 }
 
-/** What to tell someone whose GnuPG is missing, on the system they are on. */
+/**
+ * What to tell someone with no usable GnuPG, on the system they are on.
+ *
+ * The two branches say opposite things, and ADR-14 is why. Where GnuPG ships
+ * inside the app, reaching this screen means our own copy would not start —
+ * nothing the user can install fixes that, so telling them to go and install
+ * something would send them to fix the wrong thing (§4.1 principle 5). Linux is
+ * not bundled for, so there the old advice is still the true and useful one.
+ */
 function installHint(): { name: string; detail: string } {
   const platform = navigator.userAgent
-  if (platform.includes('Win')) {
+  if (platform.includes('Win') || platform.includes('Mac')) {
     return {
-      name: 'Gpg4win',
-      detail: 'Install Gpg4win from gpg4win.org, then come back to this window.',
-    }
-  }
-  if (platform.includes('Mac')) {
-    return {
-      name: 'GPG Suite',
+      name: 'Reinstalling should fix this',
       detail:
-        'Install GPG Suite from gpgtools.org, or run "brew install gnupg pinentry-mac", then come back to this window.',
+        'This app comes with its own copy of GnuPG, and that copy could not be started — so it is probably damaged or incomplete rather than missing. Reinstalling the app replaces it.',
     }
   }
   return {
@@ -71,10 +73,14 @@ export function Onboarding({ status, onRecheck, onCreated }: Props) {
 /**
  * The one state the app cannot do anything about.
  *
- * §4.1 principle 5's sharpest test: "install Gpg4win" beats "gpg not found".
- * The underlying message is kept as well, in small print — it is the only thing
- * that distinguishes "not installed" from "installed but broken", and somebody
- * will need it.
+ * §4.1 principle 5's sharpest test — a named fix beats "gpg not found" — but
+ * which fix is named now depends on the platform; see `installHint`. Rare since
+ * ADR-14, and deliberately kept rather than deleted: Linux is not bundled for,
+ * and a bundle can be damaged.
+ *
+ * The underlying message is kept as well, in small print. It is the only thing
+ * that distinguishes "nothing was found" from "something was found and would
+ * not run", and somebody will need it.
  */
 function MissingGnupg({ problem, onRecheck }: { problem: string; onRecheck: () => void }) {
   const hint = installHint()
@@ -86,8 +92,8 @@ function MissingGnupg({ problem, onRecheck }: { problem: string; onRecheck: () =
       lead={
         <>
           Your passwords are protected by <strong className="font-medium text-ink">GnuPG</strong>,
-          the encryption program this store is built on. It is not part of this app, and it needs to
-          be installed before anything can be read or written.
+          the encryption program this store is built on. Nothing can be read or written until a
+          working copy of it is available.
         </>
       }
     >

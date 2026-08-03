@@ -43,48 +43,46 @@ jobs:
 
       # The gpg.exe bundled with Git for Windows is an MSYS2 build: it reads
       # GNUPGHOME as an MSYS path, so the native temp dir the test fixture sets
-      # is treated as relative and joined onto gpg's cwd. Install a native
-      # GnuPG and put it first on PATH — also the configuration Windows users
+      # is treated as relative and joined onto gpg's cwd. Stage a native GnuPG
+      # and put it first on PATH — also the configuration Windows users
       # actually have.
       #
-      # Unpacked rather than installed. Running the GnuPG installer on a hosted
-      # runner hangs the step until it times out, whether it is launched by
-      # `choco install gnupg` or directly with NSIS `/S` — nothing is printed
-      # and nothing exits. The installer is an NSIS archive, so 7-Zip (already
-      # on the image) can extract the tree without executing anything. GnuPG
-      # finds its own root relative to the running .exe, so an extracted
-      # bin/ + share/ works exactly like an installed one.
-      #
-      # The checksum is the one published on gnupg.org/download/integrity_check.
-      - name: Install a native GnuPG
+      # This is `scripts/fetch-gnupg.sh`, the same script that stages the tree
+      # ADR-14 bundles, so the version and its checksum live in one place and
+      # the tests run against the binary the app will ship. It unpacks rather
+      # than installing: running the GnuPG installer on a hosted runner hangs
+      # the step until it times out, whether launched by `choco install gnupg`
+      # or directly with NSIS `/S`.
+      - name: Stage a native GnuPG
         if: matrix.platform == 'windows-latest'
-        shell: pwsh
+        shell: bash
         timeout-minutes: 5
         run: |
-          $url = 'https://gnupg.org/ftp/gcrypt/binary/gnupg-w32-2.5.21_20260702.exe'
-          $want = '6246c925a73167253444afc24a0deb83a3f43b7d636af84d6aaf48a98a62f024'
-          $exe = Join-Path $env:RUNNER_TEMP 'gnupg-w32.exe'
-
-          # curl.exe over Invoke-WebRequest: it is preinstalled, faster, and
-          # --max-time bounds a stalled transfer instead of hanging the step.
-          Write-Host "Downloading $url"
-          curl.exe -fsSL --retry 3 --max-time 180 -o $exe $url
-          if ($LASTEXITCODE -ne 0) { throw "download failed: curl exit $LASTEXITCODE" }
-
-          $got = (Get-FileHash $exe -Algorithm SHA256).Hash
-          if ($got -ne $want) { throw "gnupg installer checksum mismatch: $got" }
-
-          Write-Host 'Extracting bin and share'
-          7z x $exe '-oC:\gnupg' 'bin\*' 'share\*' -y | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "extraction failed: 7z exit $LASTEXITCODE" }
-          if (-not (Test-Path 'C:\gnupg\bin\gpg.exe')) { throw 'no gpg.exe in the extracted tree' }
-
+          ./scripts/fetch-gnupg.sh
+          staged="$(pwd)/src-tauri/gnupg/bin"
           # Proves the extracted tree is usable, not merely present.
-          & 'C:\gnupg\bin\gpg.exe' --version
-          if ($LASTEXITCODE -ne 0) { throw "extracted gpg is not runnable: exit $LASTEXITCODE" }
+          "${staged}/gpg.exe" --version
+          # GITHUB_PATH prepends, so this wins over Git for Windows' gpg — but
+          # only if Windows can read the entry. `pwd` in this shell is an MSYS
+          # path (`/d/a/...`), which native PATH lookup ignores *in silence*,
+          # putting the MSYS gpg.exe back in front. `cygpath -w` is what makes
+          # the entry a path the test binaries will actually search.
+          cygpath -w "${staged}" >>"$GITHUB_PATH"
 
-          # GITHUB_PATH prepends, so this wins over Git for Windows' gpg.
-          Add-Content -Path $env:GITHUB_PATH -Value 'C:\gnupg\bin' -Encoding utf8
+      # GITHUB_PATH only takes effect in later steps, so this is the earliest
+      # place the ordering can be checked — and it is worth a step of its own,
+      # because getting it wrong fails nowhere near here: the MSYS gpg then
+      # wins and dies mid-suite on a keyring path it built by joining
+      # GNUPGHOME onto its cwd.
+      - name: Check which gpg the tests will find
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $gpg = (Get-Command gpg.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "gpg.exe -> $gpg"
+          if ($gpg -notlike '*\src-tauri\gnupg\bin\gpg.exe') {
+            throw "expected the staged GnuPG first on PATH, found '$gpg'"
+          }
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -144,4 +142,14 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+
+      # ADR-14. A no-op on Linux, which is not bundled for, and currently a
+      # no-op on macOS too — the script refuses rather than producing a bundle
+      # with no GnuPG in it, so `continue-on-error` is what keeps that refusal
+      # informative instead of red.
+      - name: Stage the bundled GnuPG
+        shell: bash
+        continue-on-error: ${{ matrix.platform == 'macos-latest' }}
+        run: ./scripts/fetch-gnupg.sh
+
       - run: pnpm tauri build

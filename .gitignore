@@ -16,6 +16,15 @@ dist-ssr
 src-tauri/target/
 src-tauri/gen/schemas/
 
+# The bundled GnuPG (ADR-14). Fetched by `scripts/fetch-gnupg.sh` at build time
+# and never committed: it is a third-party binary tree with its own release
+# cadence, and the checksum in the script is what makes it reproducible. The
+# directory itself is kept so `bundle.resources` always resolves — on Linux,
+# which is not bundled for, it stays empty.
+src-tauri/gnupg/*
+!src-tauri/gnupg/.gitkeep
+!src-tauri/gnupg/README.md
+
 # Never commit secrets, keys, or a real store (PLAN.md §9).
 # Integration tests build their store and GNUPGHOME at runtime (PLAN.md §8),
 # so nothing encrypted should ever need to be checked in.

@@ -104,10 +104,15 @@ pub enum Error {
 
     /// No usable `gpg` binary.
     ///
-    /// `reason` comes from the backend, which is safe only because this is
-    /// raised while *building* a crypto context — before any ciphertext has
-    /// been read, so there is no plaintext in the process to capture. See the
-    /// note on `crypto::prs::describe`; do not reuse the pattern elsewhere.
+    /// The one variant carrying a free-form message, and it is safe for a reason
+    /// that does not generalize: `crypto::gnupg::bin` composes it out of binary
+    /// names and version numbers while *looking for* GnuPG — before any
+    /// ciphertext has been read, so there is no plaintext in the process for it
+    /// to capture. Do not reuse the pattern elsewhere.
+    ///
+    /// It says which of two things went wrong, because the fixes are opposite:
+    /// nothing was found anywhere (install GnuPG, or the bundle is damaged), or
+    /// something was found and would not run (ADR-14's probe rejected it).
     #[error("no usable GnuPG installation: {reason}")]
     GpgUnavailable { reason: String },
 

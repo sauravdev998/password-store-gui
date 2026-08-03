@@ -27,7 +27,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::clipboard::Clipboard;
-use crate::crypto::{Gpg, KeyIds, KeyInfo, PrsGpg};
+use crate::crypto::{Gnupg, Gpg, KeyIds, KeyInfo};
 use crate::error::{Error, Result};
 use crate::generate;
 use crate::git::{Change, GitRepo, Revision, SyncOutcome, SyncStatus, Vcs};
@@ -41,11 +41,11 @@ use crate::store::{gpg_id, Entry, EntryMetadata, EntryName, PrsStore, Recipients
 ///
 /// The store and the backend are opened per command rather than once at
 /// startup. That is deliberate — each can fail for a reason the user can fix
-/// while the app is running (no store directory yet, no `gpg` on `PATH`), and
+/// while the app is running (no store directory yet, no usable GnuPG), and
 /// reopening means the fix takes effect on the next click instead of the next
 /// launch. Neither is expensive: opening the store is a `canonicalize`, and the
-/// `gpg` probe hits the thread-local context cache in `crypto::prs` after the
-/// first call.
+/// `gpg` probe is a `which` plus a `--version` on the first candidate that
+/// answers.
 ///
 /// The clipboard is the exception: on X11 and Wayland the process that set the
 /// clipboard is the one that serves it, so the handle has to outlive the
@@ -114,7 +114,7 @@ impl Core {
             // already buys for a store that did not exist yet.
             Box::new(move || Ok(Box::new(PrsStore::open(&for_store.store_root()?)?))),
             Box::new(move || for_root.store_root()),
-            Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            Box::new(|| Ok(Box::new(Gnupg::new()?))),
             Box::new(real_git),
             clipboard,
             settings,
@@ -147,7 +147,7 @@ impl Core {
             // if the two could disagree, a test pointed at a fixture would
             // create a store in the developer's own home.
             Box::new(move || Ok(for_root.clone())),
-            Box::new(|| Ok(Box::new(PrsGpg::new()?))),
+            Box::new(|| Ok(Box::new(Gnupg::new()?))),
             Box::new(real_git),
             clipboard,
             Arc::new(SettingsFile::ephemeral()),
@@ -3081,8 +3081,10 @@ mod tests {
 
     /// Missing GnuPG is reported *beside* the store rather than instead of it:
     /// the two failures are independent and have different remedies, and a
-    /// user told to install Gpg4win when what they need is a store has been
-    /// sent to fix the wrong thing (§4.1 principle 5).
+    /// user told to install GnuPG when what they need is a store has been sent
+    /// to fix the wrong thing (§4.1 principle 5). Rarer since ADR-14 bundles a
+    /// GnuPG on Windows and macOS, but not gone — Linux is not bundled for, and
+    /// a bundle can be damaged.
     #[test]
     fn setup_status_reports_a_missing_gpg_without_losing_the_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -3090,13 +3092,17 @@ mod tests {
         let core = Core::from_parts(
             Box::new(|| {
                 Err(Error::GpgUnavailable {
-                    reason: "cannot find binary path".into(),
+                    reason: "no gpg on PATH, in the usual install locations, or bundled \
+                         with this app"
+                        .into(),
                 })
             }),
             Box::new(move || Ok(root.clone())),
             Box::new(|| {
                 Err(Error::GpgUnavailable {
-                    reason: "cannot find binary path".into(),
+                    reason: "no gpg on PATH, in the usual install locations, or bundled \
+                         with this app"
+                        .into(),
                 })
             }),
             Box::new(|_| None),
@@ -3108,7 +3114,10 @@ mod tests {
 
         assert_eq!(
             status.gpg_problem.as_deref(),
-            Some("no usable GnuPG installation: cannot find binary path")
+            Some(
+                "no usable GnuPG installation: no gpg on PATH, in the usual \
+                 install locations, or bundled with this app"
+            )
         );
         assert!(status.keys.is_empty());
         assert_eq!(

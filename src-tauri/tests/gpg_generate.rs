@@ -27,7 +27,7 @@
 
 mod common;
 
-use password_store_gui_lib::crypto::{Gpg, PrsGpg};
+use password_store_gui_lib::crypto::{Gnupg, Gpg};
 use password_store_gui_lib::error::Error;
 
 #[test]
@@ -37,7 +37,7 @@ fn generating_a_key_prompts_through_the_agent_and_produces_a_usable_key() {
         println!("skipping: no gpg on PATH");
         return;
     };
-    let gpg = PrsGpg::new().unwrap();
+    let gpg = Gnupg::new().unwrap();
 
     let before = gpg.usable_keys().unwrap().len();
 
