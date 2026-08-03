@@ -213,7 +213,7 @@ fn install_locations() -> Vec<PathBuf> {
         // of the two even on a 64-bit machine.
         ["ProgramFiles(x86)", "ProgramFiles"]
             .iter()
-            .filter_map(|var| std::env::var_os(var))
+            .filter_map(std::env::var_os)
             .map(|prefix| {
                 PathBuf::from(prefix)
                     .join("GnuPG")
