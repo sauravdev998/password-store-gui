@@ -7,6 +7,7 @@ import { MoveDialog } from './components/MoveDialog'
 import { HistoryDialog } from './components/HistoryDialog'
 import { KeysDialog } from './components/KeysDialog'
 import { NewEntryDialog } from './components/NewEntryDialog'
+import { Onboarding } from './components/Onboarding'
 import { SettingsDialog } from './components/SettingsDialog'
 import { SyncPanel } from './components/SyncPanel'
 import { Tree } from './components/Tree'
@@ -26,8 +27,10 @@ import { behaviour, useSettings } from './lib/settings'
 import {
   clearClipboard,
   listTree,
+  setupStatus,
   storeHasHistory,
   type Node,
+  type SetupStatus,
   type SyncOutcome,
   type Tree as StoreTree,
   type WriteReceipt,
@@ -139,6 +142,29 @@ function describeSync(outcome: SyncOutcome): Notice {
 
 const changes = (count: number) => (count === 1 ? '1 change' : `${count} changes`)
 
+/**
+ * Turn a finished setup into something worth saying.
+ *
+ * The same shape as {@link noticeFor} and for the same reason: the store exists
+ * whatever happened to its history, so a history that could not be started must
+ * not read as a store that was not created.
+ */
+function describeSetup(receipt: WriteReceipt): Notice {
+  const { commit } = receipt
+  if (commit?.status === 'failed') {
+    return {
+      tone: 'warn',
+      message: `Your store is ready. A history could not be started for it: ${commit.reason}`,
+    }
+  }
+  return {
+    tone: 'ok',
+    message: commit
+      ? 'Your store is ready, and it will keep a history of your changes.'
+      : 'Your store is ready.',
+  }
+}
+
 /** Nothing configured, for the moment before the core has answered. */
 const EMPTY_SETTINGS = {
   storeDir: null,
@@ -171,6 +197,16 @@ function App() {
   const [clipped, setClipped] = useState<Clipped | null>(null)
   // `null` until the core has been asked. Nothing claims either way meanwhile.
   const [versioned, setVersioned] = useState<boolean | null>(null)
+  /**
+   * What the core found on this machine (ADR-7). `null` until it has answered,
+   * and nothing is shown either way meanwhile.
+   *
+   * Asked separately rather than inferred from a failed `listTree`: "there is
+   * no store yet" and "the store would not open" look the same from there and
+   * have entirely different remedies, and only one of them is something this
+   * app can fix for the user.
+   */
+  const [setup, setSetup] = useState<SetupStatus | null>(null)
   // Bumped after an edit so the detail pane remounts: it re-reads the entry's
   // shape, and every revealed value from before the edit goes with the unmount.
   const [revision, setRevision] = useState(0)
@@ -188,7 +224,20 @@ function App() {
     }
   }, [])
 
+  const checkSetup = useCallback(async () => {
+    try {
+      setSetup(await setupStatus())
+    } catch {
+      // The store location itself could not be worked out. Left unknown rather
+      // than guessed at: `refresh` reports that failure with the actual reason,
+      // and offering to create a store somewhere we cannot name would be worse
+      // than saying nothing.
+      setSetup(null)
+    }
+  }, [])
+
   useEffect(() => {
+    void checkSetup()
     void refresh()
     storeHasHistory()
       .then(setVersioned)
@@ -196,7 +245,7 @@ function App() {
         // The store itself failed to open, which `refresh` already reports.
         // Leaving this unknown is better than asserting one of the two.
       })
-  }, [refresh])
+  }, [refresh, checkSetup])
 
   // Only ticks while there is a clipboard window to count down.
   const now = useNow(clipped ? 500 : null)
@@ -278,6 +327,35 @@ function App() {
     } catch (e: unknown) {
       setError(String(e))
     }
+  }
+
+  /**
+   * Onboarding takes the whole window, or nothing does (ADR-7).
+   *
+   * The GnuPG case covers an existing store too, not only a new one: with no
+   * usable GnuPG nothing can be decrypted, copied, or written, so a tree whose
+   * every click fails would be the bare "operation failed" §4.1 principle 5
+   * forbids, spread over the whole app. One screen naming the actual fix is the
+   * honest version of the same state.
+   */
+  if (setup && (setup.gpgProblem !== null || setup.store !== 'ready')) {
+    return (
+      <Onboarding
+        status={setup}
+        onRecheck={() => void checkSetup()}
+        onCreated={(receipt) => {
+          setNotice(describeSetup(receipt))
+          void checkSetup()
+          void refresh()
+          // Asked rather than derived from the receipt: a history that failed
+          // to start may still have left a repository, and the delete
+          // confirmation's promise of recoverability must not be guessed at.
+          storeHasHistory()
+            .then(setVersioned)
+            .catch(() => {})
+        }}
+      />
+    )
   }
 
   return (

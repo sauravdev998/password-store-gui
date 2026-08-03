@@ -527,3 +527,69 @@ export function getSettings(): Promise<EffectiveSettings> {
 export function setSettings(settings: Settings): Promise<EffectiveSettings> {
   return invoke<EffectiveSettings>('set_settings', { settings })
 }
+
+/**
+ * What the app found on this machine when it started up (ADR-7).
+ *
+ * Three independent facts rather than one verdict, because the three states
+ * onboarding covers — no GnuPG, no key, no store — are independent and have
+ * different remedies. Costs nothing to ask: nothing here is decrypted, so it
+ * cannot raise a passphrase prompt.
+ */
+export type SetupStatus = {
+  /** Where the store is, or would be. Worth showing before one is created. */
+  storePath: string
+  store: StoreState
+  /**
+   * Why GnuPG is unusable, or `null` when it is fine. When this is set there is
+   * nothing the app can do until it is fixed outside the app.
+   */
+  gpgProblem: string | null
+  /**
+   * Keys already on this machine that could hold a store.
+   *
+   * Offered before making a new one is: a second key for somebody who already
+   * has one is how a store ends up locked to a key they never backed up.
+   */
+  keys: KeyInfo[]
+  /**
+   * Whether git could record anything if asked. What defaults the offer to keep
+   * a history — without it, every later save would report a failed commit.
+   */
+  gitIdentity: boolean
+}
+
+export type StoreState =
+  /** Nothing at that path yet. */
+  | 'missing'
+  /** A directory with nothing in it — including one made by hand. */
+  | 'empty'
+  /** A store to open rather than one to create. */
+  | 'ready'
+
+/** What the app found on this machine. Decrypts nothing. */
+export function setupStatus(): Promise<SetupStatus> {
+  return invoke<SetupStatus>('setup_status')
+}
+
+/**
+ * Make a new key pair.
+ *
+ * **The passphrase is never ours.** GnuPG's own prompt asks for it, in a
+ * separate window outside this app, and this call does not return until that
+ * window is answered. Dismissing it creates nothing and is not a failure to
+ * report as one — it comes back as a refusal that can simply be tried again.
+ */
+export function createKey(name: string, email: string): Promise<KeyInfo> {
+  return invoke<KeyInfo>('create_key', { name, email })
+}
+
+/**
+ * Create the store: the folder, and the record of which keys can open it.
+ *
+ * `versioned` also starts a history for it. A key that cannot be found is
+ * refused before anything is written, so a refused setup leaves nothing behind.
+ */
+export function initStore(ids: string[], versioned: boolean): Promise<WriteReceipt> {
+  return invoke<WriteReceipt>('init_store', { ids, versioned })
+}
