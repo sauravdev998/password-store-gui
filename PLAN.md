@@ -772,6 +772,60 @@ Record decisions here as they're made or changed.
     on Unix compiles its paths in and a relocated tree is not automatically
     self-locating.
 
+- **ADR-14a — how macOS is bundled (2026-08-06).** The remainder ADR-14 left,
+  built. Nothing above changes: the ordering, `GNUPGHOME`, the probe and the
+  per-call resolution are all as they were. What follows is only *how* the tree
+  is made and how it finds itself.
+
+  **A relocated Unix GnuPG is a solved problem, and the solution is GnuPG's
+  own.** `common/homedir.c:unix_rootdir` reads a `gpgconf.ctl` from the
+  directory of the running binary — located on macOS through `proc_pidpath` —
+  and a `rootdir` line in it replaces the compiled-in prefix for `gpg`,
+  `gpg-agent`, `scdaemon` and the pinentry alike. Values may contain
+  `${VARIABLE}`, expanded from the environment, which is the piece that makes it
+  usable: an app bundle's path is not knowable when the file is written, but it
+  is knowable when the process starts. So `crypto::gnupg::gpg` sets
+  `PASSWORD_STORE_GUI_GNUPG_ROOT` on every `gpg` it spawns from the bundle, and
+  the spawned `gpg-agent` inherits it. `sysconfdir` is pinned by the same file:
+  left alone it would keep naming the build machine's throwaway prefix, and
+  `gpgconf.conf` and `common.conf` are read from there.
+
+  **Decisions:**
+  - **Built from source, statically.** libgpg-error, libgcrypt, libassuan,
+    libksba and npth are all `--disable-shared`, so there are no dylib
+    references to rewrite with `install_name_tool` and none to go missing. Every
+    tarball is pinned by version and sha256 in `scripts/fetch-gnupg.sh`.
+  - **The GnuPG version matches the Windows one** (2.5.21). Two platforms
+    shipping the same app should not ship two GnuPGs.
+  - **The pinentry is GPGTools' fork**, pinned by commit. Upstream pinentry has
+    no native macOS frontend, and a bundle that cannot raise a passphrase prompt
+    is decoration — Invariant 3 says the pinentry is what sees the passphrase,
+    so there has to be one. It is a separate program under GPL-2.0-or-later,
+    which is aggregation rather than combination.
+  - **`bin/pinentry` is a two-line wrapper**, because `gpg-agent` looks for that
+    exact path first and pinentry-mac must run from inside its `.app` to find
+    its nib. It execs and is gone; it reads nothing.
+  - **Host architecture by default**, which is what `pnpm tauri build`
+    produces; `MACOS_ARCHS="arm64 x86_64"` cross-builds and `lipo`s for a
+    universal bundle.
+
+  **Consequences:**
+  - `crypto::gnupg::gpg` is now the single place a `gpg` is *spawned*, the way
+    `bin` is the single place one is chosen. Adding a `Command::new` that skips
+    it would produce a `gpg` that starts and then cannot reach its agent.
+  - The variable's name is a contract spanning a shell script and a Rust
+    module, so a unit test reads the script and asserts they agree.
+  - `--disable-nls`, so the bundled GnuPG's messages are English only. Most are
+    dropped unread; the ones a user sees come through the pinentry.
+  - **A signed release now has more to sign.** The bundled binaries live in
+    `Contents/Resources` and notarization wants a signature on each. Code
+    signing was already blocked on not having a Developer ID; this widens what
+    it will cover when it is not.
+  - `tests/gpg_bundled.rs` gains real teeth on macOS: its decrypt needs
+    `gpg-agent`, which the bundled `gpg` can only reach through `gpgconf.ctl`,
+    so a broken `rootdir` fails there. CI stages the tree and deliberately does
+    *not* put it on `PATH`, so the `gpg` the fixture uses stays a different one.
+
 ---
 
 ## 4. Security Invariants (hard constraints)
@@ -862,9 +916,9 @@ password-store-gui/
         ├── lib.rs
         ├── store/            # our types + Store trait; name/gpg_id/tree/entry are
         │                     #   ours outright (F-1, F-6); prs.rs holds the impl
-        ├── crypto/           # our Gpg trait; gnupg.rs is the whole backend and
-        │                     #   the one place a gpg is chosen (ADR-6, ADR-4b,
-        │                     #   ADR-14)
+        ├── crypto/           # our Gpg trait; gnupg.rs is the whole backend,
+        │                     #   the one place a gpg is chosen, and the one
+        │                     #   place one is spawned (ADR-6, ADR-4b, ADR-14a)
         ├── git/              # our Vcs trait; mod.rs is git2-backed and local
         │                     #   (commit, status, per-entry history, blobs),
         │                     #   remote.rs spawns the user's `git` (ADR-9)
@@ -1233,10 +1287,14 @@ this is not ☑.
     with a Rust blocker in front of it rather than the other way round: see
     ADR-4b. Windows stages the official relocatable tree through
     `scripts/fetch-gnupg.sh`; the deb and rpm gained a `gnupg` dependency.
-  - ☐ **macOS is the remainder.** The fetch script fails loudly there rather
-    than shipping a bundle with no GnuPG in it, so a macOS build still needs a
-    system GnuPG — the state every platform was in before. Cross-Platform Notes
-    says what making it work involves.
+  - ☑ **macOS followed on 2026-08-06 (ADR-14a)**, by the only route GnuPG
+    supports on Unix: built from source, linked statically, and relocated with a
+    `gpgconf.ctl` whose `rootdir` the app expands at spawn time. `pinentry-mac`
+    is bundled with it, because an agent that cannot ask for a passphrase is an
+    agent that cannot decrypt.
+  - ☐ **Signing the bundled binaries** is part of the code-signing item above
+    rather than a separate one, but it is the part that did not exist before:
+    notarization wants a signature on each executable in `Contents/Resources`.
 - ☑ **Definition of done, so far:** the precedence rule is a unit test rather
   than something to be checked by reading (`settings.rs` — environment beats
   configured beats default, a pinned value keeps the configured one behind it,
@@ -1582,13 +1640,14 @@ being read as more than it is:
   official relocatable `gnupg-w32` tree, checksum pinned. Gpg4win is still used
   when it is installed, since resolution prefers the system's. Watch path
   separators and CRLF line endings.
-- **macOS:** GnuPG is bundled by ADR-14 but **the fetch is not implemented**, so
-  builds today fall back to a system GnuPG (GPG Suite, Homebrew, MacPorts — all
-  three are in the search path). GnuPG on Unix compiles its paths in, so making
-  a relocated tree self-locating means building it and its five libraries from
-  source for two architectures and rewriting the dylib references. Notarization
-  + hardened runtime for distribution, and a bundled GnuPG has to be signed
-  along with everything else.
+- **macOS:** GnuPG is bundled (ADR-14, ADR-14a) — `scripts/fetch-gnupg.sh`
+  builds it, its five libraries and `pinentry-mac` from pinned, checksummed
+  source, statically, and writes the `bin/gpgconf.ctl` that lets the tree find
+  itself wherever the `.app` ends up. A system GnuPG still wins where there is
+  one (GPG Suite, Homebrew, MacPorts — all three are in the search path).
+  Building needs Xcode for `ibtool`, plus autoconf/automake/libtool/gettext.
+  Notarization + hardened runtime for distribution, and the bundled binaries
+  have to be signed along with everything else.
 - **Linux:** not bundled for, deliberately — a bundled `gpg-agent` meeting a
   distro-managed `~/.gnupg` is the mixed-version hazard GnuPG warns about, in
   the one place the prerequisite was never hard. The deb and rpm depend on
@@ -1616,7 +1675,7 @@ Fixed by `PRODUCT.md`; packaging (Phase 5) must not drift from it.
 | Window title | `Password Store` |
 | Package | `password-store-gui` |
 | Bundle identifier | `dev.passwordstoregui.app` |
-| License | `GPL-3.0-or-later` (ADR-4 — a consequence of statically linking LGPL `prs-lib`; ADR-14's bundled GnuPG is compatible with it) |
+| License | `GPL-3.0-or-later` (ADR-4 — a consequence of statically linking LGPL `prs-lib`; ADR-14's bundled GnuPG and ADR-14a's GPL-2.0-or-later `pinentry-mac` are separate programs shipped alongside, which is aggregation) |
 
 No visual identity exists. The bundled icons and `public/favicon.svg` are
 scaffold defaults — **not a reference for anything**, and not to be extended

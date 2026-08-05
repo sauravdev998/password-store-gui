@@ -90,6 +90,61 @@ pub fn set_bundled_root(root: PathBuf) {
     let _ = BUNDLED_ROOT.set(root);
 }
 
+/// The variable a bundled GnuPG's `gpgconf.ctl` expands to find its own tree.
+///
+/// **The macOS half of ADR-14 rests on this**, and it is the one thing the
+/// Windows bundle needed no help with. A Windows GnuPG locates its root from the
+/// running `.exe`; a Unix one has its directories compiled in at build time, so
+/// a `gpg` copied into an app bundle goes looking for `gpg-agent`, `scdaemon`
+/// and the pinentry wherever it was *built*. GnuPG's own answer is a
+/// `gpgconf.ctl` file beside `gpgconf`, read relative to the running binary
+/// (`common/homedir.c:unix_rootdir`), whose values may contain `${VARIABLE}`
+/// expanded from the environment. `scripts/fetch-gnupg.sh` writes that file with
+/// this name in it; setting it here is the other half of the contract, and
+/// [`tests::the_relocation_variable_matches_the_one_the_script_writes`] is what
+/// keeps a rename on either side from being silent.
+///
+/// The value is a path, not store data — Invariant 5 is untouched.
+const BUNDLE_ROOT_VAR: &str = "PASSWORD_STORE_GUI_GNUPG_ROOT";
+
+/// Build a [`Command`] for `bin`, telling it where it lives if it is ours.
+///
+/// **Every `gpg` this module spawns goes through here**, for the same reason
+/// [`bin`] is the only resolver (ADR-4b): a binary launched without the variable
+/// would search the build machine's directories, and the failure — a `gpg` that
+/// starts, then cannot reach its agent — looks nothing like its cause.
+///
+/// The child's environment rather than ours: `std::env::set_var` is process-
+/// global, races every other thread, and is `unsafe` under edition 2024, which
+/// this crate forbids. ADR-4b closed that door for `PATH` and it stays closed
+/// here.
+///
+/// `gpg` spawns `gpg-agent` itself, which inherits this and so reads the same
+/// `gpgconf.ctl` — which is what lets the agent find the bundled pinentry.
+///
+/// A system `gpg` gets nothing added, and the Windows bundle is unaffected in
+/// practice: no `gpgconf.ctl` is written there, so nothing expands the variable.
+fn gpg(bin: &Path) -> Command {
+    let mut command = Command::new(bin);
+    if let Some(root) = relocation_root(BUNDLED_ROOT.get().map(PathBuf::as_path), bin) {
+        command.env(BUNDLE_ROOT_VAR, root);
+    }
+    command
+}
+
+/// The `rootdir` a bundled `bin` should be told, or `None` if it is not ours.
+///
+/// Split from [`gpg`] with the bundle root passed in so it can be asserted
+/// in a test: reading the `OnceLock` here would make that test set a
+/// process-global every other test in the binary would then see.
+///
+/// The answer is the directory *holding* `bin/`, because that is what a
+/// `gpgconf.ctl` `rootdir` means and what [`bundled_bin`] builds its path from.
+fn relocation_root(bundled_root: Option<&Path>, bin: &Path) -> Option<PathBuf> {
+    let root = bundled_root?.join("gnupg");
+    bin.starts_with(&root).then_some(root)
+}
+
 /// Locate a usable `gpg` (ADR-14).
 ///
 /// **This is the only place in the crate that decides which binary to run.**
@@ -258,7 +313,7 @@ fn probe(candidate: &Path) -> std::result::Result<(), ()> {
         return Ok(());
     }
 
-    let output = Command::new(candidate)
+    let output = gpg(candidate)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -349,7 +404,7 @@ const DECRYPT_ARGV: [&str; 3] = ["--batch", "--quiet", "--decrypt"];
 /// the plaintext comes back over one (Invariant 1), landing directly in a
 /// [`Secret`] so it is zeroized when dropped.
 pub fn decrypt(bin: &Path, ciphertext: &[u8]) -> Result<Secret> {
-    let mut child = Command::new(bin)
+    let mut child = gpg(bin)
         .args(DECRYPT_ARGV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -455,7 +510,7 @@ fn verify_recipients(bin: &Path, recipients: &Recipients) -> Result<()> {
     }
 
     for id in &recipients.ids {
-        let output = Command::new(bin)
+        let output = gpg(bin)
             .args(["--batch", "--quiet", "--utf8-strings"])
             .args(["--list-keys", "--with-colons"])
             .arg("--")
@@ -490,7 +545,7 @@ fn verify_recipients(bin: &Path, recipients: &Recipients) -> Result<()> {
 /// keys in it. Returning nothing would be F-8 rebuilt by hand — the silent drop
 /// that encrypts an entry to fewer people than the store demands.
 pub fn describe_key(bin: &Path, id: &str, secret: &KeyIds) -> Result<KeyInfo> {
-    let output = Command::new(bin)
+    let output = gpg(bin)
         .args(["--batch", "--quiet", "--utf8-strings"])
         .args(["--with-colons", "--list-keys"])
         // Ends option parsing, so an id beginning with `-` is an id.
@@ -527,7 +582,7 @@ pub fn describe_key(bin: &Path, id: &str, secret: &KeyIds) -> Result<KeyInfo> {
 /// the card. §4.1 principle 1 calls a security key a confirmed operating
 /// condition, not a hypothetical.
 pub fn secret_keys(bin: &Path) -> Result<KeyIds> {
-    let output = Command::new(bin)
+    let output = gpg(bin)
         .args(["--batch", "--quiet", "--utf8-strings"])
         .args(["--with-colons", "--list-secret-keys"])
         .stdin(Stdio::null())
@@ -634,7 +689,7 @@ fn unescape_colon_field(field: &str) -> String {
 /// told about. It is also not localized, unlike the `gpg: public key is …` line
 /// `pass` greps for, which a non-English locale would change out from under us.
 pub fn encrypted_to(bin: &Path, path: &Path) -> Result<KeyIds> {
-    let output = Command::new(bin)
+    let output = gpg(bin)
         .args(["--batch", "--quiet", "--list-packets"])
         .arg("--")
         .arg(path)
@@ -684,7 +739,7 @@ fn parse_packet_keyids(listing: &str) -> KeyIds {
 
 /// Run `gpg`, returning the ciphertext.
 fn encrypt(bin: &Path, recipients: &Recipients, plaintext: &Secret) -> Result<Vec<u8>> {
-    let mut command = Command::new(bin);
+    let mut command = gpg(bin);
     command
         .args([
             "--batch",
@@ -806,7 +861,7 @@ const EXPIRY: &str = "never";
 pub fn generate_key(bin: &Path, name: &str, email: &str) -> Result<KeyInfo> {
     let uid = build_uid(name, email)?;
 
-    let output = Command::new(bin)
+    let output = gpg(bin)
         .args(generate_argv(&uid))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -950,7 +1005,7 @@ fn build_uid(name: &str, email: &str) -> Result<String> {
 /// then refused: written into a `.gpg-id` it would produce a store `gpg` will
 /// not encrypt to, which is [`Error::UnusableKey`] arriving at the worst moment.
 pub fn usable_keys(bin: &Path) -> Result<Vec<KeyInfo>> {
-    let output = Command::new(bin)
+    let output = gpg(bin)
         .args(["--batch", "--quiet", "--utf8-strings"])
         .args(["--with-colons", "--list-secret-keys"])
         .stdin(Stdio::null())
@@ -1367,6 +1422,65 @@ ssb:u:255:18:7298DC4C15400BE4:1785695396::::::e:::+::cv25519::
             !candidates.is_empty(),
             "the known install locations are unconditional, so the list is \
              never empty even where gpg is absent"
+        );
+    }
+
+    /// The macOS half of ADR-14: a bundled `gpg` is told where its own tree is,
+    /// because on Unix it cannot work that out for itself.
+    ///
+    /// The root is the directory holding `bin/`, which is what a `gpgconf.ctl`
+    /// `rootdir` means. Handing it `bin/` itself would send `gpg` looking for
+    /// `bin/bin/gpg-agent`, and the resulting failure — a `gpg` that starts and
+    /// then cannot reach its agent — names nothing that would lead here.
+    #[test]
+    fn the_bundled_gpg_is_told_which_tree_it_belongs_to() {
+        let resources = PathBuf::from("/Applications/Password Store.app/Contents/Resources");
+        let bundled = resources.join("gnupg").join("bin").join(BIN_NAME);
+
+        assert_eq!(
+            relocation_root(Some(&resources), &bundled),
+            Some(resources.join("gnupg")),
+            "the rootdir is the directory holding bin/, not bin/ itself"
+        );
+    }
+
+    /// The other direction, and the one that would be a bug rather than a
+    /// missing feature: pointing somebody's own GnuPG at our tree would have it
+    /// run our `gpg-agent` and our pinentry against their keyring, which is
+    /// precisely the mixed-version hazard ADR-14's ordering exists to avoid.
+    #[test]
+    fn a_system_gpg_is_never_relocated() {
+        let resources = PathBuf::from("/Applications/Password Store.app/Contents/Resources");
+
+        for system in ["/opt/homebrew/bin/gpg", "/usr/local/MacGPG2/bin/gpg"] {
+            assert_eq!(
+                relocation_root(Some(&resources), Path::new(system)),
+                None,
+                "{system} is not ours to relocate"
+            );
+        }
+
+        // No bundle at all: `cargo test`, `pnpm tauri dev`, and Linux.
+        assert_eq!(
+            relocation_root(None, Path::new("/usr/bin/gpg")),
+            None,
+            "with no bundle there is no tree to point at"
+        );
+    }
+
+    /// **A contract split across two languages, so neither side can be renamed
+    /// quietly.** `scripts/fetch-gnupg.sh` writes the variable into the
+    /// `gpgconf.ctl` it stages; this module sets it. If they disagree, the
+    /// expansion yields an empty `rootdir`, `gpg` falls back to the paths
+    /// compiled in on the build machine, and every operation fails somewhere far
+    /// from the cause.
+    #[test]
+    fn the_relocation_variable_matches_the_one_the_script_writes() {
+        let script = include_str!("../../../scripts/fetch-gnupg.sh");
+
+        assert!(
+            script.contains(&format!("MAC_ROOT_VAR='{BUNDLE_ROOT_VAR}'")),
+            "{BUNDLE_ROOT_VAR} is not the name scripts/fetch-gnupg.sh stages"
         );
     }
 

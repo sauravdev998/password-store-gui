@@ -59,14 +59,14 @@ benchmarked.
 
 ## Requirements
 
-**On Windows, nothing — GnuPG ships inside the app.** It still drives GPG rather
-than reimplementing OpenPGP, and it still never handles your passphrase —
-`gpg-agent` and pinentry do, exactly as before.
+**On Windows and macOS, nothing — GnuPG ships inside the app.** It still drives
+GPG rather than reimplementing OpenPGP, and it still never handles your
+passphrase — `gpg-agent` and pinentry do, exactly as before.
 
 | | |
 |---|---|
 | Windows | Nothing. GnuPG is bundled |
-| macOS | GnuPG and `pinentry-mac` — **bundling is designed but not yet built**, see below |
+| macOS | Nothing. GnuPG and `pinentry-mac` are bundled |
 | Linux | The `gnupg` package, and `pinentry-gtk` or `pinentry-qt` — the deb and rpm depend on it |
 
 **If you already have GnuPG, that is the one it uses.** The bundled copy is a
@@ -79,15 +79,16 @@ at its own copy.
 **Linux is not bundled for on purpose.** A bundled agent meeting a
 distro-managed `~/.gnupg` is a worse problem than installing a package.
 
-**macOS is not bundled for yet.** GnuPG on Unix compiles its paths in, so a
-relocated copy does not find its own helpers the way the Windows one does;
-making it work means building GnuPG and its libraries from source for both
-architectures. Until that lands, macOS needs a GnuPG installed the ordinary way
-— which is what every platform needed before.
+The two bundles are made differently, because GnuPG is. The Windows one is the
+official build, which finds its own root next to the running `.exe`. On macOS —
+on any Unix — GnuPG has its directories compiled in, so a copied tree would go
+looking for `gpg-agent` and the pinentry wherever it was built; the macOS bundle
+is therefore built from source and carries a `gpgconf.ctl`, which is GnuPG's own
+mechanism for telling a relocated installation where it now lives.
 
-The bundled GnuPG is unmodified upstream, under the GPL like this app;
-`gnupg/SOURCE` inside a built bundle names the exact version and where its
-source lives.
+The bundled GnuPG is unmodified upstream, under the GPL like this app, and so is
+the `pinentry-mac` beside it; `gnupg/SOURCE` inside a built bundle names every
+component, its version, and the checksum it was verified against.
 
 Reading and writing a store — including its local history — needs no system
 `git`; libgit2 is linked in. **Syncing with a remote does**, so a shared store
@@ -111,17 +112,32 @@ Then:
 ```sh
 pnpm install
 pnpm tauri dev              # run it
-./scripts/fetch-gnupg.sh    # stage the bundled GnuPG (Windows only)
+./scripts/fetch-gnupg.sh    # stage the bundled GnuPG (Windows and macOS)
 pnpm tauri build            # release bundle for the current OS
 ```
 
-`fetch-gnupg.sh` downloads a pinned, checksummed GnuPG into `src-tauri/gnupg/`,
-which is where `bundle.resources` picks it up. It is a no-op on Linux, and on
-macOS it fails with a message rather than producing a bundle that quietly has no
-GnuPG in it. Skipping it builds without the fallback: the app then needs a
-system GnuPG, which is what it needed before.
+`fetch-gnupg.sh` puts a pinned, checksummed GnuPG into `src-tauri/gnupg/`, which
+is where `bundle.resources` picks it up. It is a no-op on Linux. Skipping it
+builds without the fallback: the app then needs a system GnuPG, which is what it
+needed before.
 
-The bundle is unsigned and unnotarized.
+On macOS it **builds** GnuPG, its five libraries and `pinentry-mac` from source,
+which takes a few minutes and needs Xcode (for `ibtool`, which compiles
+pinentry's interface files) plus autoconf, automake, libtool and gettext:
+
+```sh
+brew install autoconf automake libtool gettext
+MACOS_ARCHS="arm64 x86_64" ./scripts/fetch-gnupg.sh   # for a universal build
+```
+
+Without `MACOS_ARCHS` it builds for the machine's own architecture, which is
+what `pnpm tauri build` produces; set it to both when you are also passing
+`--target universal-apple-darwin`.
+
+The bundle is unsigned and unnotarized. A signed macOS release would have to
+sign the bundled binaries too — they are ordinary executables inside
+`Contents/Resources`, and notarization requires every one of them to carry a
+signature.
 
 ## Development
 

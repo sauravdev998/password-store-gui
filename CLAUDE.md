@@ -41,7 +41,8 @@ When unsure whether something leaks a secret, assume it does.
 ```sh
 pnpm install                # once
 pnpm tauri dev              # run the app (starts Vite + cargo)
-./scripts/fetch-gnupg.sh    # stage the bundled GnuPG before a build (ADR-14)
+./scripts/fetch-gnupg.sh    # stage the bundled GnuPG before a build (ADR-14);
+                            #   a no-op on Linux, a source build on macOS
 pnpm tauri build            # release bundle for the current OS
 pnpm dev                    # frontend only, no Rust core
 pnpm dev:mock               # frontend against a stubbed core (see below)
@@ -141,12 +142,22 @@ validation are ours in `store/` (ADR-4a F-1, F-6), and git is `git2` plus the
 user's own binary (ADR-9) — `prs-lib`'s git is not used at all.
 
 `crypto::gnupg::bin` is the **only** place that decides which `gpg` runs, and
-that is load-bearing rather than tidy: ADR-14 bundles GnuPG (Windows today,
-macOS designed but not built), preferring the system's when there is one, and a
-second resolver would mean the binary that encrypts an entry need not be the one
-that decrypts it. Do not add another, and do not reach for `std::env::set_var`
-on `PATH` to get around one — ADR-4b records why that door is closed, and the
-edition-2024 half of that argument applies to any `set_var` in the lib.
+that is load-bearing rather than tidy: ADR-14 bundles GnuPG on Windows and macOS,
+preferring the system's when there is one, and a second resolver would mean the
+binary that encrypts an entry need not be the one that decrypts it. Do not add
+another, and do not reach for `std::env::set_var` on `PATH` to get around one —
+ADR-4b records why that door is closed, and the edition-2024 half of that
+argument applies to any `set_var` in the lib.
+
+`crypto::gnupg::gpg` is the matching **only** place one is *spawned*, and it
+earns that for the same kind of reason (ADR-14a). A Unix GnuPG has its
+directories compiled in, so the bundled macOS tree finds its own `gpg-agent`,
+`scdaemon` and pinentry through a `gpgconf.ctl` whose `rootdir` is an
+environment variable that helper sets per child. A bare `Command::new` on a
+`gpg` path skips it and produces a binary that starts and then cannot reach its
+agent — a failure that names nothing leading back here. The variable's name is
+also written into `scripts/fetch-gnupg.sh`; a unit test asserts the two agree,
+so change both or neither.
 
 Two dependency rules, both with an ADR behind them:
 

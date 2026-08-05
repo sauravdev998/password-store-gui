@@ -104,13 +104,19 @@ fn the_bundled_gpg_is_a_working_fallback_and_not_a_preference() {
 /// platform:
 ///
 /// - Where CI (or a developer) has already run `scripts/fetch-gnupg.sh`, the
-///   real staged tree is right there in the crate. That is the *actual* bundle,
-///   complete with the DLLs and `share/` a Windows GnuPG needs, so it is the
-///   better test wherever it exists.
+///   real staged tree is right there in the crate. That is the *actual* bundle —
+///   the DLLs and `share/` a Windows GnuPG needs, or on macOS a tree built
+///   somewhere that no longer exists — so it is the better test wherever it
+///   exists. **On macOS it is the only check of ADR-14's relocation that runs
+///   unattended:** the decrypt below needs `gpg-agent`, `gpg` can only find it
+///   through the staged `bin/gpgconf.ctl`, and a broken `rootdir` therefore
+///   fails here rather than in front of a user.
 /// - Otherwise, on Unix, copy the system `gpg`. A lone GnuPG binary works there
 ///   because its helper paths are compiled in rather than resolved beside the
-///   executable — the same property that makes bundling on macOS hard, and why
-///   this is a fair stand-in for the fallback but not for the tree.
+///   executable — which is exactly what the staged tree has to work *around*,
+///   and why a bare copy is a fair stand-in for the fallback but not for the
+///   bundle. It carries no `gpgconf.ctl`, so the relocation variable
+///   `crypto::gnupg` sets for it goes unread, as it does for a system GnuPG.
 ///
 /// A bare copy on Windows would be neither, so that case returns `None` and the
 /// test skips rather than asserting something untrue.
