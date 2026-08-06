@@ -253,17 +253,27 @@ stage_macos() {
 # The autotools are here for pinentry alone — the six GnuPG components are
 # release tarballs and ship a `configure`. `autogen.sh` at the pinned commit
 # runs `aclocal`, `autoheader`, `automake` and `autoconf` itself rather than
-# going through `autoreconf`, and it needs nothing beyond them: pinentry's
+# going through `autoreconf`, and it needs little beyond them: pinentry's
 # libraries are `noinst_LIBRARIES`, so there is no libtool in it, and it has no
-# `po/`, so autogen.sh's gettext branch never runs. Requiring more than this is
-# not free caution — a hosted macOS runner has neither `autopoint` nor GNU
-# `libtool`, so the extra names turned into a build that refused to start.
+# `po/`, so autogen.sh's gettext branch never runs and `autopoint` is not
+# wanted. Requiring more than this is not free caution — a hosted macOS runner
+# has neither `autopoint` nor GNU `libtool`, so the extra names turned into a
+# build that refused to start.
+#
+# gettext's *macros* are a different matter from gettext's tools, and are
+# genuinely needed: pinentry's `configure.ac` calls `AM_ICONV`, and its bundled
+# `m4/iconv.m4` is only half of that macro — the rest (`AC_LIB_LINKFLAGS_BODY`
+# and friends) lives in gettext's `lib-link.m4`, which pinentry does not carry.
+# `m4` leaves an undefined macro standing as literal text and `autogen.sh` does
+# not check exit status, so without it the run *succeeds* and hands back a
+# `configure` that dies on a shell syntax error four minutes later.
 require_macos_tools() {
   local archs=("$@") missing=()
   local tool
   for tool in curl shasum tar make cc git aclocal autoheader automake autoconf; do
     command -v "${tool}" >/dev/null || missing+=("${tool}")
   done
+  gettext_m4_dir >/dev/null || missing+=("gettext's autoconf macros (lib-link.m4)")
   # Interface Builder compiles pinentry-mac's nibs, and it comes with Xcode
   # proper rather than with the Command Line Tools — the one prerequisite a
   # developer machine is likely to be missing.
@@ -272,8 +282,40 @@ require_macos_tools() {
 
   if [ "${#missing[@]}" -gt 0 ]; then
     die "missing build tools: ${missing[*]}
-     The autotools come from: brew install autoconf automake"
+     The autotools come from: brew install autoconf automake gettext"
   fi
+}
+
+# Print the directory holding gettext's autoconf macros, or fail.
+#
+# gettext 0.20 and later install these under `share/gettext/m4` for `autopoint`
+# to copy, leaving only `nls.m4` in `share/aclocal` — so `aclocal` does not see
+# them by default, and on Homebrew gettext is keg-only besides. Both layouts and
+# both Homebrew prefixes are tried, so a developer machine and a runner reach
+# the same file by whichever path it is on.
+gettext_m4_dir() {
+  local dir prefix
+  local -a candidates=()
+
+  if command -v brew >/dev/null; then
+    prefix="$(brew --prefix gettext 2>/dev/null || true)"
+    [ -n "${prefix}" ] && candidates+=("${prefix}/share/gettext/m4" "${prefix}/share/aclocal")
+  fi
+  candidates+=(
+    /opt/homebrew/share/gettext/m4 /opt/homebrew/share/aclocal
+    /usr/local/share/gettext/m4 /usr/local/share/aclocal
+    /usr/share/gettext/m4 /usr/share/aclocal
+  )
+  dir="$(aclocal --print-ac-dir 2>/dev/null || true)"
+  [ -n "${dir}" ] && candidates+=("${dir}")
+
+  for dir in "${candidates[@]}"; do
+    if [ -f "${dir}/lib-link.m4" ]; then
+      echo "${dir}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Download and verify every source tarball, and clone the pinned pinentry.
@@ -417,12 +459,25 @@ build_pinentry_mac() {
   local -a cross=(${1+"$@"})
 
   # `AM_PATH_GPG_ERROR` and `AM_PATH_LIBASSUAN` come from the libraries we just
-  # installed, so autoreconf has to be pointed at them. Exported into the
-  # subshell only — the tarball builds have their own copies and must not pick
-  # these up.
-  local aclocal="${out}/share/aclocal:${out2}/share/aclocal${ACLOCAL_PATH:+:${ACLOCAL_PATH}}"
+  # installed, and `AM_ICONV` is finished off by gettext's `lib-link.m4`, so
+  # aclocal has to be pointed at all three. Exported into the subshell only —
+  # the tarball builds have their own copies and must not pick these up.
+  local gettext_m4
+  gettext_m4="$(gettext_m4_dir)" || die "gettext's autoconf macros are gone since the tool check"
+  local aclocal="${out}/share/aclocal:${out2}/share/aclocal:${gettext_m4}${ACLOCAL_PATH:+:${ACLOCAL_PATH}}"
 
   ( cd "${srcdir}" && ACLOCAL_PATH="${aclocal}" ./autogen.sh --force >/dev/null )
+
+  # autogen.sh runs aclocal, automake and autoconf without checking any of them,
+  # so a macro that was never defined leaves its own name in `configure` and the
+  # run still exits 0. A generated `configure` contains no such line, which
+  # makes this the whole check: anything matching is a macro that did not expand,
+  # and saying so here beats a shell syntax error deep in a four-minute build.
+  local unexpanded
+  unexpanded="$(awk '/^[[:space:]]*(AC|AM)_[A-Z0-9_]+\(/ { sub(/\(.*/, "", $1); print $1; exit }' \
+    "${srcdir}/configure")"
+  [ -z "${unexpanded}" ] \
+    || die "pinentry's configure has an unexpanded macro (${unexpanded}) — an m4 file aclocal needs is missing"
 
   mkdir -p "${builddir}"
   ( cd "${builddir}" && "${srcdir}/configure" \

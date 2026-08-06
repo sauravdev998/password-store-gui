@@ -52,12 +52,15 @@ jobs:
           path: src-tauri/gnupg
           key: gnupg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-gnupg.sh') }}
 
-      # The macOS image ships neither, and pinentry's autogen.sh needs both.
-      # Skipped on a cache hit, where nothing is built: the key is the exact
-      # one above, so a hit means the staged tree is already the pinned one.
-      - name: Install autoconf and automake
+      # The macOS image ships none of these, and pinentry's autogen.sh needs all
+      # three: gettext is here for its m4 macros alone — `AM_ICONV` in pinentry's
+      # configure.ac is completed by gettext's `lib-link.m4`, which pinentry does
+      # not carry — not for its tools. Skipped on a cache hit, where nothing is
+      # built: the key is the exact one above, so a hit means the staged tree is
+      # already the pinned one.
+      - name: Install autoconf, automake and gettext
         if: matrix.platform == 'macos-latest' && steps.gnupg-cache.outputs.cache-hit != 'true'
-        run: brew install autoconf automake
+        run: brew install autoconf automake gettext
 
       # The gpg.exe bundled with Git for Windows is an MSYS2 build: it reads
       # GNUPGHOME as an MSYS path, so the native temp dir the test fixture sets
@@ -197,11 +200,11 @@ jobs:
           path: src-tauri/gnupg
           key: gnupg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-gnupg.sh') }}
 
-      # As in the rust job: the macOS image has no autoconf or automake, and
-      # the source build runs pinentry's autogen.sh.
-      - name: Install autoconf and automake
+      # As in the rust job: the macOS image has no autoconf, automake or gettext
+      # macros, and the source build runs pinentry's autogen.sh.
+      - name: Install autoconf, automake and gettext
         if: matrix.platform == 'macos-latest' && steps.gnupg-cache.outputs.cache-hit != 'true'
-        run: brew install autoconf automake
+        run: brew install autoconf automake gettext
 
       # ADR-14. A no-op on Linux, which is not bundled for; an unpack on
       # Windows; a source build on macOS, which is why the timeout is generous.
