@@ -123,10 +123,11 @@ needed before.
 
 On macOS it **builds** GnuPG, its five libraries and `pinentry-mac` from source,
 which takes a few minutes and needs Xcode (for `ibtool`, which compiles
-pinentry's interface files) plus autoconf, automake, libtool and gettext:
+pinentry's interface files) plus autoconf and automake, which pinentry's
+`autogen.sh` runs — the GnuPG components are release tarballs and need neither:
 
 ```sh
-brew install autoconf automake libtool gettext
+brew install autoconf automake
 MACOS_ARCHS="arm64 x86_64" ./scripts/fetch-gnupg.sh   # for a universal build
 ```
 

@@ -249,10 +249,19 @@ stage_macos() {
 }
 
 # Fail early and by name, rather than half way through a ten-minute build.
+#
+# The autotools are here for pinentry alone — the six GnuPG components are
+# release tarballs and ship a `configure`. `autogen.sh` at the pinned commit
+# runs `aclocal`, `autoheader`, `automake` and `autoconf` itself rather than
+# going through `autoreconf`, and it needs nothing beyond them: pinentry's
+# libraries are `noinst_LIBRARIES`, so there is no libtool in it, and it has no
+# `po/`, so autogen.sh's gettext branch never runs. Requiring more than this is
+# not free caution — a hosted macOS runner has neither `autopoint` nor GNU
+# `libtool`, so the extra names turned into a build that refused to start.
 require_macos_tools() {
   local archs=("$@") missing=()
   local tool
-  for tool in curl shasum tar make cc git autoreconf autopoint automake libtool; do
+  for tool in curl shasum tar make cc git aclocal autoheader automake autoconf; do
     command -v "${tool}" >/dev/null || missing+=("${tool}")
   done
   # Interface Builder compiles pinentry-mac's nibs, and it comes with Xcode
@@ -263,7 +272,7 @@ require_macos_tools() {
 
   if [ "${#missing[@]}" -gt 0 ]; then
     die "missing build tools: ${missing[*]}
-     Most of them come from: brew install autoconf automake libtool gettext"
+     The autotools come from: brew install autoconf automake"
   fi
 }
 

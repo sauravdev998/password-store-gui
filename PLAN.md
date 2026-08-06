@@ -1645,7 +1645,8 @@ being read as more than it is:
   source, statically, and writes the `bin/gpgconf.ctl` that lets the tree find
   itself wherever the `.app` ends up. A system GnuPG still wins where there is
   one (GPG Suite, Homebrew, MacPorts — all three are in the search path).
-  Building needs Xcode for `ibtool`, plus autoconf/automake/libtool/gettext.
+  Building needs Xcode for `ibtool`, plus autoconf and automake for pinentry's
+  `autogen.sh` — and nothing else: the GnuPG components are release tarballs.
   Notarization + hardened runtime for distribution, and the bundled binaries
   have to be signed along with everything else.
 - **Linux:** not bundled for, deliberately — a bundled `gpg-agent` meeting a
